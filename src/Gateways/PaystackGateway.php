@@ -55,11 +55,16 @@ final class PaystackGateway implements PaymentGatewayInterface
         $apiStatus = (bool) ($decoded['status'] ?? false);
         $data = (array) ($decoded['data'] ?? []);
 
+        // Prefer gateway_response from transaction data when available
+        $rawMessage = (string) ($decoded['message'] ?? '');
+        $gatewayResponse = isset($data['gateway_response']) ? (string) $data['gateway_response'] : '';
+        $message = $gatewayResponse !== '' ? $gatewayResponse : $rawMessage;
+
         if (!$apiStatus || $httpCode < 200 || $httpCode >= 300) {
             return [
                 'status' => 'failed',
                 'reference' => (string) ($data['reference'] ?? $reference),
-                'message' => (string) ($decoded['message'] ?? 'Paystack verification returned error'),
+                'message' => $message !== '' ? $message : 'Paystack verification returned error',
                 'raw' => $decoded,
             ];
         }
@@ -73,7 +78,7 @@ final class PaystackGateway implements PaymentGatewayInterface
             'reference' => (string) ($data['reference'] ?? $reference),
             'amount' => $amount,
             'currency' => $currency,
-            'message' => (string) ($decoded['message'] ?? ''),
+            'message' => $message,
             'raw' => $decoded,
         ];
     }
