@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Additional gateway drivers (Stripe, Flutterwave, etc.)
 - Webhook helpers and signatures verification utilities
 
+## [0.1.2] - 2025-11-16
+
+### Fixed
+- **Critical**: Fixed incorrect namespace escaping in `composer.json`
+  - Corrected PSR-4 autoload mapping from `Glueful\\\\Extensions\\\\Payvia\\\\` to `Glueful\\Extensions\\Payvia\\`
+  - Fixed extension provider class name from `Glueful\\\\Extensions\\\\Payvia\\\\PayviaServiceProvider` to `Glueful\\Extensions\\Payvia\\PayviaServiceProvider`
+  - This bug prevented the service provider from being discovered and loaded, which meant:
+    - Extension routes were not registered
+    - Migration directory was not registered (migrations were invisible to `php glueful migrate:run`)
+    - Extension services were not available in the container
+  - **Impact**: Extension now loads correctly and migrations are properly discovered
+
 ## [0.1.1] - 2025-11-16
 
 ### Changed

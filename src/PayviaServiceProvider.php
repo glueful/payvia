@@ -26,7 +26,7 @@ final class PayviaServiceProvider extends ServiceProvider
 
     public function getVersion(): string
     {
-        return '0.1.0';
+        return '0.1.2';
     }
 
     public function getDescription(): string
@@ -79,8 +79,6 @@ final class PayviaServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
-        $this->loadMigrationsFrom(__DIR__ . '/../migrations');
-        $this->loadRoutesFrom(__DIR__ . '/../routes.php');
 
         try {
             $this->app->get(\Glueful\Extensions\ExtensionManager::class)->registerMeta(self::class, [
@@ -91,6 +89,23 @@ final class PayviaServiceProvider extends ServiceProvider
             ]);
         } catch (\Throwable $e) {
             error_log('[Payvia] Failed to register extension metadata: ' . $e->getMessage());
+        }
+
+         try {
+            $this->loadRoutesFrom(__DIR__ . '/../routes.php');
+        } catch (\Throwable $e) {
+            error_log('[Payvia] Failed to load routes: ' . $e->getMessage());
+            $env = (string)($_ENV['APP_ENV'] ?? (getenv('APP_ENV') !== false ? getenv('APP_ENV') : 'production'));
+            if ($env !== 'production') {
+                throw $e; // fail fast in non-production
+            }
+        }
+
+         // 3) Register migrations directory (low risk)
+        try {
+            $this->loadMigrationsFrom(__DIR__ . '/../migrations');
+        } catch (\Throwable $e) {
+            error_log('[Payvia] Failed to register migrations: ' . $e->getMessage());
         }
     }
 }
