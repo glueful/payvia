@@ -36,6 +36,43 @@ final class PaymentService
         $amount = (float) ($verification['amount'] ?? 0.0);
         $currency = (string) ($verification['currency'] ?? 'GHS');
 
+        // Start with caller-provided metadata
+        $metadata = [];
+        if (isset($context['metadata']) && is_array($context['metadata'])) {
+            $metadata = $context['metadata'];
+        }
+
+        // Enrich metadata for known gateways when raw payload is available
+        if ($gatewayKey === 'paystack' && isset($verification['raw']) && is_array($verification['raw'])) {
+            /** @var array<string,mixed> $raw */
+            $raw = $verification['raw'];
+            $data = (array) ($raw['data'] ?? []);
+
+            $customer = (array) ($data['customer'] ?? []);
+            $authorization = (array) ($data['authorization'] ?? []);
+
+            $extra = [];
+            if (isset($customer['email']) && is_string($customer['email'])) {
+                $extra['customer_email'] = $customer['email'];
+            }
+            if (isset($authorization['last4']) && is_string($authorization['last4'])) {
+                $extra['card_last4'] = $authorization['last4'];
+            }
+            if (isset($authorization['brand']) && is_string($authorization['brand'])) {
+                $extra['card_brand'] = trim($authorization['brand']);
+            }
+            if (isset($authorization['bank']) && is_string($authorization['bank'])) {
+                $extra['card_bank'] = $authorization['bank'];
+            }
+            if (isset($data['channel']) && is_string($data['channel'])) {
+                $extra['channel'] = $data['channel'];
+            }
+
+            if ($extra !== []) {
+                $metadata = array_merge($metadata, $extra);
+            }
+        }
+
         $payload = [
             'user_uuid' => $context['user_uuid'] ?? null,
             'payable_type' => $context['payable_type'] ?? null,
@@ -47,7 +84,7 @@ final class PaymentService
             'currency' => $currency,
             'status' => $status,
             'message' => $message !== '' ? $message : null,
-            'metadata' => $context['metadata'] ?? null,
+            'metadata' => $metadata !== [] ? $metadata : null,
             'raw_payload' => config('payvia.features.store_raw_payload', true)
                 ? json_encode($verification, JSON_THROW_ON_ERROR)
                 : null,

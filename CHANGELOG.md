@@ -10,7 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Planned
 - Additional gateway drivers (Stripe, Flutterwave, etc.)
 - Webhook helpers and signatures verification utilities
-- Payment listing and query endpoints
+
+## [0.1.1] - 2025-11-16
+
+### Changed
+- Improved Paystack gateway normalization:
+  - Prefer `gateway_response` as the human-readable message when available
+  - Retain full raw payload under `verification['raw']` for downstream consumers
+- Enriched payment `metadata` for Paystack payments with derived fields:
+  - `customer_email`, `card_last4`, `card_brand`, `card_bank`, `channel`
+  - Existing caller-provided metadata is merged, not replaced
 
 ## [0.1.0] - 2024-12-14
 

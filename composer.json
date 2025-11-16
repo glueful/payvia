@@ -55,7 +55,7 @@
             "name": "Payvia",
             "displayName": "Payvia Payments",
             "description": "Unified payment gateway bridge for Glueful (Stripe, Paystack, Flutterwave, and more).",
-            "version": "0.1.0",
+            "version": "0.1.1",
             "icon": "assets/icon.png",
             "categories": [
                 "payments",
