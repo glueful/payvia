@@ -40,10 +40,10 @@ final class InvoiceService
 
     /**
      * @param array<string,mixed> $filters
-     * @return array<int,array<string,mixed>>
+     * @return array<string,mixed> Paginated payload (items + meta)
      */
-    public function list(array $filters = []): array
+    public function list(int $page = 1, int $perPage = 20, array $filters = []): array
     {
-        return $this->invoices->list($filters);
+        return $this->invoices->paginateWithFilters($page, $perPage, $filters);
     }
 }

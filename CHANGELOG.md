@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Additional gateway drivers (Stripe, Flutterwave, etc.)
 - Webhook helpers and signatures verification utilities
 
+## [0.2.0] - 2025-11-17
+
+### Added
+- **Invoice Pagination**: Added pagination support to invoice listing endpoint
+  - New `paginateWithFilters()` method in `InvoiceRepository` and `InvoiceRepositoryInterface`
+  - Supports `page` and `per_page` query parameters in `GET /payvia/invoices` endpoint
+  - Returns paginated response with metadata (total, per_page, current_page, last_page, etc.)
+  - Advanced filtering support:
+    - Filter by `status`, `user_uuid`, `billing_plan_uuid`
+    - Filter by polymorphic relation (`payable_type`, `payable_id`)
+    - JSON metadata filtering via `metadata_contains` (key-value search)
+
+### Changed
+- **Breaking**: `InvoiceService::list()` method signature updated
+  - Old: `list(array $filters = []): array`
+  - New: `list(int $page = 1, int $perPage = 20, array $filters = []): array`
+  - Now returns paginated result structure instead of plain array
+- `InvoiceController::index()` now uses `Response::successWithMeta()` for paginated responses
+  - Response structure: `{ "data": [...], "total": N, "per_page": N, ... }`
+
 ## [0.1.2] - 2025-11-16
 
 ### Fixed
