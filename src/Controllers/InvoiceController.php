@@ -130,9 +130,16 @@ final class InvoiceController extends BaseController
                 ];
             }
 
-            $invoices = $this->invoices->list($filters);
+            $page = isset($query['page']) && is_numeric($query['page']) ? max(1, (int) $query['page']) : 1;
+            $perPage = isset($query['per_page']) && is_numeric($query['per_page']) ? max(1, (int) $query['per_page']) : 20;
 
-            return $this->success(['invoices' => $invoices], 'Invoices retrieved');
+            $result = $this->invoices->list($page, $perPage, $filters);
+
+            $data = $result['data'] ?? [];
+            $meta = $result;
+            unset($meta['data']);
+
+            return Response::successWithMeta($data, $meta, 'Invoices retrieved');
         } catch (\Throwable $e) {
             return $this->serverError('Failed to list invoices: ' . $e->getMessage());
         }

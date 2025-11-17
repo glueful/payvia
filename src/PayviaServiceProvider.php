@@ -26,7 +26,7 @@ final class PayviaServiceProvider extends ServiceProvider
 
     public function getVersion(): string
     {
-        return '0.1.2';
+        return '0.2.0';
     }
 
     public function getDescription(): string
