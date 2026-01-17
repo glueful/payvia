@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Additional gateway drivers (Stripe, Flutterwave, etc.)
 - Webhook helpers and signatures verification utilities
 
+## [0.3.0] - 2026-01-17
+
+### Breaking Changes
+- **PHP 8.3 Required**: Minimum PHP version raised from 8.2 to 8.3.
+- **Glueful 1.9.0 Required**: Minimum framework version raised to 1.9.0.
+
+### Changed
+- Updated `composer.json` PHP requirement to `^8.3`.
+- Updated `extra.glueful.requires.glueful` to `>=1.9.0`.
+
+### Notes
+- Ensure your environment runs PHP 8.3 or higher before upgrading.
+- Run `composer update` after upgrading.
+
 ## [0.2.0] - 2025-11-17
 
 ### Added
