@@ -16,7 +16,7 @@ final class PaymentController extends BaseController
         private ?PaymentService $payments = null
     ) {
         parent::__construct();
-        $this->payments = $this->payments ?? app(PaymentService::class);
+        $this->payments = $this->payments ?? app($this->getContext(), PaymentService::class);
     }
 
     /**

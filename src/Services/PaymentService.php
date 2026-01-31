@@ -4,15 +4,19 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Services;
 
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\GatewayManager;
 
 final class PaymentService
 {
+    private ApplicationContext $context;
     public function __construct(
+        ApplicationContext $context,
         private PaymentRepositoryInterface $payments,
         private GatewayManager $gateways,
     ) {
+        $this->context = $context;
     }
 
     /**
@@ -24,7 +28,7 @@ final class PaymentService
         ?string $gatewayName = null,
         array $context = []
     ): array {
-        $gatewayKey = $gatewayName ?: (string) config('payvia.default_gateway', 'paystack');
+        $gatewayKey = $gatewayName ?: (string) config($this->context, 'payvia.default_gateway', 'paystack');
 
         $options = (array) ($context['options'] ?? []);
         $gateway = $this->gateways->gateway($gatewayKey);
@@ -85,7 +89,7 @@ final class PaymentService
             'status' => $status,
             'message' => $message !== '' ? $message : null,
             'metadata' => $metadata !== [] ? $metadata : null,
-            'raw_payload' => config('payvia.features.store_raw_payload', true)
+            'raw_payload' => config($this->context, 'payvia.features.store_raw_payload', true)
                 ? json_encode($verification, JSON_THROW_ON_ERROR)
                 : null,
         ];

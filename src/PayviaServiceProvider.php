@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia;
 
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\ServiceProvider;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
@@ -26,7 +27,7 @@ final class PayviaServiceProvider extends ServiceProvider
 
     public function getVersion(): string
     {
-        return '0.2.0';
+        return '0.4.0';
     }
 
     public function getDescription(): string
@@ -52,32 +53,37 @@ final class PayviaServiceProvider extends ServiceProvider
             PaymentService::class => [
                 'class' => PaymentService::class,
                 'shared' => true,
+                'autowire' => true,
             ],
             BillingPlanService::class => [
                 'class' => BillingPlanService::class,
                 'shared' => true,
+                'autowire' => true,
             ],
             InvoiceService::class => [
                 'class' => InvoiceService::class,
                 'shared' => true,
+                'autowire' => true,
             ],
             GatewayManager::class => [
                 'class' => GatewayManager::class,
                 'shared' => true,
+                'autowire' => true,
             ],
             PaystackGateway::class => [
                 'class' => PaystackGateway::class,
                 'shared' => true,
+                'autowire' => true,
             ],
         ];
     }
 
-    public function register(): void
+    public function register(ApplicationContext $context): void
     {
         $this->mergeConfig('payvia', require __DIR__ . '/../config/payvia.php');
     }
 
-    public function boot(): void
+    public function boot(ApplicationContext $context): void
     {
 
         try {

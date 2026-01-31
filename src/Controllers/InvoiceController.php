@@ -15,7 +15,7 @@ final class InvoiceController extends BaseController
         private ?InvoiceService $invoices = null
     ) {
         parent::__construct();
-        $this->invoices = $this->invoices ?? app(InvoiceService::class);
+        $this->invoices = $this->invoices ?? app($this->getContext(), InvoiceService::class);
     }
 
     public function create(Request $request): Response

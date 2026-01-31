@@ -4,19 +4,23 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Gateways;
 
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Http\Client as HttpClient;
 
 final class PaystackGateway implements PaymentGatewayInterface
 {
+    private ApplicationContext $context;
     public function __construct(
         private HttpClient $httpClient,
+        ApplicationContext $context,
     ) {
+        $this->context = $context;
     }
 
     public function verify(string $reference, array $options = []): array
     {
-        $config = (array) config('payvia.gateways.paystack', []);
+        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
 
         $secret = (string) ($config['secret_key'] ?? '');
         if ($secret === '') {

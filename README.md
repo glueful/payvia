@@ -20,8 +20,8 @@ Payvia is the official payment gateway bridge for the Glueful PHP Framework. It 
 
 ## Requirements
 
-- PHP 8.2+
-- Glueful Framework 1.7.1+ (via `extra.glueful.requires`)
+- PHP 8.3+
+- Glueful Framework 1.22.0+
 - No extra libraries required for Paystack (uses Glueful HTTP client)
 - Provider‑specific SDKs are optional if you add custom gateways
 
