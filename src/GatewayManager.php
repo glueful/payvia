@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia;
 
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 use Psr\Container\ContainerInterface;
 
 final class GatewayManager
 {
+    private ApplicationContext $context;
     /** @var array<string,string> */
     private array $drivers = [
         'paystack' => PaystackGateway::class,
@@ -21,7 +23,9 @@ final class GatewayManager
 
     public function __construct(
         private ContainerInterface $container,
+        ApplicationContext $context,
     ) {
+        $this->context = $context;
     }
 
     public function gateway(string $name): PaymentGatewayInterface
@@ -30,7 +34,7 @@ final class GatewayManager
             return $this->resolved[$name];
         }
 
-        $config = (array) config('payvia.gateways', []);
+        $config = (array) config($this->context, 'payvia.gateways', []);
         if (!isset($config[$name]) || (($config[$name]['enabled'] ?? true) === false)) {
             throw new \RuntimeException("Payvia: gateway '{$name}' is not configured or disabled.");
         }

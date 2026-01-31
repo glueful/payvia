@@ -16,7 +16,7 @@ final class BillingPlanController extends BaseController
         private ?BillingPlanService $plans = null
     ) {
         parent::__construct();
-        $this->plans = $this->plans ?? app(BillingPlanService::class);
+        $this->plans = $this->plans ?? app($this->getContext(), BillingPlanService::class);
     }
 
     public function create(Request $request): Response

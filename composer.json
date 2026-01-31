@@ -27,12 +27,6 @@
         "squizlabs/php_codesniffer": "^3.6",
         "phpstan/phpstan": "^1.0"
     },
-    "repositories": [
-        {
-            "type": "path",
-            "url": "${GLUEFUL_PATH}"
-        }
-    ],
     "homepage": "https://github.com/glueful/payvia",
     "autoload": {
         "psr-4": {
@@ -55,7 +49,7 @@
             "name": "Payvia",
             "displayName": "Payvia Payments",
             "description": "Unified payment gateway bridge for Glueful (Stripe, Paystack, Flutterwave, and more).",
-            "version": "0.3.0",
+            "version": "0.4.0",
             "icon": "assets/icon.png",
             "categories": [
                 "payments",
@@ -64,7 +58,7 @@
             "publisher": "glueful-team",
             "provider": "Glueful\\Extensions\\Payvia\\PayviaServiceProvider",
             "requires": {
-                "glueful": ">=1.9.0",
+                "glueful": ">=1.22.0",
                 "extensions": []
             }
         }
