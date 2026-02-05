@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Additional gateway drivers (Stripe, Flutterwave, etc.)
 - Webhook helpers and signatures verification utilities
 
+## [0.5.0] - 2026-02-05
+
+### Changed
+- **Framework Compatibility**: Updated minimum framework requirement to Glueful 1.28.0
+  - Compatible with route caching infrastructure (Bellatrix release)
+  - Routes converted from closures to `[Controller::class, 'method']` syntax for cache compatibility
+- **Route Refactoring**: All 9 payment routes now use controller syntax
+  - Payment confirmation: `PaymentController::confirm`
+  - Billing plans: `BillingPlanController::create`, `update`, `disable`, `index`
+  - Invoices: `InvoiceController::create`, `markPaid`, `cancel`, `index`
+- **composer.json**: Updated `extra.glueful.requires.glueful` to `>=1.28.0`
+
+### Notes
+- This release enables route caching for improved performance
+- All existing functionality remains unchanged
+- Run `composer update` after upgrading
+
 ## [0.4.0] - 2026-01-31
 
 ### Changed
