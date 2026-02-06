@@ -20,6 +20,22 @@ use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 
 final class PayviaServiceProvider extends ServiceProvider
 {
+    private static ?string $cachedVersion = null;
+
+    /**
+     * Read the extension version from composer.json (cached)
+     */
+    public static function composerVersion(): string
+    {
+        if (self::$cachedVersion === null) {
+            $path = __DIR__ . '/../composer.json';
+            $composer = json_decode(file_get_contents($path), true);
+            self::$cachedVersion = $composer['version'] ?? '0.0.0';
+        }
+
+        return self::$cachedVersion;
+    }
+
     public function getName(): string
     {
         return 'Payvia';
@@ -27,7 +43,7 @@ final class PayviaServiceProvider extends ServiceProvider
 
     public function getVersion(): string
     {
-        return '0.4.0';
+        return self::composerVersion();
     }
 
     public function getDescription(): string

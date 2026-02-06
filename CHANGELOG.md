@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Additional gateway drivers (Stripe, Flutterwave, etc.)
 - Webhook helpers and signatures verification utilities
 
+## [0.5.1] - 2026-02-06
+
+### Changed
+- **Version Management**: Version is now read from `composer.json` at runtime via `PayviaServiceProvider::composerVersion()`.
+  - `getVersion()` now returns `self::composerVersion()` instead of a hardcoded string.
+  - `registerMeta()` in `boot()` already used `$this->getVersion()`, so it automatically benefits.
+  - Future releases only require updating `composer.json` and `CHANGELOG.md`.
+
+### Fixed
+- **Version Mismatch**: `getVersion()` was returning `0.4.0` while `composer.json` specified `0.5.0`. All version references now read from `composer.json` as single source of truth.
+
+### Notes
+- No breaking changes. Internal refactor only.
+
 ## [0.5.0] - 2026-02-05
 
 ### Changed
