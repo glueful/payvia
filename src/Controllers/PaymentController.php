@@ -7,7 +7,7 @@ namespace Glueful\Extensions\Payvia\Controllers;
 use Glueful\Controllers\BaseController;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Http\Response;
-use Glueful\Exceptions\ValidationException;
+use Glueful\Validation\ValidationException;
 use Symfony\Component\HttpFoundation\Request;
 
 final class PaymentController extends BaseController
