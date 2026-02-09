@@ -15,6 +15,9 @@ use Glueful\Extensions\Payvia\Repositories\InvoiceRepository;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Extensions\Payvia\Services\BillingPlanService;
 use Glueful\Extensions\Payvia\Services\InvoiceService;
+use Glueful\Extensions\Payvia\Controllers\PaymentController;
+use Glueful\Extensions\Payvia\Controllers\BillingPlanController;
+use Glueful\Extensions\Payvia\Controllers\InvoiceController;
 use Glueful\Extensions\Payvia\GatewayManager;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 
@@ -88,6 +91,21 @@ final class PayviaServiceProvider extends ServiceProvider
             ],
             PaystackGateway::class => [
                 'class' => PaystackGateway::class,
+                'shared' => true,
+                'autowire' => true,
+            ],
+            PaymentController::class => [
+                'class' => PaymentController::class,
+                'shared' => true,
+                'autowire' => true,
+            ],
+            BillingPlanController::class => [
+                'class' => BillingPlanController::class,
+                'shared' => true,
+                'autowire' => true,
+            ],
+            InvoiceController::class => [
+                'class' => InvoiceController::class,
                 'shared' => true,
                 'autowire' => true,
             ],

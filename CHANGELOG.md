@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Additional gateway drivers (Stripe, Flutterwave, etc.)
 - Webhook helpers and signatures verification utilities
 
+## [0.6.1] - 2026-02-09
+
+### Fixed
+- **Controller DI Registration**: `PaymentController`, `BillingPlanController`, and `InvoiceController` were not registered in `PayviaServiceProvider::services()`, causing `Service not found` errors when the router resolved controllers from the container. All controllers are now explicitly registered with their dependencies.
+
+### Notes
+- Patch release. No breaking changes.
+
 ## [0.6.0] - 2026-02-09
 
 ### Changed
