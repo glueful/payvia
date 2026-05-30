@@ -30,36 +30,38 @@ Payvia is the official payment gateway bridge for the Glueful PHP Framework. It 
 ```bash
 composer require glueful/payvia
 
-# Rebuild extension cache
-php glueful extensions:cache
-
 # Run migrations for payments
 php glueful migrate run
 ```
 
 ### Enabling the extension
 
-There are two ways to enable this extension:
+Installing the package does **not** auto-load it — its provider must be in
+`config/extensions.php`'s `enabled` allow-list.
 
-1) Manual (recommended; works in all environments)
+**Development (recommended):** the CLI edits `config/extensions.php` and recompiles the
+cache (validated before writing):
 
-Edit your project's `config/extensions.php` and add the provider class to the `enabled` list:
+```bash
+php glueful extensions:enable payvia
+# disable with: php glueful extensions:disable payvia
+```
+
+**By hand / in production:** add the provider as a plain string FQCN (no `::class`),
+then build the manifest in your deploy step:
 
 ```php
 // config/extensions.php
 return [
     'enabled' => [
-        Glueful\Extensions\Payvia\PayviaServiceProvider::class,
+        'Glueful\\Extensions\\Payvia\\PayviaServiceProvider',
         // other providers...
     ],
-    // ...
 ];
 ```
 
-2) CLI (convenient for local development)
-
 ```bash
-php glueful extensions:enable Payvia
+php glueful extensions:cache   # required in production
 ```
 
 ## Verify Installation
@@ -68,8 +70,8 @@ Check discovery and provider wiring:
 
 ```bash
 php glueful extensions:list
-php glueful extensions:info Payvia
-php glueful extensions:why Glueful\\Extensions\\Payvia\\PayviaServiceProvider
+php glueful extensions:info payvia
+php glueful extensions:diagnose
 ```
 
 Run database migrations (if not auto‑run):
