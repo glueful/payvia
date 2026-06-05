@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Controllers;
 
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Controllers\BaseController;
 use Glueful\Extensions\Payvia\Services\BillingPlanService;
 use Glueful\Http\Response;
@@ -13,10 +14,11 @@ use Symfony\Component\HttpFoundation\Request;
 final class BillingPlanController extends BaseController
 {
     public function __construct(
+        ApplicationContext $context,
         private ?BillingPlanService $plans = null
     ) {
-        parent::__construct();
-        $this->plans = $this->plans ?? app($this->getContext(), BillingPlanService::class);
+        parent::__construct($context);
+        $this->plans = $this->plans ?? app($context, BillingPlanService::class);
     }
 
     public function create(Request $request): Response

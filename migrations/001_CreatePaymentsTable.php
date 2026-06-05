@@ -52,10 +52,8 @@ class CreatePaymentsTable implements MigrationInterface
             $table->index('gateway');
             $table->index('gateway_transaction_id');
 
-            $table->foreign('user_uuid')
-                ->references('uuid')
-                ->on('users')
-                ->cascadeOnDelete();
+            // user_uuid is an indexed logical reference to users.uuid (owned by glueful/users);
+            // no cross-package FK (Phase 5 decoupling — integrity enforced at the service layer).
         });
     }
 
