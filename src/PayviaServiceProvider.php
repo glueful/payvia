@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia;
 
 use Glueful\Bootstrap\ApplicationContext;
+use Glueful\Database\Migrations\MigrationPriority;
 use Glueful\Extensions\ServiceProvider;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
@@ -141,9 +142,11 @@ final class PayviaServiceProvider extends ServiceProvider
             }
         }
 
-         // 3) Register migrations directory (low risk)
+         // 3) Register migrations directory. payments/invoices hold (FK-less) logical references to
+         //    users.uuid — owned by glueful/users at IDENTITY — so payvia migrates at DEPENDENT
+         //    (after identity + app) and records its source as glueful/payvia.
         try {
-            $this->loadMigrationsFrom(__DIR__ . '/../migrations');
+            $this->loadMigrationsFrom(__DIR__ . '/../migrations', MigrationPriority::DEPENDENT, 'glueful/payvia');
         } catch (\Throwable $e) {
             error_log('[Payvia] Failed to register migrations: ' . $e->getMessage());
         }

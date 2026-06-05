@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Controllers;
 
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Controllers\BaseController;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Http\Response;
@@ -13,10 +14,11 @@ use Symfony\Component\HttpFoundation\Request;
 final class PaymentController extends BaseController
 {
     public function __construct(
+        ApplicationContext $context,
         private ?PaymentService $payments = null
     ) {
-        parent::__construct();
-        $this->payments = $this->payments ?? app($this->getContext(), PaymentService::class);
+        parent::__construct($context);
+        $this->payments = $this->payments ?? app($context, PaymentService::class);
     }
 
     /**
@@ -34,7 +36,7 @@ final class PaymentController extends BaseController
 
             $reference = isset($data['reference']) && is_string($data['reference']) ? $data['reference'] : '';
             if ($reference === '') {
-                throw new ValidationException('reference is required');
+                throw ValidationException::forField('reference', 'reference is required');
             }
 
             $gateway = isset($data['gateway']) && is_string($data['gateway']) ? $data['gateway'] : null;

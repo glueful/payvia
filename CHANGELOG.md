@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Additional gateway drivers (Stripe, Flutterwave, etc.)
 - Webhook helpers and signatures verification utilities
 
+## [0.7.0] - 2026-06-05 — Framework 1.50 Compatibility
+
+### Fixed
+
+- **Controllers no longer fatal on instantiation against Framework 1.50.** `BaseController::__construct` now requires an `ApplicationContext`, but `PaymentController` / `InvoiceController` / `BillingPlanController` called `parent::__construct()` with no arguments ("Too few arguments" fatal). Each now accepts `ApplicationContext` and passes it through (and resolves its service via `app($context, …)`).
+- **`ValidationException` API updated.** `PaymentController` used `new ValidationException('reference is required')`, but the constructor now expects an errors array — switched to the `ValidationException::forField('reference', …)` factory.
+
+### Changed
+
+- **Dropped cross-package FKs** from `payments.user_uuid` and `invoices.user_uuid` → `users(uuid)`. `user_uuid` is now an **indexed logical reference** (the `users` table is owned by `glueful/users`; Phase-5 decoupling disallows cross-package FKs — integrity is enforced at the service layer).
+- **Migrations register at `MigrationPriority::DEPENDENT`** with source `glueful/payvia` (previously a bare `loadMigrationsFrom()` — the old FKs relied on migration ordering that was never guaranteed).
+- **Minimum framework raised to `glueful/framework >=1.50.1`** (`require-dev` pinned to `^1.50.1`); previously `>=1.30.0`.
+
 ## [0.6.1] - 2026-02-09
 
 ### Fixed
