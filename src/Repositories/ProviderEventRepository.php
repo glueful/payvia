@@ -77,9 +77,11 @@ final class ProviderEventRepository extends BaseRepository implements ProviderEv
 
     public function incrementAttempts(string $uuid): void
     {
-        $row = $this->findByUuid($uuid);
-        $attempts = (int) ($row['attempts'] ?? 0);
-        $this->updateUuid($uuid, ['attempts' => $attempts + 1]);
+        $this->db->table($this->getTableName())
+            ->executeModification(
+                'UPDATE provider_events SET attempts = attempts + 1 WHERE uuid = ?',
+                [$uuid]
+            );
     }
 
     public function isLogicalDispatched(string $gateway, string $logicalEventKey): bool
@@ -112,7 +114,7 @@ final class ProviderEventRepository extends BaseRepository implements ProviderEv
 
     public function reclaimStaleDispatching(string $gateway, string $logicalEventKey, int $staleSeconds): int
     {
-        $cutoff = (new \DateTimeImmutable('-' . $staleSeconds . ' seconds'))->format('Y-m-d H:i:s');
+        $cutoff = $this->formatDateTime(new \DateTimeImmutable('-' . $staleSeconds . ' seconds'));
 
         return (int) $this->db->table($this->getTableName())
             ->where([
@@ -144,7 +146,7 @@ final class ProviderEventRepository extends BaseRepository implements ProviderEv
 
     public function findDispatchable(int $limit = 100, int $staleSeconds = 300): array
     {
-        $cutoff = (new \DateTimeImmutable('-' . $staleSeconds . ' seconds'))->format('Y-m-d H:i:s');
+        $cutoff = $this->formatDateTime(new \DateTimeImmutable('-' . $staleSeconds . ' seconds'));
 
         return $this->db->table($this->getTableName())
             ->select(['*'])
@@ -186,5 +188,10 @@ final class ProviderEventRepository extends BaseRepository implements ProviderEv
     private function now(): string
     {
         return $this->db->getDriver()->formatDateTime();
+    }
+
+    private function formatDateTime(\DateTimeInterface $dateTime): string
+    {
+        return $this->db->getDriver()->formatDateTime($dateTime->format('Y-m-d H:i:s'));
     }
 }

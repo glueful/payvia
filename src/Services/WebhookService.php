@@ -7,20 +7,10 @@ namespace Glueful\Extensions\Payvia\Services;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
+use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\PaymentProviderEvent;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
 use Glueful\Extensions\Payvia\GatewayManager;
-
-final class WebhookIngestResult
-{
-    public function __construct(
-        public readonly bool $accepted,
-        public readonly int $httpStatus,
-        public readonly ?string $providerEventUuid = null,
-        public readonly string $message = 'ok',
-    ) {
-    }
-}
 
 final class WebhookService
 {
@@ -80,7 +70,11 @@ final class WebhookService
             $this->processStored($uuid);
         } else {
             $stored = $this->events->findByDeliveryKey($event->gateway(), $event->deliveryKey());
-            if (is_array($stored) && ($stored['dispatch_status'] ?? null) !== 'dispatched') {
+            if (
+                is_array($stored)
+                && ($stored['status'] ?? null) === 'processed'
+                && ($stored['dispatch_status'] ?? null) !== 'dispatched'
+            ) {
                 $this->dispatch($this->reconstruct($stored), (string) $stored['uuid']);
             }
         }
@@ -118,27 +112,37 @@ final class WebhookService
     {
         $count = 0;
         foreach ($this->events->findDispatchable($limit, $staleSeconds) as $row) {
-            $this->dispatch($this->reconstruct($row), (string) $row['uuid'], $staleSeconds);
-            $count++;
+            if ($this->dispatch($this->reconstruct($row), (string) $row['uuid'], $staleSeconds)) {
+                $count++;
+            }
         }
 
         return $count;
     }
 
-    private function dispatch(PaymentProviderEventInterface $event, string $uuid, int $staleSeconds = 300): void
+    private function dispatch(PaymentProviderEventInterface $event, string $uuid, int $staleSeconds = 300): bool
     {
+        if ($event->type() === EventType::UNKNOWN) {
+            $this->events->markDispatched($uuid);
+            return false;
+        }
+
         if ($this->events->isLogicalDispatched($event->gateway(), $event->logicalEventKey())) {
             $this->events->markDispatched($uuid);
-            return;
+            return false;
         }
 
         $claimed = $this->events->claimLogicalForDispatch($event->gateway(), $event->logicalEventKey());
         if ($claimed === 0) {
-            $claimed = $this->events->reclaimStaleDispatching($event->gateway(), $event->logicalEventKey(), $staleSeconds);
+            $claimed = $this->events->reclaimStaleDispatching(
+                $event->gateway(),
+                $event->logicalEventKey(),
+                $staleSeconds
+            );
         }
 
         if ($claimed === 0) {
-            return;
+            return false;
         }
 
         if ($this->dispatcher !== null) {
@@ -146,6 +150,7 @@ final class WebhookService
         }
 
         $this->events->markLogicalDispatched($event->gateway(), $event->logicalEventKey());
+        return true;
     }
 
     private function recordEvent(

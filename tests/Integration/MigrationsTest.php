@@ -78,9 +78,11 @@ final class MigrationsTest extends PayviaTestCase
             'gateway_subscription_id',
             'gateway_customer_id',
             'gateway_price_id',
+            'billing_plan_uuid',
             'status',
             'current_period_end',
             'cancel_at_period_end',
+            'metadata',
             'raw_payload',
         ] as $column) {
             self::assertTrue($schema->hasColumn('gateway_subscriptions', $column), "missing {$column}");

@@ -234,6 +234,7 @@ final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGate
                 ? (string) $object['customer']
                 : null,
             'gateway_price_id' => $this->priceId($object),
+            'billing_plan_uuid' => $this->metadataString($object, 'billing_plan_uuid'),
             'amount' => $this->amount($object),
             'currency' => $currency,
             'status' => $object['status'] ?? $object['payment_status'] ?? null,
@@ -241,6 +242,7 @@ final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGate
             'current_period_end' => $this->timestamp($object['current_period_end'] ?? null),
             'cancel_at_period_end' => $object['cancel_at_period_end'] ?? null,
             'canceled_at' => $this->timestamp($object['canceled_at'] ?? null),
+            'metadata' => isset($object['metadata']) && is_array($object['metadata']) ? $object['metadata'] : null,
         ], static fn($value): bool => $value !== null);
     }
 
@@ -316,6 +318,13 @@ final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGate
         }
 
         return null;
+    }
+
+    /** @param array<string,mixed> $object */
+    private function metadataString(array $object, string $key): ?string
+    {
+        $metadata = (array) ($object['metadata'] ?? []);
+        return isset($metadata[$key]) && is_scalar($metadata[$key]) ? (string) $metadata[$key] : null;
     }
 
     private function occurredAt(array $payload): \DateTimeImmutable

@@ -20,7 +20,8 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      * @response 401 "Invalid signature"
      * @response 404 "Gateway not found or unsupported"
      */
-    $router->post('/webhooks/{gateway}', [WebhookController::class, 'handle']);
+    $router->post('/webhooks/{gateway}', [WebhookController::class, 'handle'])
+        ->where('gateway', '[a-z0-9_]+');
 
     /**
      * @route POST /payvia/payments/confirm

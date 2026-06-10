@@ -77,7 +77,8 @@ final class ProviderEventRepositoryTest extends PayviaTestCase
         $this->connection->table('provider_events')
             ->where(['uuid' => $uuid])
             ->update([
-                'dispatch_claimed_at' => (new \DateTimeImmutable('-10 minutes'))->format('Y-m-d H:i:s'),
+                'dispatch_claimed_at' => $this->connection->getDriver()
+                    ->formatDateTime((new \DateTimeImmutable('-10 minutes'))->format('Y-m-d H:i:s')),
             ]);
 
         $rows = $this->repo->findDispatchable(staleSeconds: 300);

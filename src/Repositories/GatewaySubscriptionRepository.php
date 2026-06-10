@@ -35,6 +35,7 @@ final class GatewaySubscriptionRepository extends BaseRepository implements Gate
             $uuid = Utils::generateNanoID(12);
             $this->db->table($this->getTableName())->insert(array_merge($payload, [
                 'uuid' => $uuid,
+                'status' => $payload['status'] ?? 'active',
                 'created_at' => $now,
             ]));
             return $uuid;
@@ -52,6 +53,9 @@ final class GatewaySubscriptionRepository extends BaseRepository implements Gate
     {
         if (isset($data['raw_payload']) && is_array($data['raw_payload'])) {
             $data['raw_payload'] = json_encode($data['raw_payload'], JSON_THROW_ON_ERROR);
+        }
+        if (isset($data['metadata']) && is_array($data['metadata'])) {
+            $data['metadata'] = json_encode($data['metadata'], JSON_THROW_ON_ERROR);
         }
 
         return $data;

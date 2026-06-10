@@ -39,7 +39,8 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
         $baseUrl = rtrim((string) ($config['base_url'] ?? 'https://api.paystack.co'), '/');
         $timeout = (int) ($config['timeout'] ?? 15);
 
-        $verifyUrl = (string) ($options['verify_url'] ?? ($baseUrl . '/transaction/verify/' . rawurlencode($reference)));
+        $verifyUrl = (string) ($options['verify_url']
+            ?? ($baseUrl . '/transaction/verify/' . rawurlencode($reference)));
 
         try {
             $response = $this->httpClient->get($verifyUrl, [
@@ -161,6 +162,22 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
             return ['status' => 'failed', 'message' => 'Missing Paystack secret key'];
         }
 
+        $subscription = $this->fetchSubscription($gatewaySubscriptionId);
+        $subscriptionData = (array) ($subscription['data'] ?? $subscription);
+        $token = $this->stringOrNull(
+            $subscriptionData['email_token']
+                ?? $subscriptionData['token']
+                ?? $subscriptionData['emailToken']
+                ?? null
+        );
+        if ($token === null) {
+            return [
+                'status' => 'failed',
+                'message' => 'Paystack subscription cancellation requires an email token',
+                'raw' => $subscription,
+            ];
+        }
+
         $baseUrl = rtrim((string) ($config['base_url'] ?? 'https://api.paystack.co'), '/');
         $timeout = (int) ($config['timeout'] ?? 15);
         $response = $this->httpClient->post($baseUrl . '/subscription/disable', [
@@ -169,7 +186,10 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
                 'Accept' => 'application/json',
                 'Content-Type' => 'application/json',
             ],
-            'json' => ['code' => $gatewaySubscriptionId],
+            'json' => [
+                'code' => $gatewaySubscriptionId,
+                'token' => $token,
+            ],
             'timeout' => $timeout,
         ]);
 
@@ -233,13 +253,17 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
             'type' => $type,
             'reference' => $data['reference'] ?? null,
             'gateway_transaction_id' => isset($data['id']) ? (string) $data['id'] : null,
-            'gateway_subscription_id' => $data['subscription_code'] ?? $data['subscription']['subscription_code'] ?? null,
+            'gateway_subscription_id' => $data['subscription_code']
+                ?? $data['subscription']['subscription_code']
+                ?? null,
             'gateway_customer_id' => $customer['customer_code'] ?? $data['customer_code'] ?? null,
+            'billing_plan_uuid' => $data['metadata']['billing_plan_uuid'] ?? null,
             'amount' => $amount,
             'currency' => $data['currency'] ?? null,
             'status' => $data['status'] ?? null,
             'current_period_end' => $data['next_payment_date'] ?? null,
             'cancel_at_period_end' => null,
+            'metadata' => isset($data['metadata']) && is_array($data['metadata']) ? $data['metadata'] : null,
         ], static fn($value): bool => $value !== null);
     }
 
@@ -253,5 +277,10 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
         }
 
         return new \DateTimeImmutable();
+    }
+
+    private function stringOrNull(mixed $value): ?string
+    {
+        return is_scalar($value) && (string) $value !== '' ? (string) $value : null;
     }
 }

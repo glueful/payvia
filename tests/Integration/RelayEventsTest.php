@@ -94,4 +94,35 @@ final class RelayEventsTest extends PayviaTestCase
 
         self::assertSame(['payment.succeeded:R2'], $dispatched);
     }
+
+    public function testRelayRecoversStaleDispatchClaimExactlyOnce(): void
+    {
+        $dispatched = [];
+        $service = $this->service($dispatched);
+        $uuid = $this->events->insertReceived([
+            'gateway' => 'fake',
+            'source' => 'webhook',
+            'delivery_key' => 'stale:R3',
+            'logical_event_key' => 'payment.succeeded:R3',
+            'type' => EventType::PAYMENT_SUCCEEDED,
+            'signature_valid' => true,
+            'normalized_payload' => [],
+            'raw_payload' => [],
+        ]);
+        self::assertNotNull($uuid);
+
+        $this->events->markProcessed($uuid);
+        self::assertGreaterThanOrEqual(1, $this->events->claimLogicalForDispatch('fake', 'payment.succeeded:R3'));
+
+        $this->connection->table('provider_events')
+            ->where(['uuid' => $uuid])
+            ->update([
+                'dispatch_claimed_at' => $this->connection->getDriver()
+                    ->formatDateTime((new \DateTimeImmutable('-10 minutes'))->format('Y-m-d H:i:s')),
+            ]);
+
+        self::assertSame(1, $service->relayPending(staleSeconds: 300));
+        self::assertSame(['payment.succeeded:R3'], $dispatched);
+        self::assertSame(0, $service->relayPending(staleSeconds: 300));
+    }
 }

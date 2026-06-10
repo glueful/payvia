@@ -89,6 +89,37 @@ final class WebhookIngestionTest extends PayviaTestCase
         self::assertSame(['payment.succeeded:REF_2'], $dispatched);
     }
 
+    public function testDuplicateVerifyEventDoesNotDispatchUnprocessedStoredRow(): void
+    {
+        $dispatched = [];
+        $service = $this->service($dispatched);
+
+        $uuid = $this->events->insertReceived([
+            'gateway' => 'fake',
+            'source' => 'verify',
+            'delivery_key' => 'verify:REF_WAIT',
+            'logical_event_key' => 'payment.succeeded:REF_WAIT',
+            'type' => EventType::PAYMENT_SUCCEEDED,
+            'signature_valid' => true,
+            'normalized_payload' => ['reference' => 'REF_WAIT'],
+            'raw_payload' => [],
+        ]);
+        self::assertNotNull($uuid);
+
+        $service->recordVerifyEvent(\Glueful\Extensions\Payvia\Events\ProviderEvent::create(
+            'fake',
+            EventType::PAYMENT_SUCCEEDED,
+            null,
+            'verify:REF_WAIT',
+            'REF_WAIT',
+            new \DateTimeImmutable(),
+            ['reference' => 'REF_WAIT'],
+            []
+        ));
+
+        self::assertSame([], $dispatched);
+    }
+
     public function testQueuedIngestPersistsButDoesNotDispatchUntilProcessed(): void
     {
         $dispatched = [];
@@ -112,5 +143,45 @@ final class WebhookIngestionTest extends PayviaTestCase
 
         $service->processStored($queued[0]);
         self::assertSame(['payment.succeeded:REF_3'], $dispatched);
+    }
+
+    public function testInvalidSignatureReturns401AndDoesNotPersist(): void
+    {
+        $dispatched = [];
+        $this->gateway->signatureValid = false;
+        $service = $this->service($dispatched);
+        $body = json_encode([
+            'type' => EventType::PAYMENT_SUCCEEDED,
+            'entity_id' => 'REF_BAD',
+            'delivery_key' => 'delivery-bad',
+            'normalized' => ['reference' => 'REF_BAD'],
+        ], JSON_THROW_ON_ERROR);
+
+        $result = $service->ingest('fake', $body);
+
+        self::assertFalse($result->accepted);
+        self::assertSame(401, $result->httpStatus);
+        self::assertNull($this->events->findByDeliveryKey('fake', 'delivery-bad'));
+        self::assertSame([], $dispatched);
+    }
+
+    public function testUnknownProviderEventsArePersistedButNotDispatched(): void
+    {
+        $dispatched = [];
+        $service = $this->service($dispatched);
+        $body = json_encode([
+            'type' => EventType::UNKNOWN,
+            'entity_id' => 'mystery',
+            'delivery_key' => 'delivery-unknown',
+            'normalized' => ['provider_type' => 'something.new'],
+        ], JSON_THROW_ON_ERROR);
+
+        $result = $service->ingest('fake', $body);
+        $stored = $this->events->findByDeliveryKey('fake', 'delivery-unknown');
+
+        self::assertSame(200, $result->httpStatus);
+        self::assertSame([], $dispatched);
+        self::assertSame('processed', $stored['status']);
+        self::assertSame('dispatched', $stored['dispatch_status']);
     }
 }
