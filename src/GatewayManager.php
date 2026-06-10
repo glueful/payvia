@@ -6,7 +6,10 @@ namespace Glueful\Extensions\Payvia;
 
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
+use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
+use Glueful\Extensions\Payvia\Gateways\StripeGateway;
 use Psr\Container\ContainerInterface;
 
 final class GatewayManager
@@ -15,7 +18,7 @@ final class GatewayManager
     /** @var array<string,string> */
     private array $drivers = [
         'paystack' => PaystackGateway::class,
-        // additional drivers (stripe, flutterwave, etc.) can be added here
+        'stripe' => StripeGateway::class,
     ];
 
     /** @var array<string,PaymentGatewayInterface> */
@@ -35,11 +38,14 @@ final class GatewayManager
         }
 
         $config = (array) config($this->context, 'payvia.gateways', []);
-        if (!isset($config[$name]) || (($config[$name]['enabled'] ?? true) === false)) {
+        if (!isset($config[$name]) && !isset($this->drivers[$name])) {
             throw new \RuntimeException("Payvia: gateway '{$name}' is not configured or disabled.");
         }
+        if (isset($config[$name]) && (($config[$name]['enabled'] ?? true) === false)) {
+            throw new \RuntimeException("Payvia: gateway '{$name}' is disabled.");
+        }
 
-        $gatewayConfig = (array) $config[$name];
+        $gatewayConfig = (array) ($config[$name] ?? []);
         $driver = (string) ($gatewayConfig['driver'] ?? $name);
 
         $class = $this->drivers[$driver] ?? null;
@@ -53,5 +59,46 @@ final class GatewayManager
         }
 
         return $this->resolved[$name] = $instance;
+    }
+
+    public function registerDriver(string $name, string $class): void
+    {
+        $this->drivers[$name] = $class;
+        unset($this->resolved[$name]);
+    }
+
+    public function supports(string $gateway, string $capability): bool
+    {
+        try {
+            $driver = $this->gateway($gateway);
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return match ($capability) {
+            'webhook' => $driver instanceof WebhookCapableGateway,
+            'subscription' => $driver instanceof SubscriptionCapableGateway,
+            default => false,
+        };
+    }
+
+    public function webhookGateway(string $gateway): WebhookCapableGateway
+    {
+        $driver = $this->gateway($gateway);
+        if (!$driver instanceof WebhookCapableGateway) {
+            throw new \RuntimeException("Payvia: gateway '{$gateway}' does not support webhooks.");
+        }
+
+        return $driver;
+    }
+
+    public function subscriptionGateway(string $gateway): SubscriptionCapableGateway
+    {
+        $driver = $this->gateway($gateway);
+        if (!$driver instanceof SubscriptionCapableGateway) {
+            throw new \RuntimeException("Payvia: gateway '{$gateway}' does not support subscriptions.");
+        }
+
+        return $driver;
     }
 }
