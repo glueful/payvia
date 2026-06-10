@@ -6,6 +6,8 @@ namespace Glueful\Extensions\Payvia\Services;
 
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
+use Glueful\Extensions\Payvia\Events\EventType;
+use Glueful\Extensions\Payvia\Events\ProviderEvent;
 use Glueful\Extensions\Payvia\GatewayManager;
 
 final class PaymentService
@@ -15,6 +17,7 @@ final class PaymentService
         ApplicationContext $context,
         private PaymentRepositoryInterface $payments,
         private GatewayManager $gateways,
+        private ?WebhookService $webhooks = null,
     ) {
         $this->context = $context;
     }
@@ -99,6 +102,30 @@ final class PaymentService
             $this->payments->createPayment($payload);
         } else {
             $this->payments->updateByReference($reference, $payload);
+        }
+
+        if ($this->webhooks !== null) {
+            try {
+                $eventType = $status === 'success' ? EventType::PAYMENT_SUCCEEDED : EventType::PAYMENT_FAILED;
+                $this->webhooks->recordVerifyEvent(ProviderEvent::create(
+                    gateway: $gatewayKey,
+                    type: $eventType,
+                    providerEventId: $providerId !== '' ? $providerId : null,
+                    deliveryKey: $providerId !== '' ? 'verify:' . $providerId : 'verify:' . $reference,
+                    entityId: $reference,
+                    occurredAt: new \DateTimeImmutable(),
+                    normalized: [
+                        'reference' => $reference,
+                        'gateway_transaction_id' => $providerId !== '' ? $providerId : null,
+                        'amount' => $amount,
+                        'currency' => $currency,
+                        'status' => $status,
+                    ],
+                    raw: $verification,
+                ));
+            } catch (\Throwable) {
+                // Payment confirmation must not regress if the optional outbox path is unavailable.
+            }
         }
 
         return [
