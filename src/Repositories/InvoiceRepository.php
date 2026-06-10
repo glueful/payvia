@@ -91,7 +91,11 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
             $qb = $qb->where('user_uuid', '=', $filters['user_uuid']);
         }
 
-        if (isset($filters['billing_plan_uuid']) && is_string($filters['billing_plan_uuid']) && $filters['billing_plan_uuid'] !== '') {
+        if (
+            isset($filters['billing_plan_uuid'])
+            && is_string($filters['billing_plan_uuid'])
+            && $filters['billing_plan_uuid'] !== ''
+        ) {
             $qb = $qb->where('billing_plan_uuid', '=', $filters['billing_plan_uuid']);
         }
 
@@ -143,7 +147,11 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
             $qb = $qb->where('user_uuid', '=', $filters['user_uuid']);
         }
 
-        if (isset($filters['billing_plan_uuid']) && is_string($filters['billing_plan_uuid']) && $filters['billing_plan_uuid'] !== '') {
+        if (
+            isset($filters['billing_plan_uuid'])
+            && is_string($filters['billing_plan_uuid'])
+            && $filters['billing_plan_uuid'] !== ''
+        ) {
             $qb = $qb->where('billing_plan_uuid', '=', $filters['billing_plan_uuid']);
         }
 

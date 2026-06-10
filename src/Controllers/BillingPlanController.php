@@ -42,11 +42,15 @@ final class BillingPlanController extends BaseController
 
             $payload = [
                 'name' => $name,
-                'description' => isset($data['description']) && is_string($data['description']) ? $data['description'] : null,
+                'description' => isset($data['description']) && is_string($data['description'])
+                    ? $data['description']
+                    : null,
                 'amount' => (float) $amount,
                 'currency' => isset($data['currency']) && is_string($data['currency']) ? $data['currency'] : 'GHS',
                 'interval' => isset($data['interval']) && is_string($data['interval']) ? $data['interval'] : 'monthly',
-                'trial_days' => isset($data['trial_days']) && is_numeric($data['trial_days']) ? (int) $data['trial_days'] : null,
+                'trial_days' => isset($data['trial_days']) && is_numeric($data['trial_days'])
+                    ? (int) $data['trial_days']
+                    : null,
                 'gateway' => isset($data['gateway']) && is_string($data['gateway']) ? $data['gateway'] : null,
                 'gateway_product_id' => isset($data['gateway_product_id']) && is_string($data['gateway_product_id'])
                     ? $data['gateway_product_id']

@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Database\Migrations\MigrationPriority;
 use Glueful\Extensions\ServiceProvider;
+use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\InvoiceRepositoryInterface;
@@ -29,6 +30,7 @@ use Glueful\Extensions\Payvia\Controllers\WebhookController;
 use Glueful\Extensions\Payvia\GatewayManager;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 use Glueful\Extensions\Payvia\Gateways\StripeGateway;
+use Glueful\Extensions\Payvia\Events\PaymentProviderEvent;
 use Glueful\Events\EventService;
 use Glueful\Queue\QueueManager;
 use Psr\Container\ContainerInterface;
@@ -158,13 +160,13 @@ final class PayviaServiceProvider extends ServiceProvider
         $queueEnabled = (bool) config($context, 'payvia.webhooks.queue', false);
         $queueName = (string) config($context, 'payvia.webhooks.queue_name', 'default');
 
-        $dispatcher = static function (\Glueful\Extensions\Payvia\Events\PaymentProviderEvent $event) use ($container): void {
+        $dispatcher = static function (PaymentProviderEvent $event) use ($container): void {
             if ($container->has(EventService::class)) {
                 $container->get(EventService::class)->dispatch($event);
             }
         };
 
-        $applier = static function (\Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface $event) use ($subscriptions): void {
+        $applier = static function (PaymentProviderEventInterface $event) use ($subscriptions): void {
             $subscriptions->applyProviderEvent($event);
         };
 
@@ -209,7 +211,7 @@ final class PayviaServiceProvider extends ServiceProvider
             error_log('[Payvia] Failed to register extension metadata: ' . $e->getMessage());
         }
 
-         try {
+        try {
             $this->loadRoutesFrom(__DIR__ . '/../routes.php');
         } catch (\Throwable $e) {
             error_log('[Payvia] Failed to load routes: ' . $e->getMessage());

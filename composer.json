@@ -43,8 +43,8 @@
     },
     "scripts": {
         "test": "vendor/bin/phpunit",
-        "phpcs": "vendor/bin/phpcs --standard=Squiz src",
-        "phpcbf": "vendor/bin/phpcbf --standard=Squiz src",
+        "phpcs": "vendor/bin/phpcs --standard=PSR12 src",
+        "phpcbf": "vendor/bin/phpcbf --standard=PSR12 src",
         "analyze": "vendor/bin/phpstan analyze src --level=5"
     },
     "extra": {

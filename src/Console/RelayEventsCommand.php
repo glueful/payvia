@@ -17,7 +17,13 @@ final class RelayEventsCommand extends BaseCommand
     protected function configure(): void
     {
         $this->addOption('limit', null, InputOption::VALUE_OPTIONAL, 'Maximum rows to relay', 100);
-        $this->addOption('stale-seconds', null, InputOption::VALUE_OPTIONAL, 'Reclaim stale dispatching rows after N seconds', 300);
+        $this->addOption(
+            'stale-seconds',
+            null,
+            InputOption::VALUE_OPTIONAL,
+            'Reclaim stale dispatching rows after N seconds',
+            300
+        );
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
