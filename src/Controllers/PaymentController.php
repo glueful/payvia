@@ -43,8 +43,12 @@ final class PaymentController extends BaseController
 
             $context = [
                 'user_uuid' => isset($data['user_uuid']) && is_string($data['user_uuid']) ? $data['user_uuid'] : null,
-                'payable_type' => isset($data['payable_type']) && is_string($data['payable_type']) ? $data['payable_type'] : null,
-                'payable_id' => isset($data['payable_id']) && is_string($data['payable_id']) ? $data['payable_id'] : null,
+                'payable_type' => isset($data['payable_type']) && is_string($data['payable_type'])
+                    ? $data['payable_type']
+                    : null,
+                'payable_id' => isset($data['payable_id']) && is_string($data['payable_id'])
+                    ? $data['payable_id']
+                    : null,
                 'metadata' => isset($data['metadata']) && is_array($data['metadata']) ? $data['metadata'] : null,
                 'options' => isset($data['options']) && is_array($data['options']) ? $data['options'] : [],
             ];

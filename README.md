@@ -2,7 +2,7 @@
 
 ## Overview
 
-Payvia is the official payment gateway bridge for the Glueful PHP Framework. It provides a unified, gateway‑agnostic interface for verifying and recording payments via multiple providers (Paystack, Stripe _[coming soon]_, Flutterwave _[coming soon]_, and more) into a single `payments` table.
+Payvia is the official payment gateway bridge for the Glueful PHP Framework. It provides a unified, gateway‑agnostic interface for verifying and recording payments via multiple providers (Paystack, Stripe, Flutterwave _[coming soon]_, and more) into a single `payments` table.
 
 ## Features
 
@@ -14,6 +14,10 @@ Payvia is the official payment gateway bridge for the Glueful PHP Framework. It 
 - ✅ Gateway abstraction via `PaymentGatewayInterface`
 - ✅ `GatewayManager` to resolve gateways by config name (e.g. `paystack`, `stripe`)
 - ✅ `PaymentService` with a single entrypoint: `confirmAndRecord()`
+- ✅ Normalized provider-event outbox for webhooks and verify-origin confirmations
+- ✅ Signature-verified webhook endpoint:
+  - `POST /payvia/webhooks/{gateway}`
+- ✅ Provider subscription projection in `gateway_subscriptions`
 - ✅ HTTP endpoint for payment confirmation:
   - `POST /payvia/payments/confirm`
  - ✅ Generic billing plans (`billing_plans`) and invoices (`invoices`) with thin services
@@ -21,7 +25,7 @@ Payvia is the official payment gateway bridge for the Glueful PHP Framework. It 
 ## Requirements
 
 - PHP 8.3+
-- Glueful Framework 1.22.0+
+- Glueful Framework 1.50.1+
 - No extra libraries required for Paystack (uses Glueful HTTP client)
 - Provider‑specific SDKs are optional if you add custom gateways
 
@@ -64,6 +68,8 @@ return [
 php glueful extensions:cache   # required in production
 ```
 
+Payvia also auto-discovers the `payvia:relay-events` command. If your app caches command metadata during deploy, rebuild that cache after enabling or upgrading the extension.
+
 ## Verify Installation
 
 Check discovery and provider wiring:
@@ -93,12 +99,16 @@ PAYVIA_DEFAULT_GATEWAY=paystack
 # Paystack
 PAYVIA_PAYSTACK_ENABLED=true
 PAYVIA_PAYSTACK_SECRET_KEY=sk_test_xxx
+PAYVIA_PAYSTACK_WEBHOOK_SECRET=sk_test_xxx
 PAYVIA_PAYSTACK_BASE_URL=https://api.paystack.co
 PAYVIA_PAYSTACK_TIMEOUT=15
 
-# Stripe (example)
+# Stripe
 PAYVIA_STRIPE_ENABLED=false
 PAYVIA_STRIPE_SECRET_KEY=sk_test_xxx
+PAYVIA_STRIPE_WEBHOOK_SECRET=whsec_xxx
+PAYVIA_STRIPE_BASE_URL=https://api.stripe.com
+PAYVIA_STRIPE_TIMEOUT=15
 
 # Flutterwave (example)
 PAYVIA_FLUTTERWAVE_ENABLED=false
@@ -106,6 +116,11 @@ PAYVIA_FLUTTERWAVE_SECRET_KEY=flw_test_xxx
 
 # Whether to store full provider payload in raw_payload column
 PAYVIA_STORE_RAW_PAYLOAD=true
+
+# Webhook processing
+PAYVIA_WEBHOOKS_QUEUE=false
+PAYVIA_WEBHOOKS_QUEUE_NAME=default
+PAYVIA_WEBHOOKS_RELAY_STALE_SECONDS=300
 ```
 
 Config structure (simplified):
@@ -119,18 +134,73 @@ return [
             'enabled' => (bool) env('PAYVIA_PAYSTACK_ENABLED', true),
             'driver' => 'paystack',
             'secret_key' => env('PAYVIA_PAYSTACK_SECRET_KEY', env('PAYSTACK_SECRET_KEY', null)),
+            'webhook_secret' => env('PAYVIA_PAYSTACK_WEBHOOK_SECRET', env('PAYVIA_PAYSTACK_SECRET_KEY', env('PAYSTACK_SECRET_KEY', null))),
             'base_url' => env('PAYVIA_PAYSTACK_BASE_URL', 'https://api.paystack.co'),
             'timeout' => (int) env('PAYVIA_PAYSTACK_TIMEOUT', 15),
         ],
-        // 'stripe' => [...],
+        'stripe' => [
+            'enabled' => (bool) env('PAYVIA_STRIPE_ENABLED', false),
+            'driver' => 'stripe',
+            'secret_key' => env('PAYVIA_STRIPE_SECRET_KEY', null),
+            'webhook_secret' => env('PAYVIA_STRIPE_WEBHOOK_SECRET', null),
+            'webhook_tolerance' => (int) env('PAYVIA_STRIPE_WEBHOOK_TOLERANCE', 300),
+            'base_url' => env('PAYVIA_STRIPE_BASE_URL', 'https://api.stripe.com'),
+            'timeout' => (int) env('PAYVIA_STRIPE_TIMEOUT', 15),
+        ],
         // 'flutterwave' => [...],
     ],
 
     'features' => [
         'store_raw_payload' => (bool) env('PAYVIA_STORE_RAW_PAYLOAD', true),
     ],
+
+    'webhooks' => [
+        'queue' => (bool) env('PAYVIA_WEBHOOKS_QUEUE', false),
+        'queue_name' => env('PAYVIA_WEBHOOKS_QUEUE_NAME', 'default'),
+        'relay_stale_seconds' => (int) env('PAYVIA_WEBHOOKS_RELAY_STALE_SECONDS', 300),
+    ],
 ];
 ```
+
+## Webhooks and Provider Events
+
+Payvia persists provider deliveries in `provider_events`, normalizes them into `ProviderEvent`, applies idempotent side effects, then dispatches `PaymentProviderEvent` through the framework event bus.
+
+The `provider_events` table uses two event keys:
+
+- `delivery_key` dedupes exact provider redeliveries per gateway.
+- `logical_event_key` dedupes the same business fact across delivery paths, such as a manual verify confirmation and a later webhook for the same payment.
+
+`normalized_payload` stores Payvia's gateway-agnostic event shape for replay, while `dispatch_status` powers the outbox relay.
+
+Provider webhook endpoints:
+
+```text
+POST /payvia/webhooks/paystack
+POST /payvia/webhooks/stripe
+```
+
+The webhook route intentionally has no `auth` middleware. Payvia verifies the provider signature inside the webhook pipeline before accepting the event.
+
+`payvia:relay-events` replays processed provider events that were not dispatched yet, including crash recovery for rows stuck in `dispatching`.
+
+## Provider Subscriptions
+
+Payvia persists gateway-owned subscription state in `gateway_subscriptions` and exposes `GatewaySubscriptionService::reconcile($gateway, $gatewaySubscriptionId)`. It stays tenancy-agnostic: tenant ownership and entitlement decisions belong to `glueful/subscriptions`.
+
+`gateway_subscriptions` stores provider subscription state only. It intentionally does not store tenant ownership; `glueful/subscriptions` owns the tenant-to-provider-subscription map and all entitlement decisions.
+
+## Billing Plans and Entitlements
+
+`billing_plans` is the priced-plan side of Payvia. It includes provider linkage fields:
+
+- `gateway`
+- `gateway_product_id`
+- `gateway_price_id`
+
+Use these fields to link a local priced plan to provider-side product, price, or plan objects. Paystack usually maps to `gateway_price_id`; Stripe can use both `gateway_product_id` and `gateway_price_id`.
+
+Payvia does not store feature gates or entitlement catalogs on billing plans. Tenant plans, feature gates, and overrides belong in `glueful/subscriptions`.
 
 ## HTTP API
 
@@ -204,7 +274,9 @@ curl -s -X POST "$API_BASE/payvia/payments/confirm" \
 - `currency` (string, optional, default: `GHS`)
 - `interval` (string, optional, default: `monthly`)
 - `trial_days` (int, optional)
-- `features` (object, optional) – JSON feature flags / limits
+- `gateway` (string, optional)
+- `gateway_product_id` (string, optional)
+- `gateway_price_id` (string, optional)
 - `metadata` (object, optional)
 - `status` (string, optional, default: `active`)
 
@@ -220,14 +292,13 @@ curl -s -X POST "$API_BASE/payvia/plans" \
     "currency": "USD",
     "interval": "monthly",
     "trial_days": 14,
-    "features": {
-      "locations": 3,
-      "users": 10
-    }
+    "gateway": "stripe",
+    "gateway_product_id": "prod_123",
+    "gateway_price_id": "price_123"
   }'
 ```
 
-#### List plans (with JSON feature filtering)
+#### List plans
 
 - **Endpoint:** `GET /payvia/plans`
 - **Middleware:** `auth`, `rate_limit:60,60`
@@ -238,13 +309,11 @@ curl -s -X POST "$API_BASE/payvia/plans" \
 - `status` – filter by plan status (`active`, `inactive`)
 - `interval` – filter by billing interval (`monthly`, `yearly`, `one_time`, etc.)
 - `currency` – filter by currency code
-- `features_key` – JSON key inside `features`
-- `features_value` – value that `features_key` must contain
 
-**Example (plans that include `locations` >= 1):**
+**Example:**
 
 ```bash
-curl -s "$API_BASE/payvia/plans?status=active&features_key=locations&features_value=1" \
+curl -s "$API_BASE/payvia/plans?status=active&interval=monthly" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -336,20 +405,15 @@ $planUuid = $plans->create([
     'currency' => 'USD',
     'interval' => 'monthly',
     'trial_days' => 14,
-    'features' => [
-        'locations' => 3,
-        'users' => 10,
-    ],
+    'gateway' => 'stripe',
+    'gateway_product_id' => 'prod_123',
+    'gateway_price_id' => 'price_123',
 ]);
 
-// List active monthly plans with a feature flag
+// List active monthly plans
 $activePlans = $plans->list([
     'status' => 'active',
     'interval' => 'monthly',
-    'features_contains' => [
-        'key' => 'locations',
-        'value' => '1', // uses whereJsonContains under the hood
-    ],
 ]);
 ```
 
@@ -398,9 +462,9 @@ $userInvoices = $invoices->list([
 
 ## Adding a New Gateway
 
-To add another provider (e.g. Stripe):
+To add another provider:
 
-1. Implement `Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface` (e.g. `StripeGateway`).
+1. Implement `Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface`.
 2. Register the gateway as a service in `PayviaServiceProvider::services()`.
 3. Map a driver name to the class in `GatewayManager::$drivers`.
 4. Add config under `payvia.gateways` in `config/payvia.php` (with `driver` set to your driver name).

@@ -31,7 +31,10 @@
     "autoload": {
         "psr-4": {
             "Glueful\\Extensions\\Payvia\\": "src/"
-        }
+        },
+        "classmap": [
+            "migrations/"
+        ]
     },
     "autoload-dev": {
         "psr-4": {
@@ -40,16 +43,16 @@
     },
     "scripts": {
         "test": "vendor/bin/phpunit",
-        "phpcs": "vendor/bin/phpcs --standard=Squiz src",
-        "phpcbf": "vendor/bin/phpcbf --standard=Squiz src",
+        "phpcs": "vendor/bin/phpcs --standard=PSR12 src",
+        "phpcbf": "vendor/bin/phpcbf --standard=PSR12 src",
         "analyze": "vendor/bin/phpstan analyze src --level=5"
     },
     "extra": {
         "glueful": {
             "name": "Payvia",
             "displayName": "Payvia Payments",
-            "description": "Unified payment gateway bridge for Glueful (Stripe, Paystack, Flutterwave, and more).",
-            "version": "0.7.0",
+            "description": "Unified payment gateway bridge for Glueful (Stripe, Paystack, and more).",
+            "version": "1.0.0",
             "icon": "assets/icon.png",
             "categories": [
                 "payments",

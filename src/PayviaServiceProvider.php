@@ -7,20 +7,33 @@ namespace Glueful\Extensions\Payvia;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Database\Migrations\MigrationPriority;
 use Glueful\Extensions\ServiceProvider;
+use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\InvoiceRepositoryInterface;
+use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
+use Glueful\Extensions\Payvia\Contracts\GatewaySubscriptionRepositoryInterface;
 use Glueful\Extensions\Payvia\Repositories\PaymentRepository;
 use Glueful\Extensions\Payvia\Repositories\BillingPlanRepository;
 use Glueful\Extensions\Payvia\Repositories\InvoiceRepository;
+use Glueful\Extensions\Payvia\Repositories\ProviderEventRepository;
+use Glueful\Extensions\Payvia\Repositories\GatewaySubscriptionRepository;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Extensions\Payvia\Services\BillingPlanService;
 use Glueful\Extensions\Payvia\Services\InvoiceService;
+use Glueful\Extensions\Payvia\Services\WebhookService;
+use Glueful\Extensions\Payvia\Services\GatewaySubscriptionService;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
 use Glueful\Extensions\Payvia\Controllers\BillingPlanController;
 use Glueful\Extensions\Payvia\Controllers\InvoiceController;
+use Glueful\Extensions\Payvia\Controllers\WebhookController;
 use Glueful\Extensions\Payvia\GatewayManager;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
+use Glueful\Extensions\Payvia\Gateways\StripeGateway;
+use Glueful\Extensions\Payvia\Events\PaymentProviderEvent;
+use Glueful\Events\EventService;
+use Glueful\Queue\QueueManager;
+use Psr\Container\ContainerInterface;
 
 final class PayviaServiceProvider extends ServiceProvider
 {
@@ -70,6 +83,14 @@ final class PayviaServiceProvider extends ServiceProvider
                 'class' => InvoiceRepository::class,
                 'shared' => true,
             ],
+            ProviderEventRepositoryInterface::class => [
+                'class' => ProviderEventRepository::class,
+                'shared' => true,
+            ],
+            GatewaySubscriptionRepositoryInterface::class => [
+                'class' => GatewaySubscriptionRepository::class,
+                'shared' => true,
+            ],
             PaymentService::class => [
                 'class' => PaymentService::class,
                 'shared' => true,
@@ -85,6 +106,15 @@ final class PayviaServiceProvider extends ServiceProvider
                 'shared' => true,
                 'autowire' => true,
             ],
+            GatewaySubscriptionService::class => [
+                'class' => GatewaySubscriptionService::class,
+                'shared' => true,
+                'autowire' => true,
+            ],
+            WebhookService::class => [
+                'factory' => [self::class, 'makeWebhookService'],
+                'shared' => true,
+            ],
             GatewayManager::class => [
                 'class' => GatewayManager::class,
                 'shared' => true,
@@ -92,6 +122,11 @@ final class PayviaServiceProvider extends ServiceProvider
             ],
             PaystackGateway::class => [
                 'class' => PaystackGateway::class,
+                'shared' => true,
+                'autowire' => true,
+            ],
+            StripeGateway::class => [
+                'class' => StripeGateway::class,
                 'shared' => true,
                 'autowire' => true,
             ],
@@ -110,7 +145,51 @@ final class PayviaServiceProvider extends ServiceProvider
                 'shared' => true,
                 'autowire' => true,
             ],
+            WebhookController::class => [
+                'class' => WebhookController::class,
+                'shared' => true,
+                'autowire' => true,
+            ],
         ];
+    }
+
+    public static function makeWebhookService(ContainerInterface $container): WebhookService
+    {
+        $context = $container->get(ApplicationContext::class);
+        $subscriptions = $container->get(GatewaySubscriptionService::class);
+        $queueEnabled = (bool) config($context, 'payvia.webhooks.queue', false);
+        $queueName = (string) config($context, 'payvia.webhooks.queue_name', 'default');
+
+        $dispatcher = static function (PaymentProviderEvent $event) use ($container): void {
+            if ($container->has(EventService::class)) {
+                $container->get(EventService::class)->dispatch($event);
+            }
+        };
+
+        $applier = static function (PaymentProviderEventInterface $event) use ($subscriptions): void {
+            $subscriptions->applyProviderEvent($event);
+        };
+
+        $enqueue = static function (string $uuid) use ($container, $queueName): void {
+            if (!$container->has(QueueManager::class)) {
+                return;
+            }
+            $container->get(QueueManager::class)->push(
+                \Glueful\Extensions\Payvia\Jobs\ProcessWebhookJob::class,
+                ['provider_event_uuid' => $uuid],
+                $queueName
+            );
+        };
+
+        return new WebhookService(
+            $context,
+            $container->get(GatewayManager::class),
+            $container->get(ProviderEventRepositoryInterface::class),
+            $dispatcher,
+            $applier,
+            $queueEnabled,
+            $enqueue
+        );
     }
 
     public function register(ApplicationContext $context): void
@@ -132,7 +211,7 @@ final class PayviaServiceProvider extends ServiceProvider
             error_log('[Payvia] Failed to register extension metadata: ' . $e->getMessage());
         }
 
-         try {
+        try {
             $this->loadRoutesFrom(__DIR__ . '/../routes.php');
         } catch (\Throwable $e) {
             error_log('[Payvia] Failed to load routes: ' . $e->getMessage());
@@ -149,6 +228,12 @@ final class PayviaServiceProvider extends ServiceProvider
             $this->loadMigrationsFrom(__DIR__ . '/../migrations', MigrationPriority::DEPENDENT, 'glueful/payvia');
         } catch (\Throwable $e) {
             error_log('[Payvia] Failed to register migrations: ' . $e->getMessage());
+        }
+
+        try {
+            $this->discoverCommands('Glueful\\Extensions\\Payvia\\Console', __DIR__ . '/Console');
+        } catch (\Throwable $e) {
+            error_log('[Payvia] Failed to discover commands: ' . $e->getMessage());
         }
     }
 }

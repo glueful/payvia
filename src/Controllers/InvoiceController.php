@@ -32,9 +32,15 @@ final class InvoiceController extends BaseController
 
             $payload = [
                 'user_uuid' => isset($data['user_uuid']) && is_string($data['user_uuid']) ? $data['user_uuid'] : null,
-                'billing_plan_uuid' => isset($data['billing_plan_uuid']) && is_string($data['billing_plan_uuid']) ? $data['billing_plan_uuid'] : null,
-                'payable_type' => isset($data['payable_type']) && is_string($data['payable_type']) ? $data['payable_type'] : null,
-                'payable_id' => isset($data['payable_id']) && is_string($data['payable_id']) ? $data['payable_id'] : null,
+                'billing_plan_uuid' => isset($data['billing_plan_uuid']) && is_string($data['billing_plan_uuid'])
+                    ? $data['billing_plan_uuid']
+                    : null,
+                'payable_type' => isset($data['payable_type']) && is_string($data['payable_type'])
+                    ? $data['payable_type']
+                    : null,
+                'payable_id' => isset($data['payable_id']) && is_string($data['payable_id'])
+                    ? $data['payable_id']
+                    : null,
                 'number' => isset($data['number']) && is_string($data['number']) ? $data['number'] : null,
                 'amount' => (float) $amount,
                 'currency' => isset($data['currency']) && is_string($data['currency']) ? $data['currency'] : 'GHS',
@@ -56,7 +62,9 @@ final class InvoiceController extends BaseController
         try {
             $data = $this->normalizeBody($request);
 
-            $invoiceUuid = isset($data['invoice_uuid']) && is_string($data['invoice_uuid']) ? $data['invoice_uuid'] : '';
+            $invoiceUuid = isset($data['invoice_uuid']) && is_string($data['invoice_uuid'])
+                ? $data['invoice_uuid']
+                : '';
             if ($invoiceUuid === '') {
                 return $this->validationError(['invoice_uuid' => 'invoice_uuid is required']);
             }
@@ -86,7 +94,9 @@ final class InvoiceController extends BaseController
         try {
             $data = $this->normalizeBody($request);
 
-            $invoiceUuid = isset($data['invoice_uuid']) && is_string($data['invoice_uuid']) ? $data['invoice_uuid'] : '';
+            $invoiceUuid = isset($data['invoice_uuid']) && is_string($data['invoice_uuid'])
+                ? $data['invoice_uuid']
+                : '';
             if ($invoiceUuid === '') {
                 return $this->validationError(['invoice_uuid' => 'invoice_uuid is required']);
             }
@@ -113,7 +123,11 @@ final class InvoiceController extends BaseController
             if (isset($query['user_uuid']) && is_string($query['user_uuid']) && $query['user_uuid'] !== '') {
                 $filters['user_uuid'] = $query['user_uuid'];
             }
-            if (isset($query['billing_plan_uuid']) && is_string($query['billing_plan_uuid']) && $query['billing_plan_uuid'] !== '') {
+            if (
+                isset($query['billing_plan_uuid'])
+                && is_string($query['billing_plan_uuid'])
+                && $query['billing_plan_uuid'] !== ''
+            ) {
                 $filters['billing_plan_uuid'] = $query['billing_plan_uuid'];
             }
             if (isset($query['payable_type']) && is_string($query['payable_type']) && $query['payable_type'] !== '') {
@@ -123,8 +137,12 @@ final class InvoiceController extends BaseController
                 $filters['payable_id'] = $query['payable_id'];
             }
 
-            $metaKey = isset($query['metadata_key']) && is_string($query['metadata_key']) ? $query['metadata_key'] : null;
-            $metaValue = isset($query['metadata_value']) && is_string($query['metadata_value']) ? $query['metadata_value'] : null;
+            $metaKey = isset($query['metadata_key']) && is_string($query['metadata_key'])
+                ? $query['metadata_key']
+                : null;
+            $metaValue = isset($query['metadata_value']) && is_string($query['metadata_value'])
+                ? $query['metadata_value']
+                : null;
             if ($metaKey !== null && $metaKey !== '' && $metaValue !== null && $metaValue !== '') {
                 $filters['metadata_contains'] = [
                     'key' => $metaKey,
@@ -133,7 +151,9 @@ final class InvoiceController extends BaseController
             }
 
             $page = isset($query['page']) && is_numeric($query['page']) ? max(1, (int) $query['page']) : 1;
-            $perPage = isset($query['per_page']) && is_numeric($query['per_page']) ? max(1, (int) $query['per_page']) : 20;
+            $perPage = isset($query['per_page']) && is_numeric($query['per_page'])
+                ? max(1, (int) $query['per_page'])
+                : 20;
 
             $result = $this->invoices->list($page, $perPage, $filters);
 

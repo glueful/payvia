@@ -31,8 +31,12 @@ class CreateBillingPlansTable implements MigrationInterface
             $table->string('interval', 20)->default('monthly');
             $table->integer('trial_days')->nullable();
 
-            // JSON feature flags / usage limits / metadata
-            $table->json('features')->nullable();
+            // Provider linkage for priced plans. Nullable means app-managed / not linked yet.
+            $table->string('gateway', 50)->nullable();
+            $table->string('gateway_product_id', 100)->nullable();
+            $table->string('gateway_price_id', 100)->nullable();
+
+            // App-owned metadata. Entitlements belong in glueful/subscriptions.
             $table->json('metadata')->nullable();
 
             $table->string('status', 20)->default('active');
@@ -55,4 +59,3 @@ class CreateBillingPlansTable implements MigrationInterface
         return 'Creates billing_plans table for generic billing/subscription plans.';
     }
 }
-

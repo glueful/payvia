@@ -34,7 +34,6 @@ interface BillingPlanRepositoryInterface
      * - status: string
      * - interval: string
      * - currency: string
-     * - features_contains: ['key' => string, 'value' => string]
      *
      * @param array<string,mixed> $filters
      * @return array<int,array<string,mixed>>

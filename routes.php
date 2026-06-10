@@ -6,10 +6,23 @@ use Glueful\Routing\Router;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
 use Glueful\Extensions\Payvia\Controllers\BillingPlanController;
 use Glueful\Extensions\Payvia\Controllers\InvoiceController;
+use Glueful\Extensions\Payvia\Controllers\WebhookController;
 
 /** @var Router $router Router instance injected by RouteManifest::load() */
 
 $router->group(['prefix' => '/payvia'], function (Router $router) {
+    /**
+     * @route POST /payvia/webhooks/{gateway}
+     * @summary Receive Gateway Webhook
+     * @description Receives provider webhooks. No auth middleware; signature verification happens inside Payvia.
+     * @tag Webhooks
+     * @response 200 application/json "Webhook accepted"
+     * @response 401 "Invalid signature"
+     * @response 404 "Gateway not found or unsupported"
+     */
+    $router->post('/webhooks/{gateway}', [WebhookController::class, 'handle'])
+        ->where('gateway', '[a-z0-9_]+');
+
     /**
      * @route POST /payvia/payments/confirm
      * @summary Confirm Payment via Gateway
@@ -43,7 +56,9 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      *   currency:string="Currency code (e.g. GHS, USD)"
      *   interval:string="Billing interval: monthly|yearly|one_time"
      *   trial_days:int="Optional trial days"
-     *   features:object="JSON feature flags or usage limits"
+     *   gateway:string="Optional provider gateway key (e.g. paystack)"
+     *   gateway_product_id:string="Optional provider product id"
+     *   gateway_price_id:string="Optional provider price/plan id"
      *   metadata:object="Additional metadata for the plan"
      *   status:string="Plan status (active|inactive)"
      * @response 201 application/json "Plan created"
@@ -65,7 +80,9 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      *   currency:string="New currency code"
      *   interval:string="New billing interval"
      *   trial_days:int="New trial days"
-     *   features:object="New feature set"
+     *   gateway:string="New provider gateway key"
+     *   gateway_product_id:string="New provider product id"
+     *   gateway_price_id:string="New provider price/plan id"
      *   metadata:object="New metadata"
      *   status:string="New status"
      * @response 200 application/json "Plan updated"
@@ -90,14 +107,12 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
     /**
      * @route GET /payvia/plans
      * @summary List Billing Plans
-     * @description Lists billing plans with optional filters, including JSON feature filters.
+     * @description Lists billing plans with optional filters.
      * @tag Billing
      * @query
      *   status:string="Filter by plan status (e.g. active, inactive)"
      *   interval:string="Filter by billing interval"
      *   currency:string="Filter by currency code"
-     *   features_key:string="JSON key under features to filter by"
-     *   features_value:string="Value the features key must contain"
      * @response 200 application/json "Plans retrieved"
      */
     $router->get('/plans', [BillingPlanController::class, 'index'])

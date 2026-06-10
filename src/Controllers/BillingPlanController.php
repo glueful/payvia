@@ -42,12 +42,22 @@ final class BillingPlanController extends BaseController
 
             $payload = [
                 'name' => $name,
-                'description' => isset($data['description']) && is_string($data['description']) ? $data['description'] : null,
+                'description' => isset($data['description']) && is_string($data['description'])
+                    ? $data['description']
+                    : null,
                 'amount' => (float) $amount,
                 'currency' => isset($data['currency']) && is_string($data['currency']) ? $data['currency'] : 'GHS',
                 'interval' => isset($data['interval']) && is_string($data['interval']) ? $data['interval'] : 'monthly',
-                'trial_days' => isset($data['trial_days']) && is_numeric($data['trial_days']) ? (int) $data['trial_days'] : null,
-                'features' => isset($data['features']) && is_array($data['features']) ? $data['features'] : null,
+                'trial_days' => isset($data['trial_days']) && is_numeric($data['trial_days'])
+                    ? (int) $data['trial_days']
+                    : null,
+                'gateway' => isset($data['gateway']) && is_string($data['gateway']) ? $data['gateway'] : null,
+                'gateway_product_id' => isset($data['gateway_product_id']) && is_string($data['gateway_product_id'])
+                    ? $data['gateway_product_id']
+                    : null,
+                'gateway_price_id' => isset($data['gateway_price_id']) && is_string($data['gateway_price_id'])
+                    ? $data['gateway_price_id']
+                    : null,
                 'metadata' => isset($data['metadata']) && is_array($data['metadata']) ? $data['metadata'] : null,
                 'status' => isset($data['status']) && is_string($data['status']) ? $data['status'] : 'active',
             ];
@@ -89,8 +99,10 @@ final class BillingPlanController extends BaseController
             if (array_key_exists('trial_days', $data) && is_numeric($data['trial_days'])) {
                 $update['trial_days'] = (int) $data['trial_days'];
             }
-            if (array_key_exists('features', $data) && is_array($data['features'])) {
-                $update['features'] = $data['features'];
+            foreach (['gateway', 'gateway_product_id', 'gateway_price_id'] as $key) {
+                if (array_key_exists($key, $data) && (is_string($data[$key]) || $data[$key] === null)) {
+                    $update[$key] = $data[$key];
+                }
             }
             if (array_key_exists('metadata', $data) && is_array($data['metadata'])) {
                 $update['metadata'] = $data['metadata'];
@@ -149,15 +161,6 @@ final class BillingPlanController extends BaseController
             }
             if (isset($query['currency']) && is_string($query['currency']) && $query['currency'] !== '') {
                 $filters['currency'] = $query['currency'];
-            }
-
-            $featuresKey = isset($query['features_key']) && is_string($query['features_key']) ? $query['features_key'] : null;
-            $featuresValue = isset($query['features_value']) && is_string($query['features_value']) ? $query['features_value'] : null;
-            if ($featuresKey !== null && $featuresKey !== '' && $featuresValue !== null && $featuresValue !== '') {
-                $filters['features_contains'] = [
-                    'key' => $featuresKey,
-                    'value' => $featuresValue,
-                ];
             }
 
             $plans = $this->plans->list($filters);
