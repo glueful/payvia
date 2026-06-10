@@ -31,7 +31,10 @@
     "autoload": {
         "psr-4": {
             "Glueful\\Extensions\\Payvia\\": "src/"
-        }
+        },
+        "classmap": [
+            "migrations/"
+        ]
     },
     "autoload-dev": {
         "psr-4": {
@@ -48,8 +51,8 @@
         "glueful": {
             "name": "Payvia",
             "displayName": "Payvia Payments",
-            "description": "Unified payment gateway bridge for Glueful (Stripe, Paystack, Flutterwave, and more).",
-            "version": "0.7.0",
+            "description": "Unified payment gateway bridge for Glueful (Stripe, Paystack, and more).",
+            "version": "1.0.0",
             "icon": "assets/icon.png",
             "categories": [
                 "payments",

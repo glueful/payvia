@@ -8,8 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- Additional gateway drivers (Stripe, Flutterwave, etc.)
-- Webhook helpers and signatures verification utilities
+- Flutterwave gateway driver.
+- PayPal/Braintree gateway driver.
+- Adyen gateway driver.
+- Checkout.com gateway driver.
+- Optional marketplace/split-payment capability interfaces.
+- Optional refunds/disputes capability interfaces.
+
+## [1.0.0] - 2026-06-10 -- Stable Payment Provider Surface
+
+### Added
+
+- Gateway linkage fields on `billing_plans`: `gateway`, `gateway_product_id`, and `gateway_price_id`.
+- Normalized provider event seam: `PaymentProviderEventInterface`, immutable `ProviderEvent`, `PaymentProviderEvent`, and `EventType`.
+- Optional gateway capability interfaces: `WebhookCapableGateway` and `SubscriptionCapableGateway`.
+- `provider_events` table with delivery-key ingestion dedupe, logical-key outbox dispatch, durable normalized payload, and crash-recoverable dispatch claiming.
+- `POST /payvia/webhooks/{gateway}` for signature-verified provider webhooks.
+- `payvia:relay-events` for replaying processed-but-undispatched provider events.
+- `gateway_subscriptions` provider subscription projection plus `GatewaySubscriptionService::reconcile()`.
+- Paystack webhook HMAC SHA512 verification and normalized event parsing.
+- Stripe verification, webhook HMAC SHA256 verification, normalized event parsing, subscription fetch, and subscription cancellation.
+- Verify-origin events from `PaymentService::confirmAndRecord()` flow through the same provider-event outbox.
+
+### Removed
+
+- `billing_plans.features`. Payvia billing plans are priced/provider plans only; tenant entitlements belong in `glueful/subscriptions`.
 
 ## [0.7.0] - 2026-06-05 — Framework 1.50 Compatibility
 
