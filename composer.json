@@ -22,7 +22,7 @@
         "vlucas/phpdotenv": "^5.6"
     },
     "require-dev": {
-        "glueful/framework": "^1.50.1",
+        "glueful/framework": "^1.54.0",
         "phpunit/phpunit": "^10.5",
         "squizlabs/php_codesniffer": "^3.6",
         "phpstan/phpstan": "^1.0"
@@ -52,7 +52,7 @@
             "name": "Payvia",
             "displayName": "Payvia Payments",
             "description": "Unified payment gateway bridge for Glueful (Stripe, Paystack, and more).",
-            "version": "1.0.0",
+            "version": "1.0.1",
             "icon": "assets/icon.png",
             "categories": [
                 "payments",
@@ -61,7 +61,7 @@
             "publisher": "glueful-team",
             "provider": "Glueful\\Extensions\\Payvia\\PayviaServiceProvider",
             "requires": {
-                "glueful": ">=1.50.1",
+                "glueful": ">=1.54.0",
                 "extensions": []
             }
         }

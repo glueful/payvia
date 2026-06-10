@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional marketplace/split-payment capability interfaces.
 - Optional refunds/disputes capability interfaces.
 
+## [1.0.1] - 2026-06-10 -- Framework 1.54 Compatibility
+
+### Changed
+
+- **Minimum framework raised to Glueful Framework 1.54.0.** `require-dev` now targets `glueful/framework ^1.54.0`, and extension metadata now requires `glueful >=1.54.0`.
+- **Extension metadata version bumped to `1.0.1`.** This is a compatibility patch release for the Framework 1.54 line; Payvia's public payment/provider surface is unchanged from `1.0.0`.
+
 ## [1.0.0] - 2026-06-10 -- Stable Payment Provider Surface
 
 ### Added
