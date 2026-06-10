@@ -62,7 +62,9 @@ final class BillingPlanRepository extends BaseRepository implements BillingPlanR
                 'currency',
                 'interval',
                 'trial_days',
-                'features',
+                'gateway',
+                'gateway_product_id',
+                'gateway_price_id',
                 'metadata',
                 'status',
                 'created_at',
@@ -80,14 +82,6 @@ final class BillingPlanRepository extends BaseRepository implements BillingPlanR
 
         if (isset($filters['currency']) && is_string($filters['currency']) && $filters['currency'] !== '') {
             $qb = $qb->where('currency', '=', $filters['currency']);
-        }
-
-        if (isset($filters['features_contains']) && is_array($filters['features_contains'])) {
-            $key = $filters['features_contains']['key'] ?? null;
-            $value = $filters['features_contains']['value'] ?? null;
-            if (is_string($key) && $key !== '' && is_scalar($value)) {
-                $qb = $qb->whereJsonContains('features', (string) $value, '$.' . $key);
-            }
         }
 
         return $qb->get();
