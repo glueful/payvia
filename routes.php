@@ -3,14 +3,21 @@
 declare(strict_types=1);
 
 use Glueful\Routing\Router;
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
 use Glueful\Extensions\Payvia\Controllers\BillingPlanController;
 use Glueful\Extensions\Payvia\Controllers\InvoiceController;
 use Glueful\Extensions\Payvia\Controllers\WebhookController;
 
 /** @var Router $router Router instance injected by RouteManifest::load() */
+/** @var ApplicationContext $context Application context injected by RouteManifest::load() */
 
-$router->group(['prefix' => '/payvia'], function (Router $router) {
+// Middleware stack guarding billing-plan and invoice WRITE routes. Admin-only by
+// default; hosts override via `payvia.security.manage_middleware` in config.
+// Each write route appends its own `rate_limit:N,60` to this base stack.
+$manageMiddleware = (array) config($context, 'payvia.security.manage_middleware', ['auth', 'admin']);
+
+$router->group(['prefix' => '/payvia'], function (Router $router) use ($manageMiddleware) {
     /**
      * @route POST /payvia/webhooks/{gateway}
      * @summary Receive Gateway Webhook
@@ -62,10 +69,11 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      *   metadata:object="Additional metadata for the plan"
      *   status:string="Plan status (active|inactive)"
      * @response 201 application/json "Plan created"
+     * @response 403 "Forbidden — requires admin"
      * @response 422 "Validation failed"
      */
     $router->post('/plans', [BillingPlanController::class, 'create'])
-        ->middleware(['auth', 'rate_limit:30,60']);
+        ->middleware([...$manageMiddleware, 'rate_limit:30,60']);
 
     /**
      * @route POST /payvia/plans/update
@@ -86,10 +94,11 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      *   metadata:object="New metadata"
      *   status:string="New status"
      * @response 200 application/json "Plan updated"
+     * @response 403 "Forbidden — requires admin"
      * @response 404 "Plan not found"
      */
     $router->post('/plans/update', [BillingPlanController::class, 'update'])
-        ->middleware(['auth', 'rate_limit:30,60']);
+        ->middleware([...$manageMiddleware, 'rate_limit:30,60']);
 
     /**
      * @route POST /payvia/plans/disable
@@ -99,10 +108,11 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      * @requestBody
      *   plan_uuid:string="Plan UUID to disable" {required=plan_uuid}
      * @response 200 application/json "Plan disabled"
+     * @response 403 "Forbidden — requires admin"
      * @response 404 "Plan not found"
      */
     $router->post('/plans/disable', [BillingPlanController::class, 'disable'])
-        ->middleware(['auth', 'rate_limit:30,60']);
+        ->middleware([...$manageMiddleware, 'rate_limit:30,60']);
 
     /**
      * @route GET /payvia/plans
@@ -134,10 +144,11 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      *   due_at:string="Optional due date (Y-m-d H:i:s)"
      *   metadata:object="Additional metadata for the invoice"
      * @response 201 application/json "Invoice created"
+     * @response 403 "Forbidden — requires admin"
      * @response 422 "Validation failed"
      */
     $router->post('/invoices', [InvoiceController::class, 'create'])
-        ->middleware(['auth', 'rate_limit:60,60']);
+        ->middleware([...$manageMiddleware, 'rate_limit:60,60']);
 
     /**
      * @route POST /payvia/invoices/mark-paid
@@ -148,10 +159,11 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      *   invoice_uuid:string="Invoice UUID to mark as paid" {required=invoice_uuid}
      *   paid_at:string="Optional paid at datetime (Y-m-d H:i:s)"
      * @response 200 application/json "Invoice marked as paid"
+     * @response 403 "Forbidden — requires admin"
      * @response 404 "Invoice not found"
      */
     $router->post('/invoices/mark-paid', [InvoiceController::class, 'markPaid'])
-        ->middleware(['auth', 'rate_limit:60,60']);
+        ->middleware([...$manageMiddleware, 'rate_limit:60,60']);
 
     /**
      * @route POST /payvia/invoices/cancel
@@ -161,10 +173,11 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      * @requestBody
      *   invoice_uuid:string="Invoice UUID to cancel" {required=invoice_uuid}
      * @response 200 application/json "Invoice canceled"
+     * @response 403 "Forbidden — requires admin"
      * @response 404 "Invoice not found"
      */
     $router->post('/invoices/cancel', [InvoiceController::class, 'cancel'])
-        ->middleware(['auth', 'rate_limit:60,60']);
+        ->middleware([...$manageMiddleware, 'rate_limit:60,60']);
 
     /**
      * @route GET /payvia/invoices

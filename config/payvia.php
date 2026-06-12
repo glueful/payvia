@@ -40,6 +40,15 @@ return [
         'store_raw_payload' => (bool) env('PAYVIA_STORE_RAW_PAYLOAD', true),
     ],
 
+    'security' => [
+        // Middleware applied to billing-plan and invoice write routes
+        // (create/update/disable plans, create/mark-paid/cancel invoices).
+        // Defaults to admin-only. Hosts can override this list (e.g. swap
+        // 'admin' for a custom permission middleware) without forking the
+        // extension. Each route still appends its own rate_limit:N,60.
+        'manage_middleware' => ['auth', 'admin'],
+    ],
+
     'webhooks' => [
         'queue' => (bool) env('PAYVIA_WEBHOOKS_QUEUE', false),
         'queue_name' => env('PAYVIA_WEBHOOKS_QUEUE_NAME', 'default'),

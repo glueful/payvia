@@ -154,6 +154,11 @@ return [
         'store_raw_payload' => (bool) env('PAYVIA_STORE_RAW_PAYLOAD', true),
     ],
 
+    'security' => [
+        // Middleware applied to billing-plan and invoice write routes (admin-only by default).
+        'manage_middleware' => ['auth', 'admin'],
+    ],
+
     'webhooks' => [
         'queue' => (bool) env('PAYVIA_WEBHOOKS_QUEUE', false),
         'queue_name' => env('PAYVIA_WEBHOOKS_QUEUE_NAME', 'default'),
@@ -203,6 +208,49 @@ Use these fields to link a local priced plan to provider-side product, price, or
 Payvia does not store feature gates or entitlement catalogs on billing plans. Tenant plans, feature gates, and overrides belong in `glueful/subscriptions`.
 
 ## HTTP API
+
+### Authorization
+
+The billing **write** endpoints — creating, updating, or disabling plans, and
+creating, marking-paid, or canceling invoices — require an **admin** caller by
+default. They run the `auth` + `admin` middleware (the framework's
+`AdminPermissionMiddleware`), so a plain authenticated end-user receives
+`403 Forbidden`. Read endpoints (`GET /payvia/plans`, `GET /payvia/invoices`),
+`POST /payvia/payments/confirm`, and the signature-verified webhook route are
+**not** gated by `admin`.
+
+Admin-gated write routes:
+
+- `POST /payvia/plans`
+- `POST /payvia/plans/update`
+- `POST /payvia/plans/disable`
+- `POST /payvia/invoices`
+- `POST /payvia/invoices/mark-paid`
+- `POST /payvia/invoices/cancel`
+
+**Overriding the management middleware.** The stack applied to these write routes
+is configurable via `payvia.security.manage_middleware`. Override it in your app's
+`config/payvia.php` (or merged config) to swap `admin` for a custom permission
+middleware, or to relax/tighten the requirement. Each route still appends its own
+`rate_limit:N,60` after this stack.
+
+```php
+// config/payvia.php (application override)
+return [
+    'security' => [
+        // e.g. require a custom 'billing.manage' permission middleware instead of admin
+        'manage_middleware' => ['auth', 'permission:billing.manage'],
+    ],
+];
+```
+
+Default:
+
+```php
+'security' => [
+    'manage_middleware' => ['auth', 'admin'],
+],
+```
 
 ### Confirm and record a payment
 
@@ -264,7 +312,7 @@ curl -s -X POST "$API_BASE/payvia/payments/confirm" \
 #### Create a plan
 
 - **Endpoint:** `POST /payvia/plans`
-- **Middleware:** `auth`, `rate_limit:30,60`
+- **Middleware:** `auth`, `admin`, `rate_limit:30,60` (admin-only — see [Authorization](#authorization))
 - **Handler:** `Glueful\Extensions\Payvia\Controllers\BillingPlanController::create`
 
 **Body:**
@@ -322,7 +370,7 @@ curl -s "$API_BASE/payvia/plans?status=active&interval=monthly" \
 #### Create an invoice
 
 - **Endpoint:** `POST /payvia/invoices`
-- **Middleware:** `auth`, `rate_limit:60,60`
+- **Middleware:** `auth`, `admin`, `rate_limit:60,60` (admin-only — see [Authorization](#authorization))
 - **Handler:** `Glueful\Extensions\Payvia\Controllers\InvoiceController::create`
 
 **Body:**
