@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Removed the caller-controlled `verify_url` override in the Paystack gateway.** `PaystackGateway::verify()` now always derives the verification URL from the trusted `payvia.gateways.paystack.base_url` config, ignoring any `options['verify_url']` supplied through `POST /payvia/payments/confirm`. Previously an authenticated caller could redirect verification to an arbitrary host, leaking the live Paystack secret key and forging a successful payment (SSRF / payment forgery).
+
 ### Planned
 - Flutterwave gateway driver.
 - PayPal/Braintree gateway driver.

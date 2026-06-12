@@ -63,6 +63,55 @@ final class PaystackWebhookSignatureTest extends TestCase
         self::assertSame(50.0, $event->normalized()['amount']);
     }
 
+    public function testVerifyIgnoresCallerSuppliedVerifyUrl(): void
+    {
+        $http = $this->createMock(Client::class);
+        $response = $this->createMock(HttpResponse::class);
+
+        $response->method('getStatusCode')->willReturn(200);
+        $response->method('toArray')->willReturn([
+            'status' => true,
+            'data' => [
+                'id' => 99,
+                'reference' => 'REF_1',
+                'status' => 'success',
+                'amount' => 5000,
+                'currency' => 'GHS',
+            ],
+        ]);
+
+        // The verify URL must always be derived from the configured base_url, never from
+        // the caller-supplied options. If the override were honored, the request would go to
+        // https://attacker.example/forged instead of the asserted Paystack URL.
+        $http->expects(self::once())
+            ->method('get')
+            ->with(
+                'https://api.paystack.co/transaction/verify/REF_1',
+                self::arrayHasKey('headers')
+            )
+            ->willReturn($response);
+
+        $base = sys_get_temp_dir() . '/payvia-paystack-' . uniqid('', true);
+        @mkdir($base . '/config', 0777, true);
+        file_put_contents($base . '/config/payvia.php', "<?php\nreturn " . var_export([
+            'gateways' => [
+                'paystack' => [
+                    'secret_key' => 'secret',
+                    'base_url' => 'https://api.paystack.co',
+                ],
+            ],
+        ], true) . ";\n");
+        $context = new ApplicationContext($base, 'testing');
+        $context->setConfigLoader(new ConfigurationLoader($base, 'testing', $base . '/config'));
+
+        $result = (new PaystackGateway($http, $context))->verify('REF_1', [
+            'verify_url' => 'https://attacker.example/forged',
+        ]);
+
+        self::assertSame('success', $result['status']);
+        self::assertSame('REF_1', $result['reference']);
+    }
+
     public function testCancelSubscriptionPostsCodeAndEmailToken(): void
     {
         $http = $this->createMock(Client::class);

@@ -37,7 +37,7 @@ $router->group(['prefix' => '/payvia'], function (Router $router) {
      *   payable_type:string="Optional logical type for the payable (e.g. subscription, order)"
      *   payable_id:string="Optional identifier of the payable in its domain"
      *   metadata:object="Optional free-form JSON metadata to persist"
-     *   options:object="Optional gateway-specific options (e.g. override verify URL)"
+     *   options:object="Optional gateway-specific options passed to the gateway driver"
      * @response 200 application/json "Payment verified and recorded"
      * @response 422 "Validation failed"
      */

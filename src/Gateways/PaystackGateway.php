@@ -39,8 +39,10 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
         $baseUrl = rtrim((string) ($config['base_url'] ?? 'https://api.paystack.co'), '/');
         $timeout = (int) ($config['timeout'] ?? 15);
 
-        $verifyUrl = (string) ($options['verify_url']
-            ?? ($baseUrl . '/transaction/verify/' . rawurlencode($reference)));
+        // The verify URL is always derived from trusted config (base_url). Caller-supplied
+        // options must never influence this URL, otherwise an authenticated user could point
+        // verification at a server they control (SSRF + leaked secret key + forged success).
+        $verifyUrl = $baseUrl . '/transaction/verify/' . rawurlencode($reference);
 
         try {
             $response = $this->httpClient->get($verifyUrl, [
