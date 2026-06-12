@@ -5,11 +5,14 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Repositories;
 
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
+use Glueful\Extensions\Payvia\Repositories\Concerns\DetectsUniqueViolations;
 use Glueful\Helpers\Utils;
 use Glueful\Repository\BaseRepository;
 
 final class ProviderEventRepository extends BaseRepository implements ProviderEventRepositoryInterface
 {
+    use DetectsUniqueViolations;
+
     public function getTableName(): string
     {
         return 'provider_events';
@@ -166,15 +169,6 @@ final class ProviderEventRepository extends BaseRepository implements ProviderEv
             ->where(['uuid' => $uuid])
             ->limit(1)
             ->first();
-    }
-
-    public function isUniqueViolation(\Throwable $e): bool
-    {
-        $message = $e->getMessage();
-        return str_contains($message, 'UNIQUE')
-            || str_contains(strtolower($message), 'unique')
-            || str_contains($message, '23000')
-            || str_contains($message, '23505');
     }
 
     /** @param array<string,mixed> $data */

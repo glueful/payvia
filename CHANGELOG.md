@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Billing-plan and invoice write routes now require an admin caller.** `POST /payvia/plans`, `/payvia/plans/update`, `/payvia/plans/disable`, `POST /payvia/invoices`, `/payvia/invoices/mark-paid`, and `/payvia/invoices/cancel` now run the `admin` middleware in addition to `auth` and their rate limit. Previously any authenticated end-user could create/update/disable billing plans and create/mark-paid/cancel arbitrary invoices (no ownership or role check existed). The management middleware stack is configurable via the new `payvia.security.manage_middleware` config key (default `['auth', 'admin']`), so hosts can substitute a custom permission middleware. Read, payment-confirm, and webhook routes are unchanged.
 - **Removed the caller-controlled `verify_url` override in the Paystack gateway.** `PaystackGateway::verify()` now always derives the verification URL from the trusted `payvia.gateways.paystack.base_url` config, ignoring any `options['verify_url']` supplied through `POST /payvia/payments/confirm`. Previously an authenticated caller could redirect verification to an arbitrary host, leaking the live Paystack secret key and forging a successful payment (SSRF / payment forgery).
 
+### Fixed
+
+- **Payment and subscription upserts now recover from unique-violation races instead of returning 500s.** Concurrent webhook/client retries (a normal occurrence with payment providers) could lose a find-then-insert (TOCTOU) race and crash with an unhandled UNIQUE-constraint violation — `PaymentService::confirmAndRecord` on `payments.reference`, and `GatewaySubscriptionRepository::upsertByGatewayId` on `(gateway, gateway_subscription_id)`. On a unique violation during the insert, both now fall back to the update path (re-fetching the row where needed) so the data is still applied; any other exception still propagates. Detection is centralized in a shared `DetectsUniqueViolations` trait reused by `PaymentService`, `GatewaySubscriptionRepository`, and `ProviderEventRepository`.
+
 ### Planned
 - Flutterwave gateway driver.
 - PayPal/Braintree gateway driver.

@@ -9,9 +9,12 @@ use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
 use Glueful\Extensions\Payvia\GatewayManager;
+use Glueful\Extensions\Payvia\Repositories\Concerns\DetectsUniqueViolations;
 
 final class PaymentService
 {
+    use DetectsUniqueViolations;
+
     private ApplicationContext $context;
     public function __construct(
         ApplicationContext $context,
@@ -99,7 +102,18 @@ final class PaymentService
 
         $existing = $this->payments->findByReference($reference);
         if ($existing === null) {
-            $this->payments->createPayment($payload);
+            try {
+                $this->payments->createPayment($payload);
+            } catch (\Throwable $e) {
+                if (!$this->isUniqueViolation($e)) {
+                    throw $e;
+                }
+
+                // Concurrent webhook/client retry inserted the row between our
+                // find and insert (payments.reference is UNIQUE). Apply the same
+                // payload through the update path instead of returning a 500.
+                $this->payments->updateByReference($reference, $payload);
+            }
         } else {
             $this->payments->updateByReference($reference, $payload);
         }

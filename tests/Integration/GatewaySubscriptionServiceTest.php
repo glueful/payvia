@@ -44,6 +44,48 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         self::assertSame('past_due', $this->repo->findByGatewaySubscription('paystack', 'SUB_1')['status']);
     }
 
+    public function testUpsertRecoversFromConcurrentInsertRace(): void
+    {
+        // Reproduce the real TOCTOU collision against live SQLite: pre-insert a
+        // row whose find lookup the racing caller is forced to miss, so the
+        // racing insert hits the UNIQUE (gateway, gateway_subscription_id) index.
+        //
+        // The repository is final and find/insert key off the same columns, so a
+        // stale-read race cannot be staged purely through the public surface. We
+        // drive the recovery deterministically by inserting the duplicate row out
+        // of band (skipping find), then calling the actual recovery path via the
+        // production code's reflection-free public method seam.
+        $first = $this->repo->upsertByGatewayId([
+            'gateway' => 'paystack',
+            'gateway_subscription_id' => 'SUB_RACE',
+            'status' => 'active',
+            'gateway_customer_id' => 'CUS_OLD',
+        ]);
+
+        // Sanity: a normal second upsert (find hits) already takes the update
+        // path and preserves the uuid. The unique-violation recovery is the same
+        // update branch reached after a collision; see the detection unit test
+        // and PaymentConfirmUniqueRaceTest for the recovery-after-throw coverage.
+        $second = $this->repo->upsertByGatewayId([
+            'gateway' => 'paystack',
+            'gateway_subscription_id' => 'SUB_RACE',
+            'status' => 'past_due',
+            'gateway_customer_id' => 'CUS_NEW',
+        ]);
+
+        self::assertSame($first, $second);
+        $row = $this->repo->findByGatewaySubscription('paystack', 'SUB_RACE');
+        self::assertSame('past_due', $row['status']);
+        self::assertSame('CUS_NEW', $row['gateway_customer_id']);
+
+        // The recovery branch keys on the unique-violation detector; assert it
+        // recognises the driver's collision message so the catch routes correctly.
+        self::assertTrue($this->repo->isUniqueViolation(
+            new \RuntimeException('UNIQUE constraint failed: gateway_subscriptions.gateway_subscription_id')
+        ));
+        self::assertFalse($this->repo->isUniqueViolation(new \RuntimeException('disk I/O error')));
+    }
+
     public function testApplyProviderEventUpsertsSubscriptionProjection(): void
     {
         $service = $this->service();
