@@ -41,8 +41,22 @@ final class PaymentController extends BaseController
 
             $gateway = isset($data['gateway']) && is_string($data['gateway']) ? $data['gateway'] : null;
 
+            // Bind the payment to the authenticated session, never to a caller-supplied value.
+            // $this->currentUser is populated by BaseController from the request's auth context.
+            $authUuid = $this->currentUser?->uuid();
+
+            // If the caller still sends user_uuid, it must match the session; otherwise reject
+            // (do not silently overwrite, and never honor a value for a different user).
+            if (isset($data['user_uuid']) && is_string($data['user_uuid']) && $data['user_uuid'] !== '') {
+                if ($authUuid === null || $data['user_uuid'] !== $authUuid) {
+                    return $this->validationError([
+                        'user_uuid' => 'user_uuid is derived from the authenticated session and cannot be set',
+                    ]);
+                }
+            }
+
             $context = [
-                'user_uuid' => isset($data['user_uuid']) && is_string($data['user_uuid']) ? $data['user_uuid'] : null,
+                'user_uuid' => $authUuid,
                 'payable_type' => isset($data['payable_type']) && is_string($data['payable_type'])
                     ? $data['payable_type']
                     : null,

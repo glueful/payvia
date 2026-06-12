@@ -40,13 +40,14 @@ $router->group(['prefix' => '/payvia'], function (Router $router) use ($manageMi
      * @requestBody
      *   reference:string="Provider transaction reference" {required=reference}
      *   gateway:string="Gateway key from payvia.gateways config (defaults to payvia.default_gateway)"
-     *   user_uuid:string="Optional UUID of the paying user"
      *   payable_type:string="Optional logical type for the payable (e.g. subscription, order)"
      *   payable_id:string="Optional identifier of the payable in its domain"
      *   metadata:object="Optional free-form JSON metadata to persist"
      *   options:object="Optional gateway-specific options passed to the gateway driver"
      * @response 200 application/json "Payment verified and recorded"
-     * @response 422 "Validation failed"
+     * @response 422 "Validation failed (also returned if a user_uuid that differs from the authenticated session is supplied)"
+     * @note The stored user_uuid is always derived from the authenticated session.
+     *   It is NOT caller-settable; supplying a user_uuid that differs from the session returns 422.
      */
     $router->post('/payments/confirm', [PaymentController::class, 'confirm'])
         ->middleware(['auth', 'rate_limit:60,60']);

@@ -263,13 +263,17 @@ Default:
 - `reference` (string, required): provider transaction reference.
 - `gateway` (string, optional): gateway key from `config/payvia.php` (`payvia.gateways`).  
   If omitted, `payvia.default_gateway` is used.
-- `user_uuid` (string, optional): UUID of the paying user.
 - `payable_type` (string, optional): logical type of the thing being paid for  
   (e.g. `subscription`, `order`, `invoice`).
 - `payable_id` (string, optional): identifier of that thing in its own domain  
   (e.g. subscription UUID, order ID).
 - `metadata` (object, optional): app‑level metadata to store in the `metadata` column.
 - `options` (object, optional): gateway‑specific options (e.g. override verify URL).
+
+> **Note:** The stored `user_uuid` is always derived from the authenticated session, not
+> from the request body. It is **not** caller‑settable. If a `user_uuid` is supplied and it
+> differs from the authenticated user's UUID, the request is rejected with `422`. This
+> prevents an authenticated caller from attributing a payment to another user.
 
 **Response (200):**
 
@@ -297,7 +301,6 @@ curl -s -X POST "$API_BASE/payvia/payments/confirm" \
   -d '{
     "reference": "PSK_tx_ref_123456",
     "gateway": "paystack",
-    "user_uuid": "user_nanoid_123",
     "payable_type": "subscription",
     "payable_id": "sub_plan_uuid_123",
     "metadata": {
