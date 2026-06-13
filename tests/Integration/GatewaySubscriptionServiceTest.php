@@ -215,6 +215,95 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         );
     }
 
+    /**
+     * Fail-closed status normalization: known non-active provider statuses must
+     * map to their distinct non-active value, and any unrecognized/future status
+     * must NOT become 'active'. Each case here fails if `default => 'active'` is
+     * restored.
+     *
+     * @dataProvider failClosedStatusProvider
+     */
+    public function testUnknownAndNonActiveStatusesFailClosed(string $provider, string $expected): void
+    {
+        $subId = 'SUB_' . substr(md5($provider), 0, 8);
+        $event = ProviderEvent::create(
+            'stripe',
+            EventType::SUBSCRIPTION_UPDATED,
+            null,
+            'delivery-' . $subId,
+            $subId,
+            new \DateTimeImmutable(),
+            [
+                'gateway_subscription_id' => $subId,
+                'status' => $provider,
+            ],
+            ['raw' => true],
+            'v1'
+        );
+
+        $this->service()->applyProviderEvent($event);
+
+        self::assertSame(
+            $expected,
+            $this->repo->findByGatewaySubscription('stripe', $subId)['status'],
+            sprintf('Provider status "%s" should normalize to "%s"', $provider, $expected)
+        );
+    }
+
+    /** @return array<string,array{0:string,1:string}> */
+    public static function failClosedStatusProvider(): array
+    {
+        return [
+            // Stripe non-active statuses that previously fell open to 'active'.
+            'stripe unpaid' => ['unpaid', 'past_due'],
+            'stripe paused' => ['paused', 'paused'],
+            'stripe incomplete_expired' => ['incomplete_expired', 'canceled'],
+            // Any unknown/future status must fail closed, never 'active'.
+            'unknown future status' => ['weird_future_status', 'unknown'],
+            'empty status' => ['', 'unknown'],
+            // Previously-correct mappings remain intact.
+            'active stays active' => ['active', 'active'],
+            'trialing maps active' => ['trialing', 'active'],
+            'past_due stays past_due' => ['past_due', 'past_due'],
+            'attention maps past_due' => ['attention', 'past_due'],
+            'canceled stays canceled' => ['canceled', 'canceled'],
+            'cancelled maps canceled' => ['cancelled', 'canceled'],
+            'incomplete stays incomplete' => ['incomplete', 'incomplete'],
+            'pending maps incomplete' => ['pending', 'incomplete'],
+        ];
+    }
+
+    public function testReconcileWithMissingProviderStatusDoesNotFabricateActive(): void
+    {
+        // Provider response omits 'status' entirely; reconcile must not invent
+        // 'active'. The absent status fails closed to 'unknown'.
+        $this->gateway->fetchResult = [
+            'subscription_code' => 'SUB_NOSTATUS',
+            'customer' => ['customer_code' => 'CUS_NS'],
+            'plan' => ['plan_code' => 'PLN_NS'],
+            'next_payment_date' => '2026-07-01 00:00:00',
+        ];
+
+        $row = $this->service()->reconcile('fake', 'SUB_NOSTATUS');
+
+        self::assertSame('unknown', $row['status']);
+        self::assertSame('CUS_NS', $row['gateway_customer_id']);
+    }
+
+    public function testReconcileWithUnpaidProviderStatusFailsClosed(): void
+    {
+        $this->gateway->fetchResult = [
+            'subscription_code' => 'SUB_UNPAID',
+            'customer' => ['customer_code' => 'CUS_UP'],
+            'plan' => ['plan_code' => 'PLN_UP'],
+            'status' => 'unpaid',
+        ];
+
+        $row = $this->service()->reconcile('fake', 'SUB_UNPAID');
+
+        self::assertSame('past_due', $row['status']);
+    }
+
     public function testReconcileFetchesProviderAndPersistsProjection(): void
     {
         $this->gateway->fetchResult = [

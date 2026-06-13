@@ -195,6 +195,8 @@ Payvia persists gateway-owned subscription state in `gateway_subscriptions` and 
 
 `gateway_subscriptions` stores provider subscription state only. It intentionally does not store tenant ownership; `glueful/subscriptions` owns the tenant-to-provider-subscription map and all entitlement decisions.
 
+The stored `status` is **normalized** and **fails closed**: provider statuses are mapped to one of `active`, `past_due`, `canceled`, `incomplete`, `paused`, or `unknown`. Only the explicitly active provider statuses (`active`, `trialing`) become `active`; any unrecognized, future, or missing provider status is recorded as `unknown` (never silently treated as live). Consumers deciding entitlement should treat anything other than `active` as not entitled.
+
 ## Billing Plans and Entitlements
 
 `billing_plans` is the priced-plan side of Payvia. It includes provider linkage fields:

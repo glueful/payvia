@@ -119,7 +119,9 @@ final class GatewaySubscriptionService
             'gateway_customer_id' => $customer['customer_code'] ?? $data['customer_code'] ?? null,
             'gateway_price_id' => $plan['plan_code'] ?? $data['plan_code'] ?? null,
             'billing_plan_uuid' => $data['billing_plan_uuid'] ?? null,
-            'status' => $data['status'] ?? 'active',
+            // Do not fabricate 'active' when the provider omits a status; an
+            // absent status normalizes to 'unknown' (fail closed) downstream.
+            'status' => $data['status'] ?? null,
             'current_period_end' => $data['next_payment_date'] ?? null,
             'cancel_at_period_end' => (bool) ($data['cancel_at_period_end'] ?? false),
             'canceled_at' => $data['canceled_at'] ?? null,
@@ -139,11 +141,17 @@ final class GatewaySubscriptionService
 
     private function normalizeStatus(?string $status): string
     {
+        // Fail closed: only explicitly known active-ish statuses become 'active'.
+        // Any unrecognized, future, or empty status maps to 'unknown' so that a
+        // delinquent/paused/expired provider subscription is never treated as live.
         return match (strtolower((string) $status)) {
-            'past_due', 'attention', 'payment_failed' => 'past_due',
-            'canceled', 'cancelled', 'disabled', 'not_renew', 'not_renewing', 'non-renewing' => 'canceled',
+            'active', 'trialing' => 'active',
+            'past_due', 'attention', 'payment_failed', 'unpaid' => 'past_due',
+            'canceled', 'cancelled', 'disabled', 'not_renew', 'not_renewing',
+            'non-renewing', 'incomplete_expired' => 'canceled',
             'incomplete', 'pending' => 'incomplete',
-            default => 'active',
+            'paused' => 'paused',
+            default => 'unknown',
         };
     }
 
