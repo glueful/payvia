@@ -47,6 +47,18 @@
         "phpcbf": "vendor/bin/phpcbf --standard=PSR12 src",
         "analyze": "vendor/bin/phpstan analyze src --level=5"
     },
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../../framework",
+            "options": {
+                "symlink": true,
+                "versions": {
+                    "glueful/framework": "1.55.99"
+                }
+            }
+        }
+    ],
     "extra": {
         "glueful": {
             "name": "Payvia",
