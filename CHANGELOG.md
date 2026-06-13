@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+### Planned
+- Flutterwave gateway driver.
+- PayPal/Braintree gateway driver.
+- Adyen gateway driver.
+- Checkout.com gateway driver.
+- Optional marketplace/split-payment capability interfaces.
+- Optional refunds/disputes capability interfaces.
+
 ## [1.0.2] - 2026-06-13
 
 ### Security
@@ -34,14 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Removed the inert `flutterwave` gateway stanza from the default config.** `config/payvia.php` shipped a `gateways.flutterwave` entry, but no Flutterwave driver class exists yet, so enabling it would make `GatewayManager` throw at resolution time. The stanza (and its `PAYVIA_FLUTTERWAVE_*` env example / config comment in the README) has been removed; the driver remains tracked under the **Planned** section above and the stanza will return when it ships. No code referenced `payvia.gateways.flutterwave`.
 - **Documented `status` on the create-invoice request body.** The `POST /payvia/invoices` route docblock now lists `status` as an accepted field with its enum (`draft,pending,paid,canceled,failed`) and the `pending` default, matching `InvoiceController::create`'s validation. `draft` remains an accepted input value for callers that explicitly create drafts.
 - **`billing_plans.name` uniqueness is now scoped per gateway.** The original `002` migration declared a global `UNIQUE (name)`, so the same plan name could never coexist across two payment gateways. New migration `007_ScopeBillingPlanNameUniquePerGateway` replaces it with a composite `UNIQUE (gateway, name)`. Because the framework emits the original constraint INLINE in `CREATE TABLE` — undroppable on SQLite (anonymous `sqlite_autoindex_*`) and a named CONSTRAINT on PostgreSQL that the schema builder's `dropUnique()` cannot drop portably — the change is applied via a full table rebuild (create replacement, copy every row, drop original, rename into place) so it works identically on SQLite, MySQL, and PostgreSQL. The rebuilt table is index-equivalent to `002` apart from this one change (the `uuid` unique is preserved). NULL semantics: `gateway` is nullable and NULLs do not collide in a unique index on any of the three drivers, so multiple plans with no gateway (`gateway IS NULL`) may still share a name; two plans with the same non-NULL gateway may not. The migration is idempotent (a guarded no-op if the composite unique is already present) and ships a `down()` that restores the global unique — `down()` will fail if the data has come to contain the same name under two different gateways, which is expected for a uniqueness-tightening rollback.
-
-### Planned
-- Flutterwave gateway driver.
-- PayPal/Braintree gateway driver.
-- Adyen gateway driver.
-- Checkout.com gateway driver.
-- Optional marketplace/split-payment capability interfaces.
-- Optional refunds/disputes capability interfaces.
 
 ## [1.0.1] - 2026-06-10 -- Framework 1.54 Compatibility
 
