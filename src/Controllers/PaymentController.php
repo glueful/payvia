@@ -32,7 +32,11 @@ final class PaymentController extends BaseController
             if (!is_array($data)) {
                 $data = [];
             }
-            $data = array_merge($request->query->all(), $request->request->all(), $data);
+            // Accept parameters from the JSON body and POST form fields only.
+            // Query-string params are deliberately not read: payment references
+            // and related parameters supplied via the URL would otherwise be
+            // captured in access logs.
+            $data = array_merge($request->request->all(), $data);
 
             $reference = isset($data['reference']) && is_string($data['reference']) ? $data['reference'] : '';
             if ($reference === '') {
