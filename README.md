@@ -110,10 +110,6 @@ PAYVIA_STRIPE_WEBHOOK_SECRET=whsec_xxx
 PAYVIA_STRIPE_BASE_URL=https://api.stripe.com
 PAYVIA_STRIPE_TIMEOUT=15
 
-# Flutterwave (example)
-PAYVIA_FLUTTERWAVE_ENABLED=false
-PAYVIA_FLUTTERWAVE_SECRET_KEY=flw_test_xxx
-
 # Whether to store full provider payload in raw_payload column
 PAYVIA_STORE_RAW_PAYLOAD=true
 
@@ -147,7 +143,6 @@ return [
             'base_url' => env('PAYVIA_STRIPE_BASE_URL', 'https://api.stripe.com'),
             'timeout' => (int) env('PAYVIA_STRIPE_TIMEOUT', 15),
         ],
-        // 'flutterwave' => [...],
     ],
 
     'features' => [

@@ -142,6 +142,7 @@ $router->group(['prefix' => '/payvia'], function (Router $router) use ($manageMi
      *   payable_type:string="Optional logical type of the payable (e.g. subscription, order)"
      *   payable_id:string="Optional identifier of the payable"
      *   number:string="Optional custom invoice number"
+     *   status:string="Invoice status (draft,pending,paid,canceled,failed); defaults to pending"
      *   due_at:string="Optional due date (Y-m-d H:i:s)"
      *   metadata:object="Additional metadata for the invoice"
      * @response 201 application/json "Invoice created"

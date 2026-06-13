@@ -28,12 +28,6 @@ return [
             'base_url' => env('PAYVIA_STRIPE_BASE_URL', 'https://api.stripe.com'),
             'timeout' => (int) env('PAYVIA_STRIPE_TIMEOUT', 15),
         ],
-
-        'flutterwave' => [
-            'enabled' => (bool) env('PAYVIA_FLUTTERWAVE_ENABLED', false),
-            'driver' => 'flutterwave',
-            'secret_key' => env('PAYVIA_FLUTTERWAVE_SECRET_KEY', null),
-        ],
     ],
 
     'features' => [
