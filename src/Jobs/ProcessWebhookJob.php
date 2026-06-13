@@ -13,14 +13,22 @@ final class ProcessWebhookJob extends Job
     {
         $context = $this->context;
         if ($context === null) {
-            throw new \RuntimeException('ProcessWebhookJob requires an ApplicationContext.');
+            // Permanent (config/programmer) error: retrying cannot supply a context.
+            // Drop the job so the worker records it complete instead of re-queuing.
+            error_log('[Payvia] ProcessWebhookJob dropped: requires an ApplicationContext.');
+            $this->delete();
+            return;
         }
 
         $uuid = (string) ($this->getData()['provider_event_uuid'] ?? '');
         if ($uuid === '') {
-            throw new \RuntimeException('ProcessWebhookJob missing provider_event_uuid.');
+            // Permanent error: a missing identifier will never appear on retry.
+            error_log('[Payvia] ProcessWebhookJob dropped: missing provider_event_uuid.');
+            $this->delete();
+            return;
         }
 
+        // A genuine processing failure here must propagate so the worker retries.
         app($context, WebhookService::class)->processStored($uuid);
     }
 }
