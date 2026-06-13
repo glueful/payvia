@@ -32,7 +32,11 @@ final class PaymentController extends BaseController
             if (!is_array($data)) {
                 $data = [];
             }
-            $data = array_merge($request->query->all(), $request->request->all(), $data);
+            // Accept parameters from the JSON body and POST form fields only.
+            // Query-string params are deliberately not read: payment references
+            // and related parameters supplied via the URL would otherwise be
+            // captured in access logs.
+            $data = array_merge($request->request->all(), $data);
 
             $reference = isset($data['reference']) && is_string($data['reference']) ? $data['reference'] : '';
             if ($reference === '') {
@@ -41,8 +45,22 @@ final class PaymentController extends BaseController
 
             $gateway = isset($data['gateway']) && is_string($data['gateway']) ? $data['gateway'] : null;
 
+            // Bind the payment to the authenticated session, never to a caller-supplied value.
+            // $this->currentUser is populated by BaseController from the request's auth context.
+            $authUuid = $this->currentUser?->uuid();
+
+            // If the caller still sends user_uuid, it must match the session; otherwise reject
+            // (do not silently overwrite, and never honor a value for a different user).
+            if (isset($data['user_uuid']) && is_string($data['user_uuid']) && $data['user_uuid'] !== '') {
+                if ($authUuid === null || $data['user_uuid'] !== $authUuid) {
+                    return $this->validationError([
+                        'user_uuid' => 'user_uuid is derived from the authenticated session and cannot be set',
+                    ]);
+                }
+            }
+
             $context = [
-                'user_uuid' => isset($data['user_uuid']) && is_string($data['user_uuid']) ? $data['user_uuid'] : null,
+                'user_uuid' => $authUuid,
                 'payable_type' => isset($data['payable_type']) && is_string($data['payable_type'])
                     ? $data['payable_type']
                     : null,
@@ -59,7 +77,29 @@ final class PaymentController extends BaseController
         } catch (ValidationException $e) {
             return $this->validationError(['reference' => $e->getMessage()]);
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to verify payment: ' . $e->getMessage());
+            $this->logError('payment.confirm', $e);
+            return $this->serverError('Failed to verify payment');
+        }
+    }
+
+    /**
+     * Log a controller exception server-side without leaking details to the client.
+     */
+    private function logError(string $endpoint, \Throwable $e): void
+    {
+        $message = sprintf(
+            '[Payvia] %s failed: %s: %s in %s:%d',
+            $endpoint,
+            $e::class,
+            $e->getMessage(),
+            $e->getFile(),
+            $e->getLine()
+        );
+
+        try {
+            app($this->context, \Psr\Log\LoggerInterface::class)->error($message, ['exception' => $e]);
+        } catch (\Throwable) {
+            error_log($message);
         }
     }
 }

@@ -46,8 +46,18 @@ final class PayviaServiceProvider extends ServiceProvider
     {
         if (self::$cachedVersion === null) {
             $path = __DIR__ . '/../composer.json';
-            $composer = json_decode(file_get_contents($path), true);
-            self::$cachedVersion = $composer['version'] ?? '0.0.0';
+            $raw = @file_get_contents($path);
+            if ($raw === false) {
+                return self::$cachedVersion = '0.0.0';
+            }
+
+            $composer = json_decode($raw, true);
+            if (!is_array($composer)) {
+                return self::$cachedVersion = '0.0.0';
+            }
+
+            $version = $composer['version'] ?? '0.0.0';
+            self::$cachedVersion = is_string($version) ? $version : '0.0.0';
         }
 
         return self::$cachedVersion;

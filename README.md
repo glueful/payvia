@@ -110,10 +110,6 @@ PAYVIA_STRIPE_WEBHOOK_SECRET=whsec_xxx
 PAYVIA_STRIPE_BASE_URL=https://api.stripe.com
 PAYVIA_STRIPE_TIMEOUT=15
 
-# Flutterwave (example)
-PAYVIA_FLUTTERWAVE_ENABLED=false
-PAYVIA_FLUTTERWAVE_SECRET_KEY=flw_test_xxx
-
 # Whether to store full provider payload in raw_payload column
 PAYVIA_STORE_RAW_PAYLOAD=true
 
@@ -147,11 +143,15 @@ return [
             'base_url' => env('PAYVIA_STRIPE_BASE_URL', 'https://api.stripe.com'),
             'timeout' => (int) env('PAYVIA_STRIPE_TIMEOUT', 15),
         ],
-        // 'flutterwave' => [...],
     ],
 
     'features' => [
         'store_raw_payload' => (bool) env('PAYVIA_STORE_RAW_PAYLOAD', true),
+    ],
+
+    'security' => [
+        // Middleware applied to billing-plan and invoice write routes (admin-only by default).
+        'manage_middleware' => ['auth', 'admin'],
     ],
 
     'webhooks' => [
@@ -190,6 +190,8 @@ Payvia persists gateway-owned subscription state in `gateway_subscriptions` and 
 
 `gateway_subscriptions` stores provider subscription state only. It intentionally does not store tenant ownership; `glueful/subscriptions` owns the tenant-to-provider-subscription map and all entitlement decisions.
 
+The stored `status` is **normalized** and **fails closed**: provider statuses are mapped to one of `active`, `past_due`, `canceled`, `incomplete`, `paused`, or `unknown`. Only the explicitly active provider statuses (`active`, `trialing`) become `active`; any unrecognized, future, or missing provider status is recorded as `unknown` (never silently treated as live). Consumers deciding entitlement should treat anything other than `active` as not entitled.
+
 ## Billing Plans and Entitlements
 
 `billing_plans` is the priced-plan side of Payvia. It includes provider linkage fields:
@@ -204,6 +206,49 @@ Payvia does not store feature gates or entitlement catalogs on billing plans. Te
 
 ## HTTP API
 
+### Authorization
+
+The billing **write** endpoints — creating, updating, or disabling plans, and
+creating, marking-paid, or canceling invoices — require an **admin** caller by
+default. They run the `auth` + `admin` middleware (the framework's
+`AdminPermissionMiddleware`), so a plain authenticated end-user receives
+`403 Forbidden`. Read endpoints (`GET /payvia/plans`, `GET /payvia/invoices`),
+`POST /payvia/payments/confirm`, and the signature-verified webhook route are
+**not** gated by `admin`.
+
+Admin-gated write routes:
+
+- `POST /payvia/plans`
+- `POST /payvia/plans/update`
+- `POST /payvia/plans/disable`
+- `POST /payvia/invoices`
+- `POST /payvia/invoices/mark-paid`
+- `POST /payvia/invoices/cancel`
+
+**Overriding the management middleware.** The stack applied to these write routes
+is configurable via `payvia.security.manage_middleware`. Override it in your app's
+`config/payvia.php` (or merged config) to swap `admin` for a custom permission
+middleware, or to relax/tighten the requirement. Each route still appends its own
+`rate_limit:N,60` after this stack.
+
+```php
+// config/payvia.php (application override)
+return [
+    'security' => [
+        // e.g. require a custom 'billing.manage' permission middleware instead of admin
+        'manage_middleware' => ['auth', 'permission:billing.manage'],
+    ],
+];
+```
+
+Default:
+
+```php
+'security' => [
+    'manage_middleware' => ['auth', 'admin'],
+],
+```
+
 ### Confirm and record a payment
 
 - **Endpoint:** `POST /payvia/payments/confirm`
@@ -215,13 +260,17 @@ Payvia does not store feature gates or entitlement catalogs on billing plans. Te
 - `reference` (string, required): provider transaction reference.
 - `gateway` (string, optional): gateway key from `config/payvia.php` (`payvia.gateways`).  
   If omitted, `payvia.default_gateway` is used.
-- `user_uuid` (string, optional): UUID of the paying user.
 - `payable_type` (string, optional): logical type of the thing being paid for  
   (e.g. `subscription`, `order`, `invoice`).
 - `payable_id` (string, optional): identifier of that thing in its own domain  
   (e.g. subscription UUID, order ID).
 - `metadata` (object, optional): app‑level metadata to store in the `metadata` column.
 - `options` (object, optional): gateway‑specific options (e.g. override verify URL).
+
+> **Note:** The stored `user_uuid` is always derived from the authenticated session, not
+> from the request body. It is **not** caller‑settable. If a `user_uuid` is supplied and it
+> differs from the authenticated user's UUID, the request is rejected with `422`. This
+> prevents an authenticated caller from attributing a payment to another user.
 
 **Response (200):**
 
@@ -249,7 +298,6 @@ curl -s -X POST "$API_BASE/payvia/payments/confirm" \
   -d '{
     "reference": "PSK_tx_ref_123456",
     "gateway": "paystack",
-    "user_uuid": "user_nanoid_123",
     "payable_type": "subscription",
     "payable_id": "sub_plan_uuid_123",
     "metadata": {
@@ -264,7 +312,7 @@ curl -s -X POST "$API_BASE/payvia/payments/confirm" \
 #### Create a plan
 
 - **Endpoint:** `POST /payvia/plans`
-- **Middleware:** `auth`, `rate_limit:30,60`
+- **Middleware:** `auth`, `admin`, `rate_limit:30,60` (admin-only — see [Authorization](#authorization))
 - **Handler:** `Glueful\Extensions\Payvia\Controllers\BillingPlanController::create`
 
 **Body:**
@@ -322,7 +370,7 @@ curl -s "$API_BASE/payvia/plans?status=active&interval=monthly" \
 #### Create an invoice
 
 - **Endpoint:** `POST /payvia/invoices`
-- **Middleware:** `auth`, `rate_limit:60,60`
+- **Middleware:** `auth`, `admin`, `rate_limit:60,60` (admin-only — see [Authorization](#authorization))
 - **Handler:** `Glueful\Extensions\Payvia\Controllers\InvoiceController::create`
 
 **Body:**

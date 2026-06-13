@@ -28,16 +28,19 @@ return [
             'base_url' => env('PAYVIA_STRIPE_BASE_URL', 'https://api.stripe.com'),
             'timeout' => (int) env('PAYVIA_STRIPE_TIMEOUT', 15),
         ],
-
-        'flutterwave' => [
-            'enabled' => (bool) env('PAYVIA_FLUTTERWAVE_ENABLED', false),
-            'driver' => 'flutterwave',
-            'secret_key' => env('PAYVIA_FLUTTERWAVE_SECRET_KEY', null),
-        ],
     ],
 
     'features' => [
         'store_raw_payload' => (bool) env('PAYVIA_STORE_RAW_PAYLOAD', true),
+    ],
+
+    'security' => [
+        // Middleware applied to billing-plan and invoice write routes
+        // (create/update/disable plans, create/mark-paid/cancel invoices).
+        // Defaults to admin-only. Hosts can override this list (e.g. swap
+        // 'admin' for a custom permission middleware) without forking the
+        // extension. Each route still appends its own rate_limit:N,60.
+        'manage_middleware' => ['auth', 'admin'],
     ],
 
     'webhooks' => [

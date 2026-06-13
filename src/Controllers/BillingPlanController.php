@@ -13,6 +13,12 @@ use Symfony\Component\HttpFoundation\Request;
 
 final class BillingPlanController extends BaseController
 {
+    /** @var list<string> */
+    private const STATUSES = ['active', 'inactive'];
+
+    /** @var list<string> */
+    private const INTERVALS = ['monthly', 'yearly', 'one_time'];
+
     public function __construct(
         ApplicationContext $context,
         private ?BillingPlanService $plans = null
@@ -29,14 +35,34 @@ final class BillingPlanController extends BaseController
             $name = isset($data['name']) && is_string($data['name']) ? trim($data['name']) : '';
             $amount = $data['amount'] ?? null;
 
-            if ($name === '' || !is_numeric($amount)) {
-                $errors = [];
-                if ($name === '') {
-                    $errors['name'] = 'name is required';
-                }
-                if (!is_numeric($amount)) {
-                    $errors['amount'] = 'amount is required and must be numeric';
-                }
+            $errors = [];
+            if ($name === '') {
+                $errors['name'] = 'name is required';
+            }
+            if (!is_numeric($amount)) {
+                $errors['amount'] = 'amount is required and must be numeric';
+            } elseif ((float) $amount <= 0) {
+                $errors['amount'] = 'amount must be greater than 0';
+            }
+
+            $currency = isset($data['currency']) && is_string($data['currency'])
+                ? strtoupper(trim($data['currency']))
+                : 'GHS';
+            if (!$this->isValidCurrency($currency)) {
+                $errors['currency'] = 'currency must be a 3-letter ISO code (e.g. GHS, USD)';
+            }
+
+            $interval = isset($data['interval']) && is_string($data['interval']) ? $data['interval'] : 'monthly';
+            if (!in_array($interval, self::INTERVALS, true)) {
+                $errors['interval'] = 'interval must be one of: ' . implode(', ', self::INTERVALS);
+            }
+
+            $status = isset($data['status']) && is_string($data['status']) ? $data['status'] : 'active';
+            if (!in_array($status, self::STATUSES, true)) {
+                $errors['status'] = 'status must be one of: ' . implode(', ', self::STATUSES);
+            }
+
+            if ($errors !== []) {
                 return $this->validationError($errors);
             }
 
@@ -46,8 +72,8 @@ final class BillingPlanController extends BaseController
                     ? $data['description']
                     : null,
                 'amount' => (float) $amount,
-                'currency' => isset($data['currency']) && is_string($data['currency']) ? $data['currency'] : 'GHS',
-                'interval' => isset($data['interval']) && is_string($data['interval']) ? $data['interval'] : 'monthly',
+                'currency' => $currency,
+                'interval' => $interval,
                 'trial_days' => isset($data['trial_days']) && is_numeric($data['trial_days'])
                     ? (int) $data['trial_days']
                     : null,
@@ -59,14 +85,15 @@ final class BillingPlanController extends BaseController
                     ? $data['gateway_price_id']
                     : null,
                 'metadata' => isset($data['metadata']) && is_array($data['metadata']) ? $data['metadata'] : null,
-                'status' => isset($data['status']) && is_string($data['status']) ? $data['status'] : 'active',
+                'status' => $status,
             ];
 
             $uuid = $this->plans->create($payload);
 
             return $this->created(['uuid' => $uuid], 'Plan created');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to create plan: ' . $e->getMessage());
+            $this->logError('billing_plan.create', $e);
+            return $this->serverError('Failed to create plan');
         }
     }
 
@@ -80,6 +107,7 @@ final class BillingPlanController extends BaseController
                 return $this->validationError(['plan_uuid' => 'plan_uuid is required']);
             }
 
+            $errors = [];
             $update = [];
             if (isset($data['name']) && is_string($data['name'])) {
                 $update['name'] = trim($data['name']);
@@ -88,13 +116,26 @@ final class BillingPlanController extends BaseController
                 $update['description'] = $data['description'];
             }
             if (array_key_exists('amount', $data) && is_numeric($data['amount'])) {
-                $update['amount'] = (float) $data['amount'];
+                if ((float) $data['amount'] <= 0) {
+                    $errors['amount'] = 'amount must be greater than 0';
+                } else {
+                    $update['amount'] = (float) $data['amount'];
+                }
             }
             if (array_key_exists('currency', $data) && is_string($data['currency'])) {
-                $update['currency'] = $data['currency'];
+                $currency = strtoupper(trim($data['currency']));
+                if (!$this->isValidCurrency($currency)) {
+                    $errors['currency'] = 'currency must be a 3-letter ISO code (e.g. GHS, USD)';
+                } else {
+                    $update['currency'] = $currency;
+                }
             }
             if (array_key_exists('interval', $data) && is_string($data['interval'])) {
-                $update['interval'] = $data['interval'];
+                if (!in_array($data['interval'], self::INTERVALS, true)) {
+                    $errors['interval'] = 'interval must be one of: ' . implode(', ', self::INTERVALS);
+                } else {
+                    $update['interval'] = $data['interval'];
+                }
             }
             if (array_key_exists('trial_days', $data) && is_numeric($data['trial_days'])) {
                 $update['trial_days'] = (int) $data['trial_days'];
@@ -108,7 +149,15 @@ final class BillingPlanController extends BaseController
                 $update['metadata'] = $data['metadata'];
             }
             if (array_key_exists('status', $data) && is_string($data['status'])) {
-                $update['status'] = $data['status'];
+                if (!in_array($data['status'], self::STATUSES, true)) {
+                    $errors['status'] = 'status must be one of: ' . implode(', ', self::STATUSES);
+                } else {
+                    $update['status'] = $data['status'];
+                }
+            }
+
+            if ($errors !== []) {
+                return $this->validationError($errors);
             }
 
             if ($update === []) {
@@ -123,7 +172,8 @@ final class BillingPlanController extends BaseController
         } catch (ValidationException $e) {
             return $this->validationError(['plan' => $e->getMessage()]);
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to update plan: ' . $e->getMessage());
+            $this->logError('billing_plan.update', $e);
+            return $this->serverError('Failed to update plan');
         }
     }
 
@@ -143,7 +193,8 @@ final class BillingPlanController extends BaseController
                 ? $this->success(['uuid' => $planUuid], 'Plan disabled')
                 : $this->notFound('Plan not found');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to disable plan: ' . $e->getMessage());
+            $this->logError('billing_plan.disable', $e);
+            return $this->serverError('Failed to disable plan');
         }
     }
 
@@ -167,7 +218,29 @@ final class BillingPlanController extends BaseController
 
             return $this->success(['plans' => $plans], 'Plans retrieved');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to list plans: ' . $e->getMessage());
+            $this->logError('billing_plan.index', $e);
+            return $this->serverError('Failed to list plans');
+        }
+    }
+
+    /**
+     * Log a controller exception server-side without leaking details to the client.
+     */
+    private function logError(string $endpoint, \Throwable $e): void
+    {
+        $message = sprintf(
+            '[Payvia] %s failed: %s: %s in %s:%d',
+            $endpoint,
+            $e::class,
+            $e->getMessage(),
+            $e->getFile(),
+            $e->getLine()
+        );
+
+        try {
+            app($this->context, \Psr\Log\LoggerInterface::class)->error($message, ['exception' => $e]);
+        } catch (\Throwable) {
+            error_log($message);
         }
     }
 
@@ -183,5 +256,10 @@ final class BillingPlanController extends BaseController
         }
 
         return array_merge($request->query->all(), $request->request->all(), $data);
+    }
+
+    private function isValidCurrency(string $currency): bool
+    {
+        return preg_match('/^[A-Z]{3}$/', $currency) === 1;
     }
 }

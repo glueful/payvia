@@ -122,6 +122,34 @@ final class ProviderEventTest extends TestCase
         self::assertNotSame($a->logicalEventKey(), $b->logicalEventKey());
     }
 
+    public function testRepeatPaymentFailuresForSameEntityGetDistinctLogicalKeys(): void
+    {
+        // payment.failed is mutable: a second failure for the same payment_intent
+        // (different normalized state) must not collapse onto the first's key.
+        $first = ProviderEvent::create(
+            'stripe',
+            EventType::PAYMENT_FAILED,
+            null,
+            'd1',
+            'pi_1',
+            new \DateTimeImmutable(),
+            ['status' => 'failed', 'attempt' => 1],
+            []
+        );
+        $second = ProviderEvent::create(
+            'stripe',
+            EventType::PAYMENT_FAILED,
+            null,
+            'd2',
+            'pi_1',
+            new \DateTimeImmutable(),
+            ['status' => 'failed', 'attempt' => 2],
+            []
+        );
+
+        self::assertNotSame($first->logicalEventKey(), $second->logicalEventKey());
+    }
+
     public function testBaseEventCarriesTypedVo(): void
     {
         $vo = ProviderEvent::create(

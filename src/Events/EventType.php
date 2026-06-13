@@ -19,7 +19,6 @@ final class EventType
     /** @var list<string> */
     private const IMMUTABLE = [
         self::PAYMENT_SUCCEEDED,
-        self::PAYMENT_FAILED,
         self::INVOICE_PAID,
         self::INVOICE_PAYMENT_FAILED,
         self::SUBSCRIPTION_CREATED,
@@ -28,6 +27,11 @@ final class EventType
 
     /** @var list<string> */
     private const MUTABLE = [
+        // payment.failed is mutable so repeat failures for the same entity
+        // (e.g. a retried-and-failed Stripe payment_intent) get distinct
+        // logical keys instead of being deduplicated away — the app must hear
+        // about each failure.
+        self::PAYMENT_FAILED,
         self::SUBSCRIPTION_UPDATED,
         self::SUBSCRIPTION_PAST_DUE,
     ];
