@@ -78,7 +78,8 @@ final class InvoiceController extends BaseController
 
             return $this->created(['uuid' => $uuid], 'Invoice created');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to create invoice: ' . $e->getMessage());
+            $this->logError('invoice.create', $e);
+            return $this->serverError('Failed to create invoice');
         }
     }
 
@@ -111,7 +112,8 @@ final class InvoiceController extends BaseController
                 ? $this->success(['uuid' => $invoiceUuid], 'Invoice marked as paid')
                 : $this->notFound('Invoice not found');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to mark invoice as paid: ' . $e->getMessage());
+            $this->logError('invoice.mark_paid', $e);
+            return $this->serverError('Failed to mark invoice as paid');
         }
     }
 
@@ -133,7 +135,8 @@ final class InvoiceController extends BaseController
                 ? $this->success(['uuid' => $invoiceUuid], 'Invoice canceled')
                 : $this->notFound('Invoice not found');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to cancel invoice: ' . $e->getMessage());
+            $this->logError('invoice.cancel', $e);
+            return $this->serverError('Failed to cancel invoice');
         }
     }
 
@@ -189,7 +192,29 @@ final class InvoiceController extends BaseController
 
             return Response::successWithMeta($data, $meta, 'Invoices retrieved');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to list invoices: ' . $e->getMessage());
+            $this->logError('invoice.index', $e);
+            return $this->serverError('Failed to list invoices');
+        }
+    }
+
+    /**
+     * Log a controller exception server-side without leaking details to the client.
+     */
+    private function logError(string $endpoint, \Throwable $e): void
+    {
+        $message = sprintf(
+            '[Payvia] %s failed: %s: %s in %s:%d',
+            $endpoint,
+            $e::class,
+            $e->getMessage(),
+            $e->getFile(),
+            $e->getLine()
+        );
+
+        try {
+            app($this->context, \Psr\Log\LoggerInterface::class)->error($message, ['exception' => $e]);
+        } catch (\Throwable) {
+            error_log($message);
         }
     }
 

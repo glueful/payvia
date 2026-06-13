@@ -73,7 +73,29 @@ final class PaymentController extends BaseController
         } catch (ValidationException $e) {
             return $this->validationError(['reference' => $e->getMessage()]);
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to verify payment: ' . $e->getMessage());
+            $this->logError('payment.confirm', $e);
+            return $this->serverError('Failed to verify payment');
+        }
+    }
+
+    /**
+     * Log a controller exception server-side without leaking details to the client.
+     */
+    private function logError(string $endpoint, \Throwable $e): void
+    {
+        $message = sprintf(
+            '[Payvia] %s failed: %s: %s in %s:%d',
+            $endpoint,
+            $e::class,
+            $e->getMessage(),
+            $e->getFile(),
+            $e->getLine()
+        );
+
+        try {
+            app($this->context, \Psr\Log\LoggerInterface::class)->error($message, ['exception' => $e]);
+        } catch (\Throwable) {
+            error_log($message);
         }
     }
 }

@@ -29,7 +29,14 @@ final class WebhookController extends BaseController
         );
 
         if (!$result->accepted) {
-            return Response::error($result->message, $result->httpStatus);
+            // Do not reflect the attacker-supplied gateway name back in the 404 message;
+            // the underlying GatewayManager exception echoes it. Keep other rejection
+            // messages (e.g. the static 'invalid signature' 401) as-is.
+            $message = $result->httpStatus === 404
+                ? 'gateway not found or unsupported'
+                : $result->message;
+
+            return Response::error($message, $result->httpStatus);
         }
 
         return new Response([

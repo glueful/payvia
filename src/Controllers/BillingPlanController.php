@@ -92,7 +92,8 @@ final class BillingPlanController extends BaseController
 
             return $this->created(['uuid' => $uuid], 'Plan created');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to create plan: ' . $e->getMessage());
+            $this->logError('billing_plan.create', $e);
+            return $this->serverError('Failed to create plan');
         }
     }
 
@@ -171,7 +172,8 @@ final class BillingPlanController extends BaseController
         } catch (ValidationException $e) {
             return $this->validationError(['plan' => $e->getMessage()]);
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to update plan: ' . $e->getMessage());
+            $this->logError('billing_plan.update', $e);
+            return $this->serverError('Failed to update plan');
         }
     }
 
@@ -191,7 +193,8 @@ final class BillingPlanController extends BaseController
                 ? $this->success(['uuid' => $planUuid], 'Plan disabled')
                 : $this->notFound('Plan not found');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to disable plan: ' . $e->getMessage());
+            $this->logError('billing_plan.disable', $e);
+            return $this->serverError('Failed to disable plan');
         }
     }
 
@@ -215,7 +218,29 @@ final class BillingPlanController extends BaseController
 
             return $this->success(['plans' => $plans], 'Plans retrieved');
         } catch (\Throwable $e) {
-            return $this->serverError('Failed to list plans: ' . $e->getMessage());
+            $this->logError('billing_plan.index', $e);
+            return $this->serverError('Failed to list plans');
+        }
+    }
+
+    /**
+     * Log a controller exception server-side without leaking details to the client.
+     */
+    private function logError(string $endpoint, \Throwable $e): void
+    {
+        $message = sprintf(
+            '[Payvia] %s failed: %s: %s in %s:%d',
+            $endpoint,
+            $e::class,
+            $e->getMessage(),
+            $e->getFile(),
+            $e->getLine()
+        );
+
+        try {
+            app($this->context, \Psr\Log\LoggerInterface::class)->error($message, ['exception' => $e]);
+        } catch (\Throwable) {
+            error_log($message);
         }
     }
 
