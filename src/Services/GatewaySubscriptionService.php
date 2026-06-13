@@ -44,7 +44,7 @@ final class GatewaySubscriptionService
     {
         $driver = $this->gateways->subscriptionGateway($gateway);
         $raw = $driver->fetchSubscription($gatewaySubscriptionId);
-        $normalized = $this->normalizeProviderSubscription($raw);
+        $normalized = $this->normalizeProviderSubscription($gateway, $raw);
         $uuid = $this->subscriptions->upsertByGatewayId($this->rowFromNormalized(
             $gateway,
             $gatewaySubscriptionId,
@@ -107,8 +107,35 @@ final class GatewaySubscriptionService
         return $row;
     }
 
-    /** @param array<string,mixed> $raw */
-    private function normalizeProviderSubscription(array $raw): array
+    /**
+     * Normalize a provider's raw subscription fetch into the shape consumed by
+     * rowFromNormalized(). Different gateways return very different shapes (e.g.
+     * Stripe returns the raw subscription object with unix-timestamp period
+     * fields, whereas Paystack wraps data under 'data' with a date-string
+     * next_payment_date), so normalization is gateway-aware.
+     *
+     * Unknown gateways fall back to the generic (Paystack-shaped) normalizer so
+     * third-party subscription drivers continue to work.
+     *
+     * @param array<string,mixed> $raw
+     * @return array<string,mixed>
+     */
+    private function normalizeProviderSubscription(string $gateway, array $raw): array
+    {
+        return match ($gateway) {
+            'stripe' => $this->normalizeStripeSubscription($raw),
+            default => $this->normalizeGenericSubscription($raw),
+        };
+    }
+
+    /**
+     * Generic / Paystack-shaped normalization. Behaves exactly as the historical
+     * single-track normalizer.
+     *
+     * @param array<string,mixed> $raw
+     * @return array<string,mixed>
+     */
+    private function normalizeGenericSubscription(array $raw): array
     {
         $data = (array) ($raw['data'] ?? $raw);
         $customer = (array) ($data['customer'] ?? []);
@@ -127,6 +154,53 @@ final class GatewaySubscriptionService
             'canceled_at' => $data['canceled_at'] ?? null,
             'metadata' => isset($data['metadata']) && is_array($data['metadata']) ? $data['metadata'] : null,
         ];
+    }
+
+    /**
+     * Stripe-shaped normalization. Stripe's subscription fetch returns the raw
+     * subscription object (no 'data' wrapper): the customer is a scalar id, the
+     * price lives at items.data[0].price.id, and the period/cancellation fields
+     * are unix timestamps that must be converted to 'Y-m-d H:i:s' before they
+     * reach the DATETIME columns. Status is passed through raw — normalizeStatus
+     * handles the mapping (and fails closed when absent).
+     *
+     * @param array<string,mixed> $raw
+     * @return array<string,mixed>
+     */
+    private function normalizeStripeSubscription(array $raw): array
+    {
+        $price = (array) (((array) ($raw['items']['data'] ?? []))[0]['price'] ?? []);
+        $metadata = isset($raw['metadata']) && is_array($raw['metadata']) ? $raw['metadata'] : null;
+        $billingPlanUuid = $metadata !== null && isset($metadata['billing_plan_uuid'])
+            && is_scalar($metadata['billing_plan_uuid'])
+            ? (string) $metadata['billing_plan_uuid']
+            : null;
+
+        return [
+            'gateway_subscription_id' => $raw['id'] ?? null,
+            'gateway_customer_id' => isset($raw['customer']) && is_scalar($raw['customer'])
+                ? (string) $raw['customer']
+                : null,
+            'gateway_price_id' => isset($price['id']) && is_scalar($price['id']) ? (string) $price['id'] : null,
+            'billing_plan_uuid' => $billingPlanUuid,
+            // Pass status through raw; normalizeStatus maps it and fails closed
+            // when absent (never fabricating 'active').
+            'status' => $raw['status'] ?? null,
+            'current_period_start' => $this->unixToDateTime($raw['current_period_start'] ?? null),
+            'current_period_end' => $this->unixToDateTime($raw['current_period_end'] ?? null),
+            'canceled_at' => $this->unixToDateTime($raw['canceled_at'] ?? null),
+            'cancel_at_period_end' => (bool) ($raw['cancel_at_period_end'] ?? false),
+            'metadata' => $metadata,
+        ];
+    }
+
+    private function unixToDateTime(mixed $value): ?string
+    {
+        if (!is_numeric($value)) {
+            return null;
+        }
+
+        return (new \DateTimeImmutable('@' . (string) $value))->format('Y-m-d H:i:s');
     }
 
     private function isSubscriptionEvent(string $type): bool

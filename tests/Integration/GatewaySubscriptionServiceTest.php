@@ -321,10 +321,85 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         self::assertSame('PLN_3', $row['gateway_price_id']);
     }
 
+    public function testReconcileNormalizesStripeShapedSubscription(): void
+    {
+        // Stripe returns the raw subscription object (no 'data' wrapper) with
+        // unix-timestamp period fields, a scalar customer id, and the price under
+        // items.data[0].price.id. The previous Paystack-shaped normalizer lost the
+        // period fields entirely; assert they now persist as proper datetimes.
+        $start = 1751328000; // 2025-07-01 00:00:00 UTC
+        $end = 1753920000;   // 2025-07-31 00:00:00 UTC
+        $this->gateway->fetchResult = [
+            'id' => 'sub_x',
+            'object' => 'subscription',
+            'status' => 'active',
+            'customer' => 'cus_x',
+            'items' => ['data' => [['price' => ['id' => 'price_x']]]],
+            'current_period_start' => $start,
+            'current_period_end' => $end,
+            'canceled_at' => null,
+            'cancel_at_period_end' => false,
+            'metadata' => ['billing_plan_uuid' => 'plan12345678'],
+        ];
+
+        $row = $this->stripeService()->reconcile('stripe', 'sub_x');
+
+        self::assertSame('active', $row['status']);
+        self::assertSame('cus_x', $row['gateway_customer_id']);
+        self::assertSame('price_x', $row['gateway_price_id']);
+        self::assertSame('plan12345678', $row['billing_plan_uuid']);
+        self::assertSame(
+            gmdate('Y-m-d H:i:s', $start),
+            $row['current_period_start']
+        );
+        self::assertSame(
+            gmdate('Y-m-d H:i:s', $end),
+            $row['current_period_end']
+        );
+    }
+
+    public function testReconcileNormalizesCanceledStripeSubscriptionTimestamp(): void
+    {
+        // A canceled Stripe subscription carries canceled_at as a unix integer.
+        // The previous code passed the epoch straight into the DATETIME column;
+        // assert it is now a proper datetime string.
+        $canceledAt = 1753920000; // 2025-07-31 00:00:00 UTC
+        $this->gateway->fetchResult = [
+            'id' => 'sub_canceled',
+            'object' => 'subscription',
+            'status' => 'canceled',
+            'customer' => 'cus_c',
+            'items' => ['data' => [['price' => ['id' => 'price_c']]]],
+            'current_period_start' => null,
+            'current_period_end' => null,
+            'canceled_at' => $canceledAt,
+            'cancel_at_period_end' => false,
+        ];
+
+        $row = $this->stripeService()->reconcile('stripe', 'sub_canceled');
+
+        self::assertSame('canceled', $row['status']);
+        self::assertSame(
+            gmdate('Y-m-d H:i:s', $canceledAt),
+            $row['canceled_at']
+        );
+    }
+
     private function service(): GatewaySubscriptionService
     {
         $manager = new GatewayManager($this->context->getContainer(), $this->context);
         $manager->registerDriver('fake', FakeWebhookGateway::class);
+
+        return new GatewaySubscriptionService($this->context, $this->repo, $manager);
+    }
+
+    private function stripeService(): GatewaySubscriptionService
+    {
+        // Drive the Stripe normalization path: the fake driver supplies the raw
+        // Stripe-shaped payload while the service dispatches normalization on the
+        // 'stripe' gateway key.
+        $manager = new GatewayManager($this->context->getContainer(), $this->context);
+        $manager->registerDriver('stripe', FakeWebhookGateway::class);
 
         return new GatewaySubscriptionService($this->context, $this->repo, $manager);
     }
