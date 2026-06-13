@@ -12,6 +12,11 @@ use Symfony\Component\HttpFoundation\Request;
 
 final class InvoiceController extends BaseController
 {
+    /** @var list<string> */
+    private const STATUSES = ['draft', 'pending', 'paid', 'canceled', 'failed'];
+
+    private const MAX_PER_PAGE = 100;
+
     public function __construct(
         ApplicationContext $context,
         private ?InvoiceService $invoices = null
@@ -26,8 +31,28 @@ final class InvoiceController extends BaseController
             $data = $this->normalizeBody($request);
 
             $amount = $data['amount'] ?? null;
+
+            $errors = [];
             if (!is_numeric($amount)) {
-                return $this->validationError(['amount' => 'amount is required and must be numeric']);
+                $errors['amount'] = 'amount is required and must be numeric';
+            } elseif ((float) $amount <= 0) {
+                $errors['amount'] = 'amount must be greater than 0';
+            }
+
+            $currency = isset($data['currency']) && is_string($data['currency'])
+                ? strtoupper(trim($data['currency']))
+                : 'GHS';
+            if (preg_match('/^[A-Z]{3}$/', $currency) !== 1) {
+                $errors['currency'] = 'currency must be a 3-letter ISO code (e.g. GHS, USD)';
+            }
+
+            $status = isset($data['status']) && is_string($data['status']) ? $data['status'] : 'pending';
+            if (!in_array($status, self::STATUSES, true)) {
+                $errors['status'] = 'status must be one of: ' . implode(', ', self::STATUSES);
+            }
+
+            if ($errors !== []) {
+                return $this->validationError($errors);
             }
 
             $payload = [
@@ -43,8 +68,8 @@ final class InvoiceController extends BaseController
                     : null,
                 'number' => isset($data['number']) && is_string($data['number']) ? $data['number'] : null,
                 'amount' => (float) $amount,
-                'currency' => isset($data['currency']) && is_string($data['currency']) ? $data['currency'] : 'GHS',
-                'status' => isset($data['status']) && is_string($data['status']) ? $data['status'] : 'pending',
+                'currency' => $currency,
+                'status' => $status,
                 'due_at' => isset($data['due_at']) && is_string($data['due_at']) ? $data['due_at'] : null,
                 'metadata' => isset($data['metadata']) && is_array($data['metadata']) ? $data['metadata'] : null,
             ];
@@ -74,8 +99,9 @@ final class InvoiceController extends BaseController
                 try {
                     $paidAt = new \DateTimeImmutable($data['paid_at']);
                 } catch (\Throwable) {
-                    // ignore parse error; fall back to now
-                    $paidAt = null;
+                    return $this->validationError([
+                        'paid_at' => 'paid_at must be a valid datetime (e.g. Y-m-d H:i:s)',
+                    ]);
                 }
             }
 
@@ -152,7 +178,7 @@ final class InvoiceController extends BaseController
 
             $page = isset($query['page']) && is_numeric($query['page']) ? max(1, (int) $query['page']) : 1;
             $perPage = isset($query['per_page']) && is_numeric($query['per_page'])
-                ? max(1, (int) $query['per_page'])
+                ? min(self::MAX_PER_PAGE, max(1, (int) $query['per_page']))
                 : 20;
 
             $result = $this->invoices->list($page, $perPage, $filters);
