@@ -22,8 +22,10 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
 
         $number = $data['number'] ?? null;
         if (!is_string($number) || $number === '') {
-            // Simple sequential-style number using timestamp + random suffix
-            $number = 'INV-' . date('Ymd-His') . '-' . substr($uuid, -4);
+            // Timestamp prefix for readability + the full NanoID for entropy.
+            // Using only the last 4 chars of the 12-char uuid risked UNIQUE(number)
+            // collisions; the full id keeps the generated number unique.
+            $number = 'INV-' . date('Ymd-His') . '-' . strtoupper($uuid);
         }
 
         $payload = array_merge($data, [
