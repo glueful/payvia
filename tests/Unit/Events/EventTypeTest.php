@@ -23,6 +23,14 @@ final class EventTypeTest extends TestCase
         self::assertFalse(EventType::isImmutable(EventType::SUBSCRIPTION_PAST_DUE));
     }
 
+    public function testPaymentFailedIsMutableForLogicalDedup(): void
+    {
+        // Repeat failures for the same entity must not be deduplicated away,
+        // so payment.failed is treated as mutable (still a known event).
+        self::assertFalse(EventType::isImmutable(EventType::PAYMENT_FAILED));
+        self::assertTrue(EventType::isKnown(EventType::PAYMENT_FAILED));
+    }
+
     public function testKnownVsUnknown(): void
     {
         self::assertTrue(EventType::isKnown('payment.succeeded'));
