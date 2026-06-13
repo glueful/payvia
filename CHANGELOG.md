@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-06-13
+
 ### Security
 
 - **Payment confirmation now binds `user_uuid` to the authenticated session.** `POST /payvia/payments/confirm` previously took `user_uuid` verbatim from the request body and wrote it to the `payments` row, letting any authenticated caller attribute a payment to any other user. The stored `user_uuid` is now always derived from the authenticated identity (`BaseController::$currentUser`). If the body supplies a `user_uuid` that differs from the session (or is supplied with no resolvable session), the request is rejected with `422`; a matching or absent value is accepted. When no authenticated user is resolvable, `user_uuid` falls back to `null` rather than trusting the body. The field is no longer caller-settable and has been removed from the route/README request-body docs.
