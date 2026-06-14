@@ -8,6 +8,9 @@ use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Controllers\BaseController;
 use Glueful\Extensions\Payvia\Services\BillingPlanService;
 use Glueful\Http\Response;
+use Glueful\Routing\Attributes\ApiOperation;
+use Glueful\Routing\Attributes\ApiResponse;
+use Glueful\Routing\Attributes\QueryParam;
 use Glueful\Validation\ValidationException;
 use Symfony\Component\HttpFoundation\Request;
 
@@ -27,6 +30,18 @@ final class BillingPlanController extends BaseController
         $this->plans = $this->plans ?? app($context, BillingPlanService::class);
     }
 
+    #[ApiOperation(
+        summary: 'Create Billing Plan',
+        description: 'Creates a generic billing plan record. Body: `name` (required), `amount` (required; '
+            . 'unit price), `description`, `currency` (currency code, e.g. GHS, USD), `interval` (billing '
+            . 'interval: monthly|yearly|one_time), `trial_days` (optional trial days), `gateway` (optional '
+            . 'provider gateway key, e.g. paystack), `gateway_product_id`, `gateway_price_id`, `metadata` '
+            . '(additional metadata for the plan), `status` (active|inactive). Requires the `admin` permission.',
+        tags: ['Billing'],
+    )]
+    #[ApiResponse(201, description: 'Plan created')]
+    #[ApiResponse(403, description: 'Forbidden — requires admin')]
+    #[ApiResponse(422, description: 'Validation failed')]
     public function create(Request $request): Response
     {
         try {
@@ -97,6 +112,17 @@ final class BillingPlanController extends BaseController
         }
     }
 
+    #[ApiOperation(
+        summary: 'Update Billing Plan',
+        description: 'Updates an existing billing plan by UUID. Body: `plan_uuid` (required; plan UUID to '
+            . 'update), `name`, `description`, `amount` (unit price), `currency`, `interval`, `trial_days`, '
+            . '`gateway`, `gateway_product_id`, `gateway_price_id`, `metadata`, `status`. '
+            . 'Requires the `admin` permission.',
+        tags: ['Billing'],
+    )]
+    #[ApiResponse(200, description: 'Plan updated')]
+    #[ApiResponse(403, description: 'Forbidden — requires admin')]
+    #[ApiResponse(404, description: 'Plan not found')]
     public function update(Request $request): Response
     {
         try {
@@ -177,6 +203,15 @@ final class BillingPlanController extends BaseController
         }
     }
 
+    #[ApiOperation(
+        summary: 'Disable Billing Plan',
+        description: 'Marks a billing plan as inactive, preventing new subscriptions. Body: `plan_uuid` '
+            . '(required; plan UUID to disable). Requires the `admin` permission.',
+        tags: ['Billing'],
+    )]
+    #[ApiResponse(200, description: 'Plan disabled')]
+    #[ApiResponse(403, description: 'Forbidden — requires admin')]
+    #[ApiResponse(404, description: 'Plan not found')]
     public function disable(Request $request): Response
     {
         try {
@@ -198,6 +233,15 @@ final class BillingPlanController extends BaseController
         }
     }
 
+    #[ApiOperation(
+        summary: 'List Billing Plans',
+        description: 'Lists billing plans with optional filters. Requires authentication.',
+        tags: ['Billing'],
+    )]
+    #[QueryParam('status', description: 'Filter by plan status (e.g. active, inactive)')]
+    #[QueryParam('interval', description: 'Filter by billing interval')]
+    #[QueryParam('currency', description: 'Filter by currency code')]
+    #[ApiResponse(200, description: 'Plans retrieved')]
     public function index(Request $request): Response
     {
         try {

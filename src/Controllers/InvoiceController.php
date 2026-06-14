@@ -8,6 +8,9 @@ use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Controllers\BaseController;
 use Glueful\Extensions\Payvia\Services\InvoiceService;
 use Glueful\Http\Response;
+use Glueful\Routing\Attributes\ApiOperation;
+use Glueful\Routing\Attributes\ApiResponse;
+use Glueful\Routing\Attributes\QueryParam;
 use Symfony\Component\HttpFoundation\Request;
 
 final class InvoiceController extends BaseController
@@ -25,6 +28,20 @@ final class InvoiceController extends BaseController
         $this->invoices = $this->invoices ?? app($context, InvoiceService::class);
     }
 
+    #[ApiOperation(
+        summary: 'Create Invoice',
+        description: 'Creates a generic invoice that can be reconciled with payments. Body: `amount` '
+            . '(required; invoice amount), `currency` (currency code, e.g. GHS, USD), `user_uuid` (optional), '
+            . '`billing_plan_uuid` (optional), `payable_type` (optional logical type of the payable, e.g. '
+            . 'subscription, order), `payable_id` (optional identifier of the payable), `number` (optional '
+            . 'custom invoice number), `status` (draft,pending,paid,canceled,failed; defaults to pending), '
+            . '`due_at` (optional due date, Y-m-d H:i:s), `metadata` (additional metadata for the invoice). '
+            . 'Requires the `admin` permission.',
+        tags: ['Billing'],
+    )]
+    #[ApiResponse(201, description: 'Invoice created')]
+    #[ApiResponse(403, description: 'Forbidden — requires admin')]
+    #[ApiResponse(422, description: 'Validation failed')]
     public function create(Request $request): Response
     {
         try {
@@ -83,6 +100,16 @@ final class InvoiceController extends BaseController
         }
     }
 
+    #[ApiOperation(
+        summary: 'Mark Invoice as Paid',
+        description: 'Marks an invoice as paid and records the paid_at timestamp. Body: `invoice_uuid` '
+            . '(required; invoice UUID to mark as paid), `paid_at` (optional paid at datetime, Y-m-d H:i:s). '
+            . 'Requires the `admin` permission.',
+        tags: ['Billing'],
+    )]
+    #[ApiResponse(200, description: 'Invoice marked as paid')]
+    #[ApiResponse(403, description: 'Forbidden — requires admin')]
+    #[ApiResponse(404, description: 'Invoice not found')]
     public function markPaid(Request $request): Response
     {
         try {
@@ -117,6 +144,15 @@ final class InvoiceController extends BaseController
         }
     }
 
+    #[ApiOperation(
+        summary: 'Cancel Invoice',
+        description: 'Marks an invoice as canceled. Body: `invoice_uuid` (required; invoice UUID to cancel). '
+            . 'Requires the `admin` permission.',
+        tags: ['Billing'],
+    )]
+    #[ApiResponse(200, description: 'Invoice canceled')]
+    #[ApiResponse(403, description: 'Forbidden — requires admin')]
+    #[ApiResponse(404, description: 'Invoice not found')]
     public function cancel(Request $request): Response
     {
         try {
@@ -140,6 +176,22 @@ final class InvoiceController extends BaseController
         }
     }
 
+    #[ApiOperation(
+        summary: 'List Invoices',
+        description: 'Lists invoices with optional filters, including JSON metadata filters. '
+            . 'Requires authentication.',
+        tags: ['Billing'],
+    )]
+    #[QueryParam('status', description: 'Filter by invoice status (draft,pending,paid,canceled,failed)')]
+    #[QueryParam('user_uuid', description: 'Filter by user UUID')]
+    #[QueryParam('billing_plan_uuid', description: 'Filter by billing plan UUID')]
+    #[QueryParam('payable_type', description: 'Filter by payable type')]
+    #[QueryParam('payable_id', description: 'Filter by payable id')]
+    #[QueryParam('metadata_key', description: 'JSON key under metadata to filter by')]
+    #[QueryParam('metadata_value', description: 'Value the metadata key must contain')]
+    #[QueryParam('page', 'integer', description: 'Page number for pagination (default: 1)')]
+    #[QueryParam('per_page', 'integer', description: 'Number of items per page (default: 20, max: 100)')]
+    #[ApiResponse(200, description: 'Invoices retrieved')]
     public function index(Request $request): Response
     {
         try {
