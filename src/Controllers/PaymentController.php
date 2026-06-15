@@ -8,6 +8,8 @@ use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Controllers\BaseController;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Http\Response;
+use Glueful\Routing\Attributes\ApiOperation;
+use Glueful\Routing\Attributes\ApiResponse;
 use Glueful\Validation\ValidationException;
 use Symfony\Component\HttpFoundation\Request;
 
@@ -24,6 +26,22 @@ final class PaymentController extends BaseController
     /**
      * Confirm a payment via a configured gateway and record it.
      */
+    #[ApiOperation(
+        summary: 'Confirm Payment via Gateway',
+        description: 'Verifies a payment with a configured gateway (Paystack, Stripe, etc.) and upserts a '
+            . 'record into the generic `payments` table. Body: `reference` (required; provider transaction '
+            . 'reference), `gateway` (gateway key from `payvia.gateways` config, defaults to '
+            . '`payvia.default_gateway`), `payable_type` (optional logical type for the payable, e.g. '
+            . 'subscription, order), `payable_id` (optional identifier of the payable in its domain), '
+            . '`metadata` (optional free-form JSON metadata to persist), `options` (optional gateway-specific '
+            . 'options passed to the gateway driver). Requires authentication. The stored `user_uuid` is '
+            . 'always derived from the authenticated session and is NOT caller-settable; supplying a '
+            . '`user_uuid` that differs from the session returns 422.',
+        tags: ['Payments'],
+    )]
+    #[ApiResponse(200, description: 'Payment verified and recorded')]
+    #[ApiResponse(422, description: 'Validation failed (also returned if a user_uuid that differs from the '
+        . 'authenticated session is supplied)')]
     public function confirm(Request $request): Response
     {
         try {
