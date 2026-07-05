@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Services;
 
 use Glueful\Bootstrap\ApplicationContext;
+use Glueful\Extensions\Contracts\Payments\PayableReference;
+use Glueful\Extensions\Contracts\Payments\PaymentConfirmation;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
@@ -21,6 +23,7 @@ final class PaymentService
         private PaymentRepositoryInterface $payments,
         private GatewayManager $gateways,
         private ?WebhookService $webhooks = null,
+        private ?ConfirmationDispatcher $confirmations = null,
     ) {
         $this->context = $context;
     }
@@ -142,6 +145,32 @@ final class PaymentService
             }
         }
 
+        if (
+            $status === 'success'
+            && is_string($payload['payable_type'])
+            && $payload['payable_type'] !== ''
+            && is_string($payload['payable_id'])
+            && $payload['payable_id'] !== ''
+        ) {
+            $this->confirmations?->dispatch(
+                $this->context,
+                new PayableReference(
+                    $payload['payable_type'],
+                    $payload['payable_id'],
+                    $this->minorUnits($amount),
+                    $currency,
+                    metadata: $metadata
+                ),
+                new PaymentConfirmation(
+                    'paid',
+                    (string) ($verification['reference'] ?? $reference),
+                    $this->minorUnits($amount),
+                    $currency,
+                    $verification
+                )
+            );
+        }
+
         return [
             'payment_status' => $status,
             'gateway' => $gatewayKey,
@@ -151,5 +180,10 @@ final class PaymentService
             'message' => $message !== '' ? $message : null,
             'verification' => $verification,
         ];
+    }
+
+    private function minorUnits(float $amount): int
+    {
+        return (int) round($amount * 100);
     }
 }

@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Database\Migrations\MigrationPriority;
 use Glueful\Extensions\Contracts\Payments\PaymentCollector;
+use Glueful\Extensions\Contracts\Payments\PaymentConfirmationHandler;
 use Glueful\Extensions\ServiceProvider;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
@@ -25,6 +26,7 @@ use Glueful\Extensions\Payvia\Services\BillingPlanService;
 use Glueful\Extensions\Payvia\Services\InvoiceService;
 use Glueful\Extensions\Payvia\Services\WebhookService;
 use Glueful\Extensions\Payvia\Services\GatewaySubscriptionService;
+use Glueful\Extensions\Payvia\Services\ConfirmationDispatcher;
 use Glueful\Extensions\Payvia\Services\PayviaPaymentCollector;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
 use Glueful\Extensions\Payvia\Controllers\BillingPlanController;
@@ -113,6 +115,10 @@ final class PayviaServiceProvider extends ServiceProvider
                 'shared' => true,
                 'autowire' => true,
             ],
+            ConfirmationDispatcher::class => [
+                'factory' => [self::class, 'makeConfirmationDispatcher'],
+                'shared' => true,
+            ],
             PaymentService::class => [
                 'class' => PaymentService::class,
                 'shared' => true,
@@ -173,6 +179,18 @@ final class PayviaServiceProvider extends ServiceProvider
                 'autowire' => true,
             ],
         ];
+    }
+
+    public static function makeConfirmationDispatcher(ContainerInterface $container): ConfirmationDispatcher
+    {
+        $handlers = $container->has(PaymentConfirmationHandler::CONTAINER_TAG)
+            ? $container->get(PaymentConfirmationHandler::CONTAINER_TAG)
+            : [];
+
+        return new ConfirmationDispatcher(
+            $container->get(PaymentIntentRepository::class),
+            is_iterable($handlers) ? $handlers : []
+        );
     }
 
     public static function makeWebhookService(ContainerInterface $container): WebhookService
