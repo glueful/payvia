@@ -6,6 +6,7 @@ namespace Glueful\Extensions\Payvia;
 
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Database\Migrations\MigrationPriority;
+use Glueful\Extensions\Contracts\Payments\PaymentCollector;
 use Glueful\Extensions\ServiceProvider;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
@@ -18,11 +19,13 @@ use Glueful\Extensions\Payvia\Repositories\BillingPlanRepository;
 use Glueful\Extensions\Payvia\Repositories\InvoiceRepository;
 use Glueful\Extensions\Payvia\Repositories\ProviderEventRepository;
 use Glueful\Extensions\Payvia\Repositories\GatewaySubscriptionRepository;
+use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Extensions\Payvia\Services\BillingPlanService;
 use Glueful\Extensions\Payvia\Services\InvoiceService;
 use Glueful\Extensions\Payvia\Services\WebhookService;
 use Glueful\Extensions\Payvia\Services\GatewaySubscriptionService;
+use Glueful\Extensions\Payvia\Services\PayviaPaymentCollector;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
 use Glueful\Extensions\Payvia\Controllers\BillingPlanController;
 use Glueful\Extensions\Payvia\Controllers\InvoiceController;
@@ -100,6 +103,15 @@ final class PayviaServiceProvider extends ServiceProvider
             GatewaySubscriptionRepositoryInterface::class => [
                 'class' => GatewaySubscriptionRepository::class,
                 'shared' => true,
+            ],
+            PaymentIntentRepository::class => [
+                'class' => PaymentIntentRepository::class,
+                'shared' => true,
+            ],
+            PaymentCollector::class => [
+                'class' => PayviaPaymentCollector::class,
+                'shared' => true,
+                'autowire' => true,
             ],
             PaymentService::class => [
                 'class' => PaymentService::class,
