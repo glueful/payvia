@@ -42,7 +42,7 @@ final class InvoiceApiTest extends PayviaTestCase
     public function testCreateRejectsInvalidStatus(): void
     {
         $response = $this->controller->create($this->jsonRequest([
-            'amount' => 50.0,
+            'amount' => 5000,
             'status' => 'bogus',
         ]));
 
@@ -53,7 +53,7 @@ final class InvoiceApiTest extends PayviaTestCase
     public function testCreateRejectsInvalidCurrency(): void
     {
         $response = $this->controller->create($this->jsonRequest([
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'CEDIS',
         ]));
 
@@ -84,7 +84,7 @@ final class InvoiceApiTest extends PayviaTestCase
     public function testCreateUppercasesLowercaseCurrency(): void
     {
         $this->controller->create($this->jsonRequest([
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'usd',
         ]));
 
@@ -95,7 +95,7 @@ final class InvoiceApiTest extends PayviaTestCase
     public function testCreateAcceptsValidValues(): void
     {
         $response = $this->controller->create($this->jsonRequest([
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'GHS',
             'status' => 'draft',
         ]));
@@ -107,7 +107,7 @@ final class InvoiceApiTest extends PayviaTestCase
     public function testMarkPaidRejectsUnparseablePaidAt(): void
     {
         $uuid = $this->repo->create([
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'GHS',
             'status' => 'pending',
         ]);
@@ -124,7 +124,7 @@ final class InvoiceApiTest extends PayviaTestCase
     public function testMarkPaidAcceptsValidPaidAt(): void
     {
         $uuid = $this->repo->create([
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'GHS',
             'status' => 'pending',
         ]);

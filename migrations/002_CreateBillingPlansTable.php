@@ -24,8 +24,8 @@ class CreateBillingPlansTable implements MigrationInterface
             $table->string('name', 100);
             $table->text('description')->nullable();
 
-            // Pricing
-            $table->decimal('amount', 12, 2);
+            // Pricing (integer minor units, e.g. cents)
+            $table->bigInteger('amount');
             $table->string('currency', 10)->default('GHS');
             // Interval: monthly, yearly, one_time, etc.
             $table->string('interval', 20)->default('monthly');
@@ -45,7 +45,10 @@ class CreateBillingPlansTable implements MigrationInterface
             $table->timestamp('updated_at')->nullable();
 
             $table->unique('uuid');
-            $table->unique('name');
+            // Scoped uniqueness: a name is unique per (non-NULL) gateway,
+            // not globally. NULLs never collide in a unique index, so
+            // multiple app-managed (gateway = NULL) plans may share a name.
+            $table->unique(['gateway', 'name']);
         });
     }
 

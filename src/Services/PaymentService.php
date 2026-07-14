@@ -46,7 +46,10 @@ final class PaymentService
         $status = (string) ($verification['status'] ?? 'failed');
         $providerId = (string) ($verification['id'] ?? '');
         $message = (string) ($verification['message'] ?? '');
-        $amount = (float) ($verification['amount'] ?? 0.0);
+        // Gateways already normalize amounts to integer minor units on the wire;
+        // this is the single integer carried end-to-end into storage, events, and
+        // API responses. No float arithmetic on money.
+        $amount = (int) ($verification['amount'] ?? 0);
         $currency = (string) ($verification['currency'] ?? 'GHS');
 
         // Start with caller-provided metadata
@@ -135,6 +138,7 @@ final class PaymentService
                         'reference' => $reference,
                         'gateway_transaction_id' => $providerId !== '' ? $providerId : null,
                         'amount' => $amount,
+                        'amount_unit' => 'minor',
                         'currency' => $currency,
                         'status' => $status,
                     ],
@@ -157,14 +161,14 @@ final class PaymentService
                 new PayableReference(
                     $payload['payable_type'],
                     $payload['payable_id'],
-                    $this->minorUnits($amount),
+                    $amount,
                     $currency,
                     metadata: $metadata
                 ),
                 new PaymentConfirmation(
                     'paid',
                     (string) ($verification['reference'] ?? $reference),
-                    $this->minorUnits($amount),
+                    $amount,
                     $currency,
                     $verification
                 )
@@ -180,10 +184,5 @@ final class PaymentService
             'message' => $message !== '' ? $message : null,
             'verification' => $verification,
         ];
-    }
-
-    private function minorUnits(float $amount): int
-    {
-        return (int) round($amount * 100);
     }
 }

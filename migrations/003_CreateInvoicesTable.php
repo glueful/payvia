@@ -34,7 +34,7 @@ class CreateInvoicesTable implements MigrationInterface
             $table->string('number', 50);
 
             // Financials
-            $table->decimal('amount', 12, 2);
+            $table->bigInteger('amount');
             $table->string('currency', 10)->default('GHS');
             $table->string('status', 20)->default('draft'); // draft, pending, paid, canceled, failed
 
@@ -70,4 +70,3 @@ class CreateInvoicesTable implements MigrationInterface
         return 'Creates invoices table for generic billing invoices with polymorphic links.';
     }
 }
-

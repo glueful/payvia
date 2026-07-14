@@ -30,7 +30,7 @@ class CreatePaymentsTable implements MigrationInterface
             $table->string('gateway_transaction_id', 100)->nullable();
             $table->string('reference', 100);
 
-            $table->decimal('amount', 12, 2);
+            $table->bigInteger('amount');
             $table->string('currency', 10)->default('GHS');
             $table->string('status', 20)->default('pending');
             $table->string('message', 255)->nullable();

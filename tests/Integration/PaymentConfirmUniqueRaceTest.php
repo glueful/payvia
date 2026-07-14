@@ -30,7 +30,7 @@ final class PaymentConfirmUniqueRaceTest extends PayviaTestCase
                     'status' => 'success',
                     'id' => 'gw_tx_1',
                     'message' => 'ok',
-                    'amount' => 100.0,
+                    'amount' => 10000,
                     'currency' => 'GHS',
                 ];
             }
@@ -89,7 +89,7 @@ final class PaymentConfirmUniqueRaceTest extends PayviaTestCase
         self::assertNotNull($repo->updatedWith);
         // The update path applies the same payload the insert would have.
         self::assertSame('ref_race', $repo->updatedWith['reference']);
-        self::assertSame(100.0, $repo->updatedWith['amount']);
+        self::assertSame(10000, $repo->updatedWith['amount']);
         self::assertSame('success', $repo->updatedWith['status']);
     }
 

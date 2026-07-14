@@ -33,7 +33,9 @@ final class ConfirmationDispatchTest extends PayviaTestCase
     public function testDispatchReachesMatchingHandlerOnSuccessOnly(): void
     {
         $handler = new RecordingHandler('commerce_order');
-        $gateway = new FakeConfirmGateway('failed', 49.99, 'USD');
+        // Wire amounts are already integer minor units; 4999 = USD 49.99, passed
+        // straight through with no float conversion.
+        $gateway = new FakeConfirmGateway('failed', 4999, 'USD');
         $this->bind(FakeConfirmGateway::class, $gateway);
         $service = $this->service($handler);
 
@@ -60,7 +62,7 @@ final class ConfirmationDispatchTest extends PayviaTestCase
         $handler = new RecordingHandler('lemma_invoice');
         $service = $this->service($handler);
 
-        $this->bind(FakeConfirmGateway::class, new FakeConfirmGateway('success', 49.99, 'USD'));
+        $this->bind(FakeConfirmGateway::class, new FakeConfirmGateway('success', 4999, 'USD'));
         $service->confirmAndRecord('ref_success', 'paystack', [
             'payable_type' => 'commerce_order',
             'payable_id' => 'ord2',
@@ -84,7 +86,7 @@ final class ConfirmationDispatchTest extends PayviaTestCase
             'payload' => ['checkout_url' => 'https://checkout.test/ref_success'],
         ]);
 
-        $this->bind(FakeConfirmGateway::class, new FakeConfirmGateway('success', 49.99, 'USD'));
+        $this->bind(FakeConfirmGateway::class, new FakeConfirmGateway('success', 4999, 'USD'));
         $service->confirmAndRecord('ref_success', 'paystack', [
             'payable_type' => 'commerce_order',
             'payable_id' => 'ord3',
@@ -121,7 +123,7 @@ final class FakeConfirmGateway implements PaymentGatewayInterface
 {
     public function __construct(
         public string $status,
-        private float $amount,
+        private int $amount,
         private string $currency,
     ) {
     }

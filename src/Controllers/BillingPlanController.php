@@ -33,7 +33,8 @@ final class BillingPlanController extends BaseController
     #[ApiOperation(
         summary: 'Create Billing Plan',
         description: 'Creates a generic billing plan record. Body: `name` (required), `amount` (required; '
-            . 'unit price), `description`, `currency` (currency code, e.g. GHS, USD), `interval` (billing '
+            . 'unit price as an integer in the currency\'s minor unit, e.g. cents — 5000 for GHS 50.00), '
+            . '`description`, `currency` (currency code, e.g. GHS, USD), `interval` (billing '
             . 'interval: monthly|yearly|one_time), `trial_days` (optional trial days), `gateway` (optional '
             . 'provider gateway key, e.g. paystack), `gateway_product_id`, `gateway_price_id`, `metadata` '
             . '(additional metadata for the plan), `status` (active|inactive). Requires the `admin` permission.',
@@ -55,8 +56,10 @@ final class BillingPlanController extends BaseController
                 $errors['name'] = 'name is required';
             }
             if (!is_numeric($amount)) {
-                $errors['amount'] = 'amount is required and must be numeric';
-            } elseif ((float) $amount <= 0) {
+                $errors['amount'] = 'amount is required and must be an integer (minor units, e.g. cents)';
+            } elseif ((float) $amount != (int) $amount) {
+                $errors['amount'] = 'amount must be a whole number (minor units, e.g. cents)';
+            } elseif ((int) $amount <= 0) {
                 $errors['amount'] = 'amount must be greater than 0';
             }
 
@@ -86,7 +89,7 @@ final class BillingPlanController extends BaseController
                 'description' => isset($data['description']) && is_string($data['description'])
                     ? $data['description']
                     : null,
-                'amount' => (float) $amount,
+                'amount' => (int) $amount,
                 'currency' => $currency,
                 'interval' => $interval,
                 'trial_days' => isset($data['trial_days']) && is_numeric($data['trial_days'])
@@ -115,7 +118,8 @@ final class BillingPlanController extends BaseController
     #[ApiOperation(
         summary: 'Update Billing Plan',
         description: 'Updates an existing billing plan by UUID. Body: `plan_uuid` (required; plan UUID to '
-            . 'update), `name`, `description`, `amount` (unit price), `currency`, `interval`, `trial_days`, '
+            . 'update), `name`, `description`, `amount` (unit price as an integer in the currency\'s minor '
+            . 'unit, e.g. cents), `currency`, `interval`, `trial_days`, '
             . '`gateway`, `gateway_product_id`, `gateway_price_id`, `metadata`, `status`. '
             . 'Requires the `admin` permission.',
         tags: ['Billing'],
@@ -142,10 +146,12 @@ final class BillingPlanController extends BaseController
                 $update['description'] = $data['description'];
             }
             if (array_key_exists('amount', $data) && is_numeric($data['amount'])) {
-                if ((float) $data['amount'] <= 0) {
+                if ((float) $data['amount'] != (int) $data['amount']) {
+                    $errors['amount'] = 'amount must be a whole number (minor units, e.g. cents)';
+                } elseif ((int) $data['amount'] <= 0) {
                     $errors['amount'] = 'amount must be greater than 0';
                 } else {
-                    $update['amount'] = (float) $data['amount'];
+                    $update['amount'] = (int) $data['amount'];
                 }
             }
             if (array_key_exists('currency', $data) && is_string($data['currency'])) {

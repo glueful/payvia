@@ -88,7 +88,9 @@ final class PaystackGateway implements
             ];
         }
 
-        $amount = isset($data['amount']) ? ((float) $data['amount'] / 100.0) : 0.0;
+        // Paystack's wire amount is already an integer minor unit (e.g. 5000 = GHS
+        // 50.00); pass it through untouched — never float-divide by 100.
+        $amount = isset($data['amount']) ? (int) $data['amount'] : 0;
         $currency = (string) ($data['currency'] ?? 'GHS');
 
         return [
@@ -320,7 +322,9 @@ final class PaystackGateway implements
      */
     private function normalizePayload(string $type, array $data): array
     {
-        $amount = isset($data['amount']) ? ((float) $data['amount'] / 100.0) : null;
+        // Paystack's wire amount is already an integer minor unit; pass it through
+        // untouched — never float-divide by 100.
+        $amount = isset($data['amount']) ? (int) $data['amount'] : null;
         $customer = (array) ($data['customer'] ?? []);
 
         return array_filter([
@@ -333,6 +337,9 @@ final class PaystackGateway implements
             'gateway_customer_id' => $customer['customer_code'] ?? $data['customer_code'] ?? null,
             'billing_plan_uuid' => $data['metadata']['billing_plan_uuid'] ?? null,
             'amount' => $amount,
+            // Forward-compat marker for any future consumer/re-normalizer; only set
+            // when a numeric amount is actually present.
+            'amount_unit' => $amount !== null ? 'minor' : null,
             'currency' => $data['currency'] ?? null,
             'status' => $data['status'] ?? null,
             'current_period_end' => $data['next_payment_date'] ?? null,

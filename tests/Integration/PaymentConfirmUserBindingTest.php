@@ -76,7 +76,7 @@ final class PaymentConfirmUserBindingTest extends PayviaTestCase
                     'status' => 'success',
                     'id' => 'gw_tx_1',
                     'message' => 'ok',
-                    'amount' => 100.0,
+                    'amount' => 10000,
                     'currency' => 'GHS',
                 ];
             }

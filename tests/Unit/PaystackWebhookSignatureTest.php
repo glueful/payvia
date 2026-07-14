@@ -62,7 +62,10 @@ final class PaystackWebhookSignatureTest extends TestCase
         self::assertSame(EventType::PAYMENT_SUCCEEDED, $event->type());
         self::assertSame('payment.succeeded:R1', $event->logicalEventKey());
         self::assertSame('R1', $event->normalized()['reference']);
-        self::assertSame(50.0, $event->normalized()['amount']);
+        // Wire amounts are already minor units (Paystack sends 5000 = GHS 50.00);
+        // normalization must pass them through untouched, never divide by 100.
+        self::assertSame(5000, $event->normalized()['amount']);
+        self::assertSame('minor', $event->normalized()['amount_unit']);
     }
 
     public function testVerifyIgnoresCallerSuppliedVerifyUrl(): void
@@ -112,6 +115,8 @@ final class PaystackWebhookSignatureTest extends TestCase
 
         self::assertSame('success', $result['status']);
         self::assertSame('REF_1', $result['reference']);
+        // verify() must pass the wire (minor-unit) amount straight through as an int.
+        self::assertSame(5000, $result['amount']);
     }
 
     public function testInitializePostsMinorUnitAmountToTrustedPaystackUrl(): void

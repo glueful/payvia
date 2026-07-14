@@ -43,7 +43,7 @@ final class BillingPlanApiTest extends PayviaTestCase
     {
         $request = $this->jsonRequest([
             'name' => 'Pro',
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'GHS',
             'interval' => 'monthly',
             'gateway' => 'paystack',
@@ -63,7 +63,7 @@ final class BillingPlanApiTest extends PayviaTestCase
     {
         $uuid = $this->repo->create([
             'name' => 'Basic',
-            'amount' => 10.0,
+            'amount' => 1000,
             'currency' => 'GHS',
             'interval' => 'monthly',
             'status' => 'active',
@@ -86,7 +86,7 @@ final class BillingPlanApiTest extends PayviaTestCase
     {
         $response = $this->controller->create($this->jsonRequest([
             'name' => 'Pro',
-            'amount' => 50.0,
+            'amount' => 5000,
             'status' => 'bogus',
         ]));
 
@@ -98,7 +98,7 @@ final class BillingPlanApiTest extends PayviaTestCase
     {
         $response = $this->controller->create($this->jsonRequest([
             'name' => 'Pro',
-            'amount' => 50.0,
+            'amount' => 5000,
             'interval' => 'weekly',
         ]));
 
@@ -110,7 +110,7 @@ final class BillingPlanApiTest extends PayviaTestCase
     {
         $response = $this->controller->create($this->jsonRequest([
             'name' => 'Pro',
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'CEDIS',
         ]));
 
@@ -144,7 +144,7 @@ final class BillingPlanApiTest extends PayviaTestCase
     {
         $this->controller->create($this->jsonRequest([
             'name' => 'Pro',
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'usd',
         ]));
 
@@ -156,7 +156,7 @@ final class BillingPlanApiTest extends PayviaTestCase
     {
         $uuid = $this->repo->create([
             'name' => 'Basic',
-            'amount' => 10.0,
+            'amount' => 1000,
             'currency' => 'GHS',
             'interval' => 'monthly',
             'status' => 'active',
@@ -175,7 +175,7 @@ final class BillingPlanApiTest extends PayviaTestCase
     {
         $uuid = $this->repo->create([
             'name' => 'Basic',
-            'amount' => 10.0,
+            'amount' => 1000,
             'currency' => 'GHS',
             'interval' => 'monthly',
             'status' => 'active',
@@ -187,14 +187,14 @@ final class BillingPlanApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame(10.0, (float) $this->repo->list([])[0]['amount']);
+        self::assertSame(1000, (int) $this->repo->list([])[0]['amount']);
     }
 
     public function testCreateAcceptsValidValues(): void
     {
         $response = $this->controller->create($this->jsonRequest([
             'name' => 'Pro',
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'GHS',
             'interval' => 'one_time',
             'status' => 'inactive',
