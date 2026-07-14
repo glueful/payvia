@@ -150,8 +150,12 @@ return [
     ],
 
     'security' => [
-        // Middleware applied to billing-plan and invoice write routes (admin-only by default).
-        'manage_middleware' => ['auth', 'admin'],
+        // Three ordered profiles composed onto every /payvia/* route except the webhook
+        // route (which stays signature-authenticated/tenantless). See "Middleware profiles
+        // and tenancy" below.
+        'auth_middleware' => ['auth'],
+        'tenant_context_middleware' => [],
+        'manage_middleware' => ['admin'],
     ],
 
     'webhooks' => [
@@ -225,29 +229,47 @@ Admin-gated write routes:
 - `POST /payvia/invoices/mark-paid`
 - `POST /payvia/invoices/cancel`
 
-**Overriding the management middleware.** The stack applied to these write routes
-is configurable via `payvia.security.manage_middleware`. Override it in your app's
-`config/payvia.php` (or merged config) to swap `admin` for a custom permission
-middleware, or to relax/tighten the requirement. Each route still appends its own
-`rate_limit:N,60` after this stack.
+### Middleware profiles and tenancy
+
+Every `/payvia/*` route except the webhook route (which stays
+signature-authenticated/tenantless) composes three ordered, independently
+configurable middleware profiles:
 
 ```php
-// config/payvia.php (application override)
+// config/payvia.php (application override — neutral defaults shown; single-store
+// installs can leave this block out entirely)
 return [
     'security' => [
-        // e.g. require a custom 'billing.manage' permission middleware instead of admin
-        'manage_middleware' => ['auth', 'permission:billing.manage'],
+        // Profile 1 — authentication.
+        'auth_middleware' => ['auth'],
+
+        // Profile 2 — tenant context. Empty by default; a tenancy-enabled host sets
+        // this to whatever establishes request-scoped tenant context before Payvia's
+        // repositories run (Payvia never names or hardcodes host-specific aliases here).
+        'tenant_context_middleware' => [],
+
+        // Profile 3 — authorization for the management (write) routes only.
+        'manage_middleware' => ['admin'],
     ],
 ];
 ```
 
-Default:
+Authenticated read/confirm routes compose profile 1 → 2; management (write) routes
+compose 1 → 2 → 3. Each write route still appends its own `rate_limit:N,60` after the
+composed stack. Override `manage_middleware` to swap `admin` for a custom permission
+middleware (e.g. `['permission:billing.manage']`), or `tenant_context_middleware` to
+plug in your tenancy resolution middleware.
 
-```php
-'security' => [
-    'manage_middleware' => ['auth', 'admin'],
-],
-```
+**Tenancy note:** Payvia's repositories resolve the current tenant via a local
+`PayviaTenantResolver` seam — consuming your app's `CurrentTenantResolver` (wrapped
+fail-closed) when bound, or a sentinel when it isn't — so multi-workspace hosts get
+per-tenant business keys (invoice numbers, plan names, payment-intent idempotency
+keys) while single-store installs remain byte-identical.
+
+> **Upgrading from 1.x:** if your app previously overrode
+> `payvia.security.manage_middleware`, split it: move authentication entries (e.g.
+> `auth`) into `auth_middleware` and leave only authorization checks in
+> `manage_middleware`. See `CHANGELOG.md` for the exact before/after.
 
 ### Confirm and record a payment
 
@@ -281,7 +303,7 @@ upserts a row in the `payments` table. The JSON response follows Glueful’s sta
 - `payment_status`
 - `gateway`
 - `reference`
-- `amount`
+- `amount` (integer, minor units of `currency`, e.g. cents)
 - `currency`
 - `message`
 - `verification` (normalized gateway verification payload)
@@ -318,7 +340,7 @@ curl -s -X POST "$API_BASE/payvia/payments/confirm" \
 **Body:**
 
 - `name` (string, required)
-- `amount` (number, required)
+- `amount` (integer, required) — minor units of `currency` (e.g. cents; `9900` = $99.00)
 - `currency` (string, optional, default: `GHS`)
 - `interval` (string, optional, default: `monthly`)
 - `trial_days` (int, optional)
@@ -336,7 +358,7 @@ curl -s -X POST "$API_BASE/payvia/plans" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Pro Monthly",
-    "amount": 99.0,
+    "amount": 9900,
     "currency": "USD",
     "interval": "monthly",
     "trial_days": 14,
@@ -375,7 +397,7 @@ curl -s "$API_BASE/payvia/plans?status=active&interval=monthly" \
 
 **Body:**
 
-- `amount` (number, required)
+- `amount` (integer, required) — minor units of `currency` (e.g. cents; `9900` = $99.00)
 - `currency` (string, optional, default: `GHS`)
 - `user_uuid` (string, optional)
 - `billing_plan_uuid` (string, optional)
@@ -449,7 +471,7 @@ $plans = container()->get(BillingPlanService::class);
 $planUuid = $plans->create([
     'name' => 'Pro Monthly',
     'description' => 'Pro plan billed monthly',
-    'amount' => 99.00,
+    'amount' => 9900, // minor units of `currency` (cents); $99.00 = 9900
     'currency' => 'USD',
     'interval' => 'monthly',
     'trial_days' => 14,
@@ -479,7 +501,7 @@ $invoiceUuid = $invoices->create([
     'billing_plan_uuid' => $planUuid,
     'payable_type' => 'location_subscription',
     'payable_id' => $locationUuid,
-    'amount' => 99.00,
+    'amount' => 9900, // minor units of `currency` (cents); $99.00 = 9900
     'currency' => 'USD',
     'status' => 'pending',
     'metadata' => [

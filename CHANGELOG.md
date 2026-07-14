@@ -16,7 +16,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional marketplace/split-payment capability interfaces.
 - Optional refunds/disputes capability interfaces.
 
-## [1.1.0] - 2026-06-14
+## [2.0.0] - 2026-07-14 — Money & Tenancy Hardening
+
+### Breaking Changes
+
+- **All stored and transported amounts are now integer minor units, not decimal majors.**
+  `payments.amount`, `billing_plans.amount`, and `invoices.amount` are `bigInteger` columns
+  (matching `payment_intents.amount`, which was already integer). Every gateway, service,
+  controller, and normalized event now carries a single integer end-to-end — there is no
+  runtime Money/exponent helper, because Payvia never formats money for display. Amounts in
+  request bodies and JSON responses change shape accordingly:
+
+  ```jsonc
+  // v1 (decimal major units)
+  { "amount": 10.50 }
+
+  // v2 (integer minor units)
+  { "amount": 1050 }
+  ```
+
+  This applies to `POST /payvia/plans`, `/payvia/plans/update`, `POST /payvia/invoices`, and
+  every response/list endpoint that carries an `amount`. `PaymentService::minorUnits()` is
+  deleted; gateway normalization methods (`PaystackGateway`, `StripeGateway`) return
+  `int`/`?int` and no longer float-divide a wire amount by `100.0` — Stripe/Paystack already
+  send integer minor units on the wire, so the pass-through is now lossless. `currency`
+  columns and formats are unchanged (`GHS` default, ISO-4217-shaped string).
+
+- **Schema is finalized pre-deployment — there is no data-migration path from a pre-2.0
+  install.** Because no `glueful/payvia` database existed in production when this hardening
+  was designed, the money and tenancy schema changes were folded directly into the original
+  `001`–`005`/`007` create-table migrations rather than shipped as upgrade migrations with a
+  conversion step. There is no `amount` decimal→integer conversion routine and no
+  auto-migration for existing rows. **If you have a pre-2.0 development database, you must
+  drop and recreate the Payvia tables (or hand-write and run your own conversion) before
+  upgrading** — running `php glueful migrate:run` against an already-migrated pre-2.0 schema
+  will not retroactively reshape existing columns/rows. `007_CreatePaymentIntentsTable`
+  (previously `008`) also absorbed the `billing_plans` `(gateway, name)` unique-scoping
+  rebuild that shipped as a standalone `007` migration in `1.1.0` — that migration file is
+  gone; the composite unique is now part of `002`'s create-table shape directly.
+
+- **Tenant sentinel scoping added to the five domain tables.** `payments`, `billing_plans`,
+  `invoices`, `gateway_subscriptions`, and `payment_intents` each gained a `tenant_uuid
+  char(12)` column, defaulting to `''` so single-store installs remain byte-identical to
+  `1.x`. Business keys that are meaningful only within a tenant became **composite** in the
+  create-table shape (the old global forms no longer exist):
+  - `invoices`: `(tenant_uuid, number)` — invoice numbers may repeat across tenants.
+  - `billing_plans`: `(tenant_uuid, gateway, name)` — plan names may repeat across tenants.
+  - `payment_intents`: `(tenant_uuid, idempotency_key)` — two tenants may open the same
+    logical `{payable_type}:{payable_id}` intent without colliding.
+
+  **Global correlation keys are unchanged** — `uuid` on every table, `payments.reference`,
+  and `gateway_subscriptions (gateway, gateway_subscription_id)` stay globally unique,
+  because provider callbacks and webhooks arrive with no tenant request context and must
+  resolve unambiguously. A new local `PayviaTenantResolver` seam consumes the shared
+  `CurrentTenantResolver` when a host has one (wrapped fail-closed) and falls back to a
+  sentinel resolver otherwise; Payvia never binds or replaces the shared contract itself.
+
+- **Route middleware configuration split into three ordered profiles.**
+  `payvia.security.manage_middleware` used to carry both authentication and authorization for
+  the billing-plan/invoice write routes. It is now three separate, independently
+  configurable keys — `auth_middleware`, `tenant_context_middleware`, and
+  `manage_middleware` — composed in that order (authenticated read/confirm routes use
+  profile 1 → 2; management routes use 1 → 2 → 3). The webhook route uses none of them and
+  stays signature-authenticated/tenantless.
+
+  ```php
+  // v1 config/payvia.php
+  return [
+      'security' => [
+          'manage_middleware' => ['auth', 'admin'],
+      ],
+  ];
+
+  // v2 config/payvia.php
+  return [
+      'security' => [
+          'auth_middleware' => ['auth'],
+          'tenant_context_middleware' => [],
+          'manage_middleware' => ['admin'],
+      ],
+  ];
+  ```
+
+  **If your host overrode `payvia.security.manage_middleware`, you must split it**: move the
+  authentication entries (e.g. `auth`) into `auth_middleware`, leave only authorization checks
+  (e.g. `admin`, a custom permission middleware) in `manage_middleware`, and set
+  `tenant_context_middleware` to whatever establishes request-scoped tenant context in your
+  app (empty array for single-store hosts). The default configuration is byte-identical in
+  behavior to `1.x`'s default (`['auth', 'admin']` on write routes); only a *customized* v1
+  override needs to be reshaped.
+
+### Added
+
+- **`amount_unit: 'minor'` marker on runtime-normalized events.** Every normalized provider
+  event and payment confirmation that carries a numeric `amount` now also carries
+  `amount_unit: 'minor'` — a forward-compatible marker for any future consumer or
+  re-normalizer, making the unit explicit rather than implied. Raw provider payloads
+  (`raw_payload`) are unaffected; they remain opaque historical evidence, never rewritten.
+- **`php glueful payvia:diagnose`** — reports Payvia's contract bindings, tenancy resolver
+  mode, registered tenant tables, per-table sentinel row counts, and any unresolved
+  subscription-ownership failures.
+- **`php glueful payvia:tenancy:adopt --tenant=<uuid>`** — adopts existing sentinel
+  (`tenant_uuid = ''`) rows across all five domain tables into a named tenant, for hosts
+  turning on tenancy after running Payvia single-store.
+
+### Changed
+
+- **Subscription webhook ownership now resolves in a strict, fail-closed order and never
+  fabricates a sentinel projection.** `GatewaySubscriptionService` resolves ownership for an
+  incoming `(gateway, gateway_subscription_id)` event as: (1) an existing projection's
+  persisted `tenant_uuid` is authoritative; (2) for a first-seen subscription, the tenant is
+  derived from the globally unique `billing_plan_uuid` in the normalized event metadata (an
+  explicit metadata `tenant_uuid`, if present, must agree with the plan's owner — metadata
+  alone is never an ownership authority, even under a validly signed webhook); (3) if neither
+  resolves, the event is left failed/retryable and diagnosable rather than written as an
+  ownerless or sentinel-tenant row. Reconciliation uses the same locator and never moves a
+  projection between tenants.
+- **Interactive repositories always resolve and scope by the current tenant; one named
+  internal `ProviderCorrelationRepository` is the sole exception**, used only for the
+  provider-subscription and billing-plan UUID correlation lookups above. When tenancy is
+  active it runs through the tenancy contracts' `TenantContextRunner::runAsSystem()` seam
+  (preserving query interception and observability while suspending row scoping); if a shared
+  tenant resolver is present but no runner is bound, construction fails closed rather than
+  running an unscoped query. A permanent test forbids any other runtime code from bypassing
+  the query builder with raw PDO/SQL against the five tenant-scoped tables.
+
+
 
 ### Changed
 

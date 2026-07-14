@@ -52,7 +52,9 @@ final class PayviaServiceProvider extends ServiceProvider
     private static ?string $cachedVersion = null;
 
     /**
-     * Read the extension version from composer.json (cached)
+     * Read the extension version from composer.json's `extra.glueful.version` field (cached).
+     * That field -- not a top-level `version` key, which Composer discourages and this
+     * manifest doesn't declare -- is the extension installer's source of truth.
      */
     public static function composerVersion(): string
     {
@@ -68,7 +70,7 @@ final class PayviaServiceProvider extends ServiceProvider
                 return self::$cachedVersion = '0.0.0';
             }
 
-            $version = $composer['version'] ?? '0.0.0';
+            $version = $composer['extra']['glueful']['version'] ?? '0.0.0';
             self::$cachedVersion = is_string($version) ? $version : '0.0.0';
         }
 
