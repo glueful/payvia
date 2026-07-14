@@ -94,7 +94,7 @@ final class InvoiceController extends BaseController
                 'metadata' => isset($data['metadata']) && is_array($data['metadata']) ? $data['metadata'] : null,
             ];
 
-            $uuid = $this->invoices->create($payload);
+            $uuid = $this->invoices->create($this->context, $payload);
 
             return $this->created(['uuid' => $uuid], 'Invoice created');
         } catch (\Throwable $e) {
@@ -136,7 +136,7 @@ final class InvoiceController extends BaseController
                 }
             }
 
-            $ok = $this->invoices->markPaid($invoiceUuid, $paidAt);
+            $ok = $this->invoices->markPaid($this->context, $invoiceUuid, $paidAt);
 
             return $ok
                 ? $this->success(['uuid' => $invoiceUuid], 'Invoice marked as paid')
@@ -168,7 +168,7 @@ final class InvoiceController extends BaseController
                 return $this->validationError(['invoice_uuid' => 'invoice_uuid is required']);
             }
 
-            $ok = $this->invoices->markCanceled($invoiceUuid);
+            $ok = $this->invoices->markCanceled($this->context, $invoiceUuid);
 
             return $ok
                 ? $this->success(['uuid' => $invoiceUuid], 'Invoice canceled')
@@ -239,7 +239,7 @@ final class InvoiceController extends BaseController
                 ? min(self::MAX_PER_PAGE, max(1, (int) $query['per_page']))
                 : 20;
 
-            $result = $this->invoices->list($page, $perPage, $filters);
+            $result = $this->invoices->list($this->context, $page, $perPage, $filters);
 
             $data = $result['data'] ?? [];
             $meta = $result;

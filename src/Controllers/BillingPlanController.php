@@ -106,7 +106,7 @@ final class BillingPlanController extends BaseController
                 'status' => $status,
             ];
 
-            $uuid = $this->plans->create($payload);
+            $uuid = $this->plans->create($this->context, $payload);
 
             return $this->created(['uuid' => $uuid], 'Plan created');
         } catch (\Throwable $e) {
@@ -196,7 +196,7 @@ final class BillingPlanController extends BaseController
                 return $this->validationError(['data' => 'No updatable fields provided']);
             }
 
-            $ok = $this->plans->update($planUuid, $update);
+            $ok = $this->plans->update($this->context, $planUuid, $update);
 
             return $ok
                 ? $this->success(['uuid' => $planUuid], 'Plan updated')
@@ -228,7 +228,7 @@ final class BillingPlanController extends BaseController
                 return $this->validationError(['plan_uuid' => 'plan_uuid is required']);
             }
 
-            $ok = $this->plans->disable($planUuid);
+            $ok = $this->plans->disable($this->context, $planUuid);
 
             return $ok
                 ? $this->success(['uuid' => $planUuid], 'Plan disabled')
@@ -264,7 +264,7 @@ final class BillingPlanController extends BaseController
                 $filters['currency'] = $query['currency'];
             }
 
-            $plans = $this->plans->list($filters);
+            $plans = $this->plans->list($this->context, $filters);
 
             return $this->success(['plans' => $plans], 'Plans retrieved');
         } catch (\Throwable $e) {

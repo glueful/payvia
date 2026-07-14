@@ -106,10 +106,10 @@ final class PaymentService
                 : null,
         ];
 
-        $existing = $this->payments->findByReference($reference);
+        $existing = $this->payments->findByReference($this->context, $reference);
         if ($existing === null) {
             try {
-                $this->payments->createPayment($payload);
+                $this->payments->createPayment($this->context, $payload);
             } catch (\Throwable $e) {
                 if (!$this->isUniqueViolation($e)) {
                     throw $e;
@@ -118,10 +118,10 @@ final class PaymentService
                 // Concurrent webhook/client retry inserted the row between our
                 // find and insert (payments.reference is UNIQUE). Apply the same
                 // payload through the update path instead of returning a 500.
-                $this->payments->updateByReference($reference, $payload);
+                $this->payments->updateByReference($this->context, $reference, $payload);
             }
         } else {
-            $this->payments->updateByReference($reference, $payload);
+            $this->payments->updateByReference($this->context, $reference, $payload);
         }
 
         if ($this->webhooks !== null) {

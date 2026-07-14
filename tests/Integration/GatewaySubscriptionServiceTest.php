@@ -4,44 +4,63 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Tests\Integration;
 
+use Glueful\Extensions\Payvia\Database\Migrations\CreateBillingPlansTable;
 use Glueful\Extensions\Payvia\Database\Migrations\CreateGatewaySubscriptionsTable;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
 use Glueful\Extensions\Payvia\GatewayManager;
-use Glueful\Extensions\Payvia\Repositories\GatewaySubscriptionRepository;
+use Glueful\Extensions\Payvia\Repositories\ProviderCorrelationRepository;
 use Glueful\Extensions\Payvia\Services\GatewaySubscriptionService;
 use Glueful\Extensions\Payvia\Tests\Support\FakeWebhookGateway;
 use Glueful\Extensions\Payvia\Tests\Support\PayviaTestCase;
 
 final class GatewaySubscriptionServiceTest extends PayviaTestCase
 {
-    private GatewaySubscriptionRepository $repo;
+    private ProviderCorrelationRepository $repo;
     private FakeWebhookGateway $gateway;
 
     protected function setUp(): void
     {
         parent::setUp();
         $this->runMigration(new CreateGatewaySubscriptionsTable());
-        $this->repo = new GatewaySubscriptionRepository($this->connection);
+        $this->runMigration(new CreateBillingPlansTable());
+        $this->repo = new ProviderCorrelationRepository($this->connection);
         $this->gateway = new FakeWebhookGateway();
         $this->bind(FakeWebhookGateway::class, $this->gateway);
     }
 
+    /**
+     * Task 5's ownership order requires a first (no-existing-row) subscription projection to
+     * correlate through a real billing plan before it may be written at all. Seed the sentinel
+     * (tenant_uuid = '') plan these tests correlate against, so single-store behavior stays
+     * byte-identical to pre-Task-5 while satisfying the new fail-closed contract.
+     */
+    private function seedDefaultPlan(string $uuid = 'planAAAAAAAA', string $tenantUuid = ''): void
+    {
+        $this->connection->table('billing_plans')->insert([
+            'uuid' => $uuid,
+            'tenant_uuid' => $tenantUuid,
+            'name' => 'Default Plan',
+            'amount' => 1000,
+            'currency' => 'GHS',
+        ]);
+    }
+
     public function testRepositoryUpsertsByGatewayId(): void
     {
-        $uuid = $this->repo->upsertByGatewayId([
+        $uuid = $this->repo->upsertGatewaySubscription([
             'gateway' => 'paystack',
             'gateway_subscription_id' => 'SUB_1',
             'status' => 'active',
         ]);
-        $again = $this->repo->upsertByGatewayId([
+        $again = $this->repo->upsertGatewaySubscription([
             'gateway' => 'paystack',
             'gateway_subscription_id' => 'SUB_1',
             'status' => 'past_due',
         ]);
 
         self::assertSame($uuid, $again);
-        self::assertSame('past_due', $this->repo->findByGatewaySubscription('paystack', 'SUB_1')['status']);
+        self::assertSame('past_due', $this->repo->findGatewaySubscriptionByGatewayId('paystack', 'SUB_1')['status']);
     }
 
     public function testUpsertRecoversFromConcurrentInsertRace(): void
@@ -55,7 +74,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         // drive the recovery deterministically by inserting the duplicate row out
         // of band (skipping find), then calling the actual recovery path via the
         // production code's reflection-free public method seam.
-        $first = $this->repo->upsertByGatewayId([
+        $first = $this->repo->upsertGatewaySubscription([
             'gateway' => 'paystack',
             'gateway_subscription_id' => 'SUB_RACE',
             'status' => 'active',
@@ -66,7 +85,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         // path and preserves the uuid. The unique-violation recovery is the same
         // update branch reached after a collision; see the detection unit test
         // and PaymentConfirmUniqueRaceTest for the recovery-after-throw coverage.
-        $second = $this->repo->upsertByGatewayId([
+        $second = $this->repo->upsertGatewaySubscription([
             'gateway' => 'paystack',
             'gateway_subscription_id' => 'SUB_RACE',
             'status' => 'past_due',
@@ -74,7 +93,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         ]);
 
         self::assertSame($first, $second);
-        $row = $this->repo->findByGatewaySubscription('paystack', 'SUB_RACE');
+        $row = $this->repo->findGatewaySubscriptionByGatewayId('paystack', 'SUB_RACE');
         self::assertSame('past_due', $row['status']);
         self::assertSame('CUS_NEW', $row['gateway_customer_id']);
 
@@ -88,6 +107,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
     public function testApplyProviderEventUpsertsSubscriptionProjection(): void
     {
+        $this->seedDefaultPlan();
         $service = $this->service();
         $event = ProviderEvent::create(
             'paystack',
@@ -100,6 +120,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
                 'gateway_subscription_id' => 'SUB_2',
                 'gateway_customer_id' => 'CUS_1',
                 'gateway_price_id' => 'PLN_1',
+                'billing_plan_uuid' => 'planAAAAAAAA',
                 'status' => 'active',
                 'current_period_end' => '2026-07-01 00:00:00',
             ],
@@ -109,15 +130,16 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
         $service->applyProviderEvent($event);
 
-        $row = $this->repo->findByGatewaySubscription('paystack', 'SUB_2');
+        $row = $this->repo->findGatewaySubscriptionByGatewayId('paystack', 'SUB_2');
         self::assertSame('CUS_1', $row['gateway_customer_id']);
         self::assertSame('PLN_1', $row['gateway_price_id']);
         self::assertSame('active', $row['status']);
+        self::assertSame('', $row['tenant_uuid']);
     }
 
     public function testNonSubscriptionEventsDoNotMutateSubscriptionProjection(): void
     {
-        $this->repo->upsertByGatewayId([
+        $this->repo->upsertGatewaySubscription([
             'gateway' => 'stripe',
             'gateway_subscription_id' => 'sub_1',
             'gateway_customer_id' => 'cus_1',
@@ -142,7 +164,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
         $this->service()->applyProviderEvent($event);
 
-        $row = $this->repo->findByGatewaySubscription('stripe', 'sub_1');
+        $row = $this->repo->findGatewaySubscriptionByGatewayId('stripe', 'sub_1');
         self::assertSame('active', $row['status']);
         self::assertSame('price_1', $row['gateway_price_id']);
         self::assertSame('2026-07-01 00:00:00', $row['current_period_end']);
@@ -150,7 +172,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
     public function testPartialSubscriptionUpdatePreservesExistingFieldsAndPersistsCorrelation(): void
     {
-        $this->repo->upsertByGatewayId([
+        $this->repo->upsertGatewaySubscription([
             'gateway' => 'stripe',
             'gateway_subscription_id' => 'sub_2',
             'gateway_customer_id' => 'cus_2',
@@ -179,7 +201,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
         $this->service()->applyProviderEvent($event);
 
-        $row = $this->repo->findByGatewaySubscription('stripe', 'sub_2');
+        $row = $this->repo->findGatewaySubscriptionByGatewayId('stripe', 'sub_2');
         self::assertSame('past_due', $row['status']);
         self::assertSame('price_2', $row['gateway_price_id']);
         self::assertSame('plan12345678', $row['billing_plan_uuid']);
@@ -192,6 +214,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
     public function testProviderStatusIsNormalizedBeforePersistence(): void
     {
+        $this->seedDefaultPlan();
         $event = ProviderEvent::create(
             'paystack',
             EventType::SUBSCRIPTION_UPDATED,
@@ -201,6 +224,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
             new \DateTimeImmutable(),
             [
                 'gateway_subscription_id' => 'SUB_attention',
+                'billing_plan_uuid' => 'planAAAAAAAA',
                 'status' => 'attention',
             ],
             ['raw' => true],
@@ -211,7 +235,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
         self::assertSame(
             'past_due',
-            $this->repo->findByGatewaySubscription('paystack', 'SUB_attention')['status']
+            $this->repo->findGatewaySubscriptionByGatewayId('paystack', 'SUB_attention')['status']
         );
     }
 
@@ -225,6 +249,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
      */
     public function testUnknownAndNonActiveStatusesFailClosed(string $provider, string $expected): void
     {
+        $this->seedDefaultPlan();
         $subId = 'SUB_' . substr(md5($provider), 0, 8);
         $event = ProviderEvent::create(
             'stripe',
@@ -235,6 +260,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
             new \DateTimeImmutable(),
             [
                 'gateway_subscription_id' => $subId,
+                'billing_plan_uuid' => 'planAAAAAAAA',
                 'status' => $provider,
             ],
             ['raw' => true],
@@ -245,7 +271,7 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
         self::assertSame(
             $expected,
-            $this->repo->findByGatewaySubscription('stripe', $subId)['status'],
+            $this->repo->findGatewaySubscriptionByGatewayId('stripe', $subId)['status'],
             sprintf('Provider status "%s" should normalize to "%s"', $provider, $expected)
         );
     }

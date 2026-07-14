@@ -175,17 +175,17 @@ final class RecordingPaymentRepository implements PaymentRepositoryInterface
         return 'payments';
     }
 
-    public function createPayment(array $data): string
+    public function createPayment(ApplicationContext $context, array $data): string
     {
         return 'pay1';
     }
 
-    public function findByReference(string $reference): ?array
+    public function findByReference(ApplicationContext $context, string $reference): ?array
     {
         return null;
     }
 
-    public function updateByReference(string $reference, array $data): bool
+    public function updateByReference(ApplicationContext $context, string $reference, array $data): bool
     {
         return true;
     }

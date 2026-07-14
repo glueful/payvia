@@ -16,13 +16,14 @@ class CreatePaymentIntentsTable implements MigrationInterface
         $schema->createTable('payment_intents', function ($table) {
             $table->bigInteger('id')->primary()->autoIncrement();
             $table->string('uuid', 12);
+            $table->string('tenant_uuid', 12)->default('');
 
             $table->string('payable_type', 100);
             $table->string('payable_id', 255);
 
             // Open rows use "{type}:{id}". Closing re-keys to
             // "{type}:{id}:{reference}", freeing the open key portably on
-            // engines without partial unique indexes.
+            // engines without partial unique indexes. Unique per tenant.
             $table->string('idempotency_key', 512);
 
             $table->string('gateway', 50);
@@ -37,7 +38,8 @@ class CreatePaymentIntentsTable implements MigrationInterface
             $table->timestamp('updated_at')->nullable();
 
             $table->unique('uuid');
-            $table->unique('idempotency_key');
+            $table->unique(['tenant_uuid', 'idempotency_key']);
+            $table->index('tenant_uuid');
             $table->index('reference');
             $table->index(['payable_type', 'payable_id', 'status']);
             $table->index('gateway');

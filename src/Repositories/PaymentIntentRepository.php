@@ -5,13 +5,27 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Repositories;
 
 use Glueful\Bootstrap\ApplicationContext;
+use Glueful\Database\Connection;
 use Glueful\Extensions\Payvia\Repositories\Concerns\DetectsUniqueViolations;
+use Glueful\Extensions\Payvia\Tenancy\PayviaTenantResolver;
+use Glueful\Extensions\Payvia\Tenancy\SentinelTenantResolver;
 use Glueful\Helpers\Utils;
 use Glueful\Repository\BaseRepository;
 
 final class PaymentIntentRepository extends BaseRepository
 {
     use DetectsUniqueViolations;
+
+    private readonly PayviaTenantResolver $resolver;
+
+    public function __construct(
+        ?Connection $connection = null,
+        ?ApplicationContext $context = null,
+        ?PayviaTenantResolver $resolver = null,
+    ) {
+        parent::__construct($connection, $context);
+        $this->resolver = $resolver ?? new SentinelTenantResolver();
+    }
 
     public function getTableName(): string
     {
@@ -20,8 +34,6 @@ final class PaymentIntentRepository extends BaseRepository
 
     public function findOpen(ApplicationContext $context, string $payableType, string $payableId): ?array
     {
-        unset($context);
-
         if ($payableType === '' || $payableId === '') {
             return null;
         }
@@ -29,6 +41,7 @@ final class PaymentIntentRepository extends BaseRepository
         $rows = $this->db->table($this->getTableName())
             ->select(['*'])
             ->where([
+                'tenant_uuid' => $this->resolver->tenantUuid($context),
                 'payable_type' => $payableType,
                 'payable_id' => $payableId,
                 'status' => 'open',
@@ -43,8 +56,6 @@ final class PaymentIntentRepository extends BaseRepository
     /** @param array<string,mixed> $row */
     public function createOpen(ApplicationContext $context, array $row): bool
     {
-        unset($context);
-
         $payableType = (string) ($row['payable_type'] ?? '');
         $payableId = (string) ($row['payable_id'] ?? '');
         if ($payableType === '' || $payableId === '') {
@@ -53,6 +64,7 @@ final class PaymentIntentRepository extends BaseRepository
 
         $payload = array_merge($row, [
             'uuid' => (string) ($row['uuid'] ?? Utils::generateNanoID()),
+            'tenant_uuid' => $this->resolver->tenantUuid($context),
             'idempotency_key' => $this->openKey($payableType, $payableId),
             'status' => 'open',
             'payload' => $this->encodePayload($row['payload'] ?? null),
@@ -73,25 +85,27 @@ final class PaymentIntentRepository extends BaseRepository
 
     public function close(ApplicationContext $context, string $uuid, string $reference): void
     {
-        unset($context);
-
         if ($uuid === '') {
             return;
         }
 
+        $tenant = $this->resolver->tenantUuid($context);
+
         $rows = $this->db->table($this->getTableName())
             ->select(['*'])
-            ->where(['uuid' => $uuid])
+            ->where(['uuid' => $uuid, 'tenant_uuid' => $tenant])
             ->limit(1)
             ->get();
         $row = $rows[0] ?? null;
         if (!is_array($row)) {
+            // Non-revealing: either the intent does not exist, or it belongs to another
+            // tenant -- close() must not be able to reach a row it does not own.
             return;
         }
 
         $closeReference = $reference !== '' ? $reference : (string) ($row['reference'] ?? '');
         $this->db->table($this->getTableName())
-            ->where(['uuid' => $uuid])
+            ->where(['uuid' => $uuid, 'tenant_uuid' => $tenant])
             ->update([
                 'status' => 'closed',
                 'idempotency_key' => $this->closedKey(

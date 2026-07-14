@@ -6,6 +6,7 @@ namespace Glueful\Extensions\Payvia\Tests\Integration;
 
 use Glueful\Auth\AuthenticationManager;
 use Glueful\Auth\UserIdentity;
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
@@ -44,20 +45,20 @@ final class PaymentConfirmUserBindingTest extends PayviaTestCase
             }
 
             /** @param array<string,mixed> $data */
-            public function createPayment(array $data): string
+            public function createPayment(ApplicationContext $context, array $data): string
             {
                 $this->written[] = $data;
                 return 'pay_1';
             }
 
             /** @return array<string,mixed>|null */
-            public function findByReference(string $reference): ?array
+            public function findByReference(ApplicationContext $context, string $reference): ?array
             {
                 return null;
             }
 
             /** @param array<string,mixed> $data */
-            public function updateByReference(string $reference, array $data): bool
+            public function updateByReference(ApplicationContext $context, string $reference, array $data): bool
             {
                 $this->written[] = $data;
                 return true;

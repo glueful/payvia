@@ -5,20 +5,35 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Services;
 
 use Glueful\Bootstrap\ApplicationContext;
-use Glueful\Extensions\Payvia\Contracts\GatewaySubscriptionRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\GatewayManager;
+use Glueful\Extensions\Payvia\Repositories\ProviderCorrelationRepository;
 
 final class GatewaySubscriptionService
 {
     public function __construct(
         private ApplicationContext $context,
-        private GatewaySubscriptionRepositoryInterface $subscriptions,
+        private ProviderCorrelationRepository $subscriptions,
         private GatewayManager $gateways,
     ) {
     }
 
+    /**
+     * Resolve subscription ownership before persisting, in the binding order the spec
+     * requires under the global (gateway, gateway_subscription_id) identity:
+     *
+     * 1. Existing projection: its persisted `tenant_uuid` is authoritative. The update is
+     *    always owner-qualified (see `ProviderCorrelationRepository::upsertGatewaySubscription`),
+     *    so a conflicting metadata tenant hint can never move it -- it is diagnosed and ignored.
+     * 2. First projection: the tenant is derived from the globally unique `billing_plan_uuid`
+     *    carried in normalized provider metadata, re-read via the correlation surface. An
+     *    explicit metadata `tenant_uuid` hint must equal that plan's owner or the event is
+     *    rejected.
+     * 3. No existing projection and no valid local plan correlation: fail closed. No sentinel
+     *    row is ever written; `UnresolvedSubscriptionOwnershipException` propagates so
+     *    `WebhookService` records the provider event failed/retryable.
+     */
     public function applyProviderEvent(PaymentProviderEventInterface $event): void
     {
         if (!$this->isSubscriptionEvent($event->type())) {
@@ -31,12 +46,46 @@ final class GatewaySubscriptionService
             return;
         }
 
-        $this->subscriptions->upsertByGatewayId($this->rowFromNormalized(
-            $event->gateway(),
-            (string) $gatewaySubscriptionId,
-            $normalized,
-            $event->raw()
-        ));
+        $gateway = $event->gateway();
+        $gatewaySubscriptionId = (string) $gatewaySubscriptionId;
+        $hint = $this->metadataTenantHint($normalized);
+        $row = $this->rowFromNormalized($gateway, $gatewaySubscriptionId, $normalized, $event->raw());
+
+        $existing = $this->subscriptions->findGatewaySubscriptionByGatewayId($gateway, $gatewaySubscriptionId);
+        if ($existing !== null) {
+            $owner = (string) ($existing['tenant_uuid'] ?? '');
+            if ($hint !== null && $hint !== $owner) {
+                $this->diagnoseOwnershipHintMismatch($gateway, $gatewaySubscriptionId, $owner, $hint);
+            }
+
+            // Owner-qualified update: any tenant_uuid this payload carries is discarded by the
+            // repository, so ownership cannot move here regardless of the hint above.
+            $this->subscriptions->upsertGatewaySubscription($row);
+            return;
+        }
+
+        $planUuid = $this->stringOrNull($normalized['billing_plan_uuid'] ?? null);
+        $plan = $planUuid !== null ? $this->subscriptions->findBillingPlanByUuid($planUuid) : null;
+        if ($plan === null) {
+            throw UnresolvedSubscriptionOwnershipException::noPlanCorrelation(
+                $gateway,
+                $gatewaySubscriptionId,
+                $planUuid
+            );
+        }
+
+        $owner = (string) ($plan['tenant_uuid'] ?? '');
+        if ($hint !== null && $hint !== $owner) {
+            throw UnresolvedSubscriptionOwnershipException::metadataTenantMismatch(
+                $gateway,
+                $gatewaySubscriptionId,
+                $hint,
+                $owner
+            );
+        }
+
+        $row['tenant_uuid'] = $owner;
+        $this->subscriptions->upsertGatewaySubscription($row);
     }
 
     /** @return array<string,mixed>|null */
@@ -45,14 +94,14 @@ final class GatewaySubscriptionService
         $driver = $this->gateways->subscriptionGateway($gateway);
         $raw = $driver->fetchSubscription($gatewaySubscriptionId);
         $normalized = $this->normalizeProviderSubscription($gateway, $raw);
-        $uuid = $this->subscriptions->upsertByGatewayId($this->rowFromNormalized(
+        $uuid = $this->subscriptions->upsertGatewaySubscription($this->rowFromNormalized(
             $gateway,
             $gatewaySubscriptionId,
             $normalized,
             $raw
         ));
 
-        return $this->subscriptions->findByGatewaySubscription($gateway, $gatewaySubscriptionId)
+        return $this->subscriptions->findGatewaySubscriptionByGatewayId($gateway, $gatewaySubscriptionId)
             ?? ['uuid' => $uuid];
     }
 
@@ -232,5 +281,55 @@ final class GatewaySubscriptionService
     private function stringOrNull(mixed $value): ?string
     {
         return is_scalar($value) && (string) $value !== '' ? (string) $value : null;
+    }
+
+    /**
+     * A metadata `tenant_uuid` hint is never an ownership authority by itself -- it is only
+     * ever compared against an already-resolved owner (the existing projection's own tenant,
+     * or the correlated billing plan's owner) and rejected on disagreement.
+     *
+     * @param array<string,mixed> $normalized
+     */
+    private function metadataTenantHint(array $normalized): ?string
+    {
+        $metadata = $normalized['metadata'] ?? null;
+        if (!is_array($metadata)) {
+            return null;
+        }
+
+        return $this->stringOrNull($metadata['tenant_uuid'] ?? null);
+    }
+
+    /**
+     * Rule 1 never obeys a conflicting ownership hint, but the attempt is still worth
+     * surfacing to operators -- log it (best-effort PSR-3, falling back to error_log the same
+     * way Payvia's controllers already do) rather than silently dropping it.
+     */
+    private function diagnoseOwnershipHintMismatch(
+        string $gateway,
+        string $gatewaySubscriptionId,
+        string $owner,
+        string $hint,
+    ): void {
+        $message = sprintf(
+            '[Payvia] subscription ownership hint mismatch ignored: %s subscription %s is owned by '
+                . 'tenant "%s" but the provider metadata carried a conflicting tenant_uuid hint "%s"; the '
+                . 'existing owner is authoritative and the hint was never obeyed.',
+            $gateway,
+            $gatewaySubscriptionId,
+            $owner,
+            $hint
+        );
+
+        try {
+            app($this->context, \Psr\Log\LoggerInterface::class)->warning($message, [
+                'gateway' => $gateway,
+                'gateway_subscription_id' => $gatewaySubscriptionId,
+                'owner_tenant_uuid' => $owner,
+                'hint_tenant_uuid' => $hint,
+            ]);
+        } catch (\Throwable) {
+            error_log($message);
+        }
     }
 }

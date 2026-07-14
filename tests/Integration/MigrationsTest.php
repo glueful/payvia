@@ -30,7 +30,7 @@ final class MigrationsTest extends PayviaTestCase
         (new CreateBillingPlansTable())->up($schema);
 
         $repo = new BillingPlanRepository($this->connection);
-        $repo->create([
+        $repo->createPlan($this->context, [
             'name' => 'Pro',
             'amount' => 5000,
             'currency' => 'GHS',
@@ -40,7 +40,7 @@ final class MigrationsTest extends PayviaTestCase
             'status' => 'active',
         ]);
 
-        $rows = $repo->list([]);
+        $rows = $repo->list($this->context, []);
 
         self::assertSame('paystack', $rows[0]['gateway']);
         self::assertSame('PLN_x', $rows[0]['gateway_price_id']);

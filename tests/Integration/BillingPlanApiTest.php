@@ -53,7 +53,7 @@ final class BillingPlanApiTest extends PayviaTestCase
 
         $this->controller->create($request);
 
-        $rows = $this->repo->list([]);
+        $rows = $this->repo->list($this->context, []);
         self::assertSame('paystack', $rows[0]['gateway']);
         self::assertSame('PROD_1', $rows[0]['gateway_product_id']);
         self::assertSame('PLN_x', $rows[0]['gateway_price_id']);
@@ -61,7 +61,7 @@ final class BillingPlanApiTest extends PayviaTestCase
 
     public function testUpdateChangesGatewayLinkageFields(): void
     {
-        $uuid = $this->repo->create([
+        $uuid = $this->repo->createPlan($this->context, [
             'name' => 'Basic',
             'amount' => 1000,
             'currency' => 'GHS',
@@ -77,7 +77,7 @@ final class BillingPlanApiTest extends PayviaTestCase
 
         $this->controller->update($request);
 
-        $rows = $this->repo->list([]);
+        $rows = $this->repo->list($this->context, []);
         self::assertSame('paystack', $rows[0]['gateway']);
         self::assertSame('PLN_y', $rows[0]['gateway_price_id']);
     }
@@ -91,7 +91,7 @@ final class BillingPlanApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame([], $this->repo->list([]));
+        self::assertSame([], $this->repo->list($this->context, []));
     }
 
     public function testCreateRejectsInvalidInterval(): void
@@ -103,7 +103,7 @@ final class BillingPlanApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame([], $this->repo->list([]));
+        self::assertSame([], $this->repo->list($this->context, []));
     }
 
     public function testCreateRejectsInvalidCurrency(): void
@@ -115,7 +115,7 @@ final class BillingPlanApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame([], $this->repo->list([]));
+        self::assertSame([], $this->repo->list($this->context, []));
     }
 
     public function testCreateRejectsZeroAmount(): void
@@ -126,7 +126,7 @@ final class BillingPlanApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame([], $this->repo->list([]));
+        self::assertSame([], $this->repo->list($this->context, []));
     }
 
     public function testCreateRejectsNegativeAmount(): void
@@ -137,7 +137,7 @@ final class BillingPlanApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame([], $this->repo->list([]));
+        self::assertSame([], $this->repo->list($this->context, []));
     }
 
     public function testCreateUppercasesLowercaseCurrency(): void
@@ -148,13 +148,13 @@ final class BillingPlanApiTest extends PayviaTestCase
             'currency' => 'usd',
         ]));
 
-        $rows = $this->repo->list([]);
+        $rows = $this->repo->list($this->context, []);
         self::assertSame('USD', $rows[0]['currency']);
     }
 
     public function testUpdateRejectsInvalidStatus(): void
     {
-        $uuid = $this->repo->create([
+        $uuid = $this->repo->createPlan($this->context, [
             'name' => 'Basic',
             'amount' => 1000,
             'currency' => 'GHS',
@@ -168,12 +168,12 @@ final class BillingPlanApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame('active', $this->repo->list([])[0]['status']);
+        self::assertSame('active', $this->repo->list($this->context, [])[0]['status']);
     }
 
     public function testUpdateRejectsZeroAmount(): void
     {
-        $uuid = $this->repo->create([
+        $uuid = $this->repo->createPlan($this->context, [
             'name' => 'Basic',
             'amount' => 1000,
             'currency' => 'GHS',
@@ -187,7 +187,7 @@ final class BillingPlanApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame(1000, (int) $this->repo->list([])[0]['amount']);
+        self::assertSame(1000, (int) $this->repo->list($this->context, [])[0]['amount']);
     }
 
     public function testCreateAcceptsValidValues(): void
@@ -201,6 +201,6 @@ final class BillingPlanApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(201, $response->getStatusCode());
-        self::assertCount(1, $this->repo->list([]));
+        self::assertCount(1, $this->repo->list($this->context, []));
     }
 }

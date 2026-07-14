@@ -20,6 +20,7 @@ class CreateInvoicesTable implements MigrationInterface
         $schema->createTable('invoices', function ($table) {
             $table->bigInteger('id')->primary()->autoIncrement();
             $table->string('uuid', 12);
+            $table->string('tenant_uuid', 12)->default('');
 
             $table->string('user_uuid', 12)->nullable();
 
@@ -30,7 +31,7 @@ class CreateInvoicesTable implements MigrationInterface
             $table->string('payable_type', 100)->nullable();
             $table->string('payable_id', 255)->nullable();
 
-            // Human-readable invoice number (unique)
+            // Human-readable invoice number (unique per tenant)
             $table->string('number', 50);
 
             // Financials
@@ -48,7 +49,8 @@ class CreateInvoicesTable implements MigrationInterface
             $table->timestamp('updated_at')->nullable();
 
             $table->unique('uuid');
-            $table->unique('number');
+            $table->unique(['tenant_uuid', 'number']);
+            $table->index('tenant_uuid');
             $table->index('user_uuid');
             $table->index(['payable_type', 'payable_id']);
             $table->index('billing_plan_uuid');

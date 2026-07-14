@@ -35,12 +35,30 @@ return [
     ],
 
     'security' => [
-        // Middleware applied to billing-plan and invoice write routes
-        // (create/update/disable plans, create/mark-paid/cancel invoices).
-        // Defaults to admin-only. Hosts can override this list (e.g. swap
-        // 'admin' for a custom permission middleware) without forking the
-        // extension. Each route still appends its own rate_limit:N,60.
-        'manage_middleware' => ['auth', 'admin'],
+        // Three ordered middleware profiles composed onto every /payvia/* route (except
+        // the webhook route, which uses none of them and stays signature-authenticated/
+        // tenantless). Payvia never names host-specific middleware aliases in these
+        // defaults -- a tenancy-enabled host configures profile 2 itself (e.g.
+        // `tenant_profile:admin`, `tenant_bootstrap`, `admin_tenant_binding`).
+        //
+        // Composition:
+        //   - authenticated read/confirm routes: profile 1 -> 2
+        //   - management routes (billing-plan/invoice writes): profile 1 -> 2 -> 3
+        // Each write route still appends its own rate_limit:N,60 after the composed stack.
+        //
+        // 2.0 config break: v1's `manage_middleware` default was `['auth', 'admin']` -- the
+        // `auth` entry moved to `auth_middleware`. A host that overrode `manage_middleware`
+        // must move its authentication entries into `auth_middleware` and leave only
+        // authorization checks here.
+        'auth_middleware' => ['auth'],
+
+        // Empty by default so single-store installs remain byte-identical to v1. A
+        // tenancy-enabled host sets this to whatever establishes request-scoped tenant
+        // context before Payvia's repositories run.
+        'tenant_context_middleware' => [],
+
+        // Authorization-only now (auth moved to profile 1 above). Defaults to admin-only.
+        'manage_middleware' => ['admin'],
     ],
 
     'webhooks' => [

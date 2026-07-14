@@ -4,18 +4,33 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Repositories;
 
+use Glueful\Bootstrap\ApplicationContext;
+use Glueful\Database\Connection;
 use Glueful\Extensions\Payvia\Contracts\InvoiceRepositoryInterface;
-use Glueful\Repository\BaseRepository;
+use Glueful\Extensions\Payvia\Tenancy\PayviaTenantResolver;
+use Glueful\Extensions\Payvia\Tenancy\SentinelTenantResolver;
 use Glueful\Helpers\Utils;
+use Glueful\Repository\BaseRepository;
 
 final class InvoiceRepository extends BaseRepository implements InvoiceRepositoryInterface
 {
+    private readonly PayviaTenantResolver $resolver;
+
+    public function __construct(
+        ?Connection $connection = null,
+        ?ApplicationContext $context = null,
+        ?PayviaTenantResolver $resolver = null,
+    ) {
+        parent::__construct($connection, $context);
+        $this->resolver = $resolver ?? new SentinelTenantResolver();
+    }
+
     public function getTableName(): string
     {
         return 'invoices';
     }
 
-    public function create(array $data): string
+    public function createInvoice(ApplicationContext $context, array $data): string
     {
         $uuid = Utils::generateNanoID();
         $now = $this->db->getDriver()->formatDateTime();
@@ -23,13 +38,14 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
         $number = $data['number'] ?? null;
         if (!is_string($number) || $number === '') {
             // Timestamp prefix for readability + the full NanoID for entropy.
-            // Using only the last 4 chars of the 12-char uuid risked UNIQUE(number)
+            // Using only the last 4 chars of the 12-char uuid risked UNIQUE(tenant_uuid, number)
             // collisions; the full id keeps the generated number unique.
             $number = 'INV-' . date('Ymd-His') . '-' . strtoupper($uuid);
         }
 
         $payload = array_merge($data, [
             'uuid' => $uuid,
+            'tenant_uuid' => $this->resolver->tenantUuid($context),
             'number' => $number,
             'created_at' => $now,
         ]);
@@ -39,10 +55,13 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
         return $uuid;
     }
 
-    public function markPaid(string $invoiceUuid, ?\DateTimeImmutable $paidAt = null): bool
-    {
+    public function markPaid(
+        ApplicationContext $context,
+        string $invoiceUuid,
+        ?\DateTimeImmutable $paidAt = null
+    ): bool {
         $affected = $this->db->table($this->getTableName())
-            ->where(['uuid' => $invoiceUuid])
+            ->where(['uuid' => $invoiceUuid, 'tenant_uuid' => $this->resolver->tenantUuid($context)])
             ->update([
                 'status' => 'paid',
                 'paid_at' => ($paidAt?->format('Y-m-d H:i:s')) ?? $this->db->getDriver()->formatDateTime(),
@@ -52,10 +71,10 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
         return (int) $affected > 0;
     }
 
-    public function markCanceled(string $invoiceUuid): bool
+    public function markCanceled(ApplicationContext $context, string $invoiceUuid): bool
     {
         $affected = $this->db->table($this->getTableName())
-            ->where(['uuid' => $invoiceUuid])
+            ->where(['uuid' => $invoiceUuid, 'tenant_uuid' => $this->resolver->tenantUuid($context)])
             ->update([
                 'status' => 'canceled',
                 'updated_at' => $this->db->getDriver()->formatDateTime(),
@@ -64,7 +83,7 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
         return (int) $affected > 0;
     }
 
-    public function list(array $filters = []): array
+    public function list(ApplicationContext $context, array $filters = []): array
     {
         $qb = $this->db->table($this->getTableName())
             ->select([
@@ -83,6 +102,7 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
                 'created_at',
                 'updated_at',
             ])
+            ->where('tenant_uuid', '=', $this->resolver->tenantUuid($context))
             ->orderBy(['created_at' => 'DESC']);
 
         if (isset($filters['status']) && is_string($filters['status']) && $filters['status'] !== '') {
@@ -120,8 +140,12 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
         return $qb->get();
     }
 
-    public function paginateWithFilters(int $page, int $perPage, array $filters = []): array
-    {
+    public function paginateWithFilters(
+        ApplicationContext $context,
+        int $page,
+        int $perPage,
+        array $filters = []
+    ): array {
         $qb = $this->db->table($this->getTableName())
             ->select([
                 'uuid',
@@ -139,6 +163,7 @@ final class InvoiceRepository extends BaseRepository implements InvoiceRepositor
                 'created_at',
                 'updated_at',
             ])
+            ->where('tenant_uuid', '=', $this->resolver->tenantUuid($context))
             ->orderBy(['created_at' => 'DESC']);
 
         if (isset($filters['status']) && is_string($filters['status']) && $filters['status'] !== '') {
