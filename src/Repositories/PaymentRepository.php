@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia\Repositories;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Database\Connection;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
+use Glueful\Extensions\Payvia\Repositories\Concerns\NormalizesAmountColumn;
 use Glueful\Extensions\Payvia\Tenancy\PayviaTenantResolver;
 use Glueful\Extensions\Payvia\Tenancy\SentinelTenantResolver;
 use Glueful\Helpers\Utils;
@@ -14,6 +15,8 @@ use Glueful\Repository\BaseRepository;
 
 final class PaymentRepository extends BaseRepository implements PaymentRepositoryInterface
 {
+    use NormalizesAmountColumn;
+
     private readonly PayviaTenantResolver $resolver;
 
     public function __construct(
@@ -56,7 +59,9 @@ final class PaymentRepository extends BaseRepository implements PaymentRepositor
             ->limit(1)
             ->get();
 
-        return $rows[0] ?? null;
+        $row = $rows[0] ?? null;
+
+        return is_array($row) ? $this->normalizeAmountColumn($row) : null;
     }
 
     public function updateByReference(ApplicationContext $context, string $reference, array $data): bool

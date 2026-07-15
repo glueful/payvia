@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia\Repositories;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Database\Connection;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
+use Glueful\Extensions\Payvia\Repositories\Concerns\NormalizesAmountColumn;
 use Glueful\Extensions\Payvia\Tenancy\PayviaTenantResolver;
 use Glueful\Extensions\Payvia\Tenancy\SentinelTenantResolver;
 use Glueful\Helpers\Utils;
@@ -14,6 +15,8 @@ use Glueful\Repository\BaseRepository;
 
 final class BillingPlanRepository extends BaseRepository implements BillingPlanRepositoryInterface
 {
+    use NormalizesAmountColumn;
+
     private readonly PayviaTenantResolver $resolver;
 
     public function __construct(
@@ -101,6 +104,6 @@ final class BillingPlanRepository extends BaseRepository implements BillingPlanR
             $qb = $qb->where('currency', '=', $filters['currency']);
         }
 
-        return $qb->get();
+        return $this->normalizeAmountColumns($qb->get());
     }
 }

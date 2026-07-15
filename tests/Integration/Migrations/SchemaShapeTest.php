@@ -277,6 +277,92 @@ final class SchemaShapeTest extends PayviaTestCase
         ]);
     }
 
+    public function testPaymentsUuidStaysGloballyUniqueAcrossTenants(): void
+    {
+        $this->insertRow('payments', [
+            'uuid' => 'sameuuid1234',
+            'tenant_uuid' => 'tenantAAAA01',
+            'gateway' => 'paystack',
+            'reference' => 'ref-A',
+            'amount' => 1000,
+        ]);
+
+        $this->expectException(\PDOException::class);
+        $this->insertRow('payments', [
+            'uuid' => 'sameuuid1234',
+            'tenant_uuid' => 'tenantBBBB02',
+            'gateway' => 'paystack',
+            'reference' => 'ref-B',
+            'amount' => 1000,
+        ]);
+    }
+
+    public function testBillingPlansUuidStaysGloballyUniqueAcrossTenants(): void
+    {
+        $this->insertRow('billing_plans', [
+            'uuid' => 'sameuuid1234',
+            'tenant_uuid' => 'tenantAAAA01',
+            'name' => 'Pro',
+            'amount' => 1000,
+        ]);
+
+        $this->expectException(\PDOException::class);
+        $this->insertRow('billing_plans', [
+            'uuid' => 'sameuuid1234',
+            'tenant_uuid' => 'tenantBBBB02',
+            'name' => 'Elite',
+            'amount' => 1000,
+        ]);
+    }
+
+    public function testGatewaySubscriptionsUuidStaysGloballyUniqueAcrossTenants(): void
+    {
+        $this->insertRow('gateway_subscriptions', [
+            'uuid' => 'sameuuid1234',
+            'tenant_uuid' => 'tenantAAAA01',
+            'gateway' => 'stripe',
+            'gateway_subscription_id' => 'sub_a',
+            'status' => 'active',
+        ]);
+
+        $this->expectException(\PDOException::class);
+        $this->insertRow('gateway_subscriptions', [
+            'uuid' => 'sameuuid1234',
+            'tenant_uuid' => 'tenantBBBB02',
+            'gateway' => 'stripe',
+            'gateway_subscription_id' => 'sub_b',
+            'status' => 'active',
+        ]);
+    }
+
+    public function testPaymentIntentsUuidStaysGloballyUniqueAcrossTenants(): void
+    {
+        $this->insertRow('payment_intents', [
+            'uuid' => 'sameuuid1234',
+            'tenant_uuid' => 'tenantAAAA01',
+            'payable_type' => 'invoice',
+            'payable_id' => '1',
+            'idempotency_key' => 'invoice:1',
+            'gateway' => 'stripe',
+            'reference' => 'ref-A',
+            'amount' => 1000,
+            'currency' => 'GHS',
+        ]);
+
+        $this->expectException(\PDOException::class);
+        $this->insertRow('payment_intents', [
+            'uuid' => 'sameuuid1234',
+            'tenant_uuid' => 'tenantBBBB02',
+            'payable_type' => 'invoice',
+            'payable_id' => '2',
+            'idempotency_key' => 'invoice:2',
+            'gateway' => 'stripe',
+            'reference' => 'ref-B',
+            'amount' => 1000,
+            'currency' => 'GHS',
+        ]);
+    }
+
     // -- fixtures / helpers --
 
     /**

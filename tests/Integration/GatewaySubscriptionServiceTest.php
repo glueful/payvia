@@ -301,6 +301,15 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
     public function testReconcileWithMissingProviderStatusDoesNotFabricateActive(): void
     {
+        // reconcile() only ever refreshes an existing projection (never creates one), so
+        // seed one first -- see testReconcileUnknownIdReturnsNullAndCreatesNoProjection for
+        // the no-existing-projection contract.
+        $this->repo->upsertGatewaySubscription([
+            'gateway' => 'fake',
+            'gateway_subscription_id' => 'SUB_NOSTATUS',
+            'status' => 'active',
+        ]);
+
         // Provider response omits 'status' entirely; reconcile must not invent
         // 'active'. The absent status fails closed to 'unknown'.
         $this->gateway->fetchResult = [
@@ -318,6 +327,12 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
     public function testReconcileWithUnpaidProviderStatusFailsClosed(): void
     {
+        $this->repo->upsertGatewaySubscription([
+            'gateway' => 'fake',
+            'gateway_subscription_id' => 'SUB_UNPAID',
+            'status' => 'active',
+        ]);
+
         $this->gateway->fetchResult = [
             'subscription_code' => 'SUB_UNPAID',
             'customer' => ['customer_code' => 'CUS_UP'],
@@ -330,8 +345,14 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         self::assertSame('past_due', $row['status']);
     }
 
-    public function testReconcileFetchesProviderAndPersistsProjection(): void
+    public function testReconcileFetchesProviderAndUpdatesExistingProjection(): void
     {
+        $this->repo->upsertGatewaySubscription([
+            'gateway' => 'fake',
+            'gateway_subscription_id' => 'SUB_3',
+            'status' => 'past_due',
+        ]);
+
         $this->gateway->fetchResult = [
             'subscription_code' => 'SUB_3',
             'customer' => ['customer_code' => 'CUS_3'],
@@ -347,8 +368,31 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         self::assertSame('PLN_3', $row['gateway_price_id']);
     }
 
+    public function testReconcileUnknownIdReturnsNullAndCreatesNoProjection(): void
+    {
+        // No projection has ever been persisted for ('fake', 'SUB_UNKNOWN'). reconcile()
+        // must not adopt/create one -- it only ever refreshes an existing owner. Also
+        // asserts the driver is never called: there is nothing to reconcile against.
+        $this->gateway->fetchResult = [
+            'subscription_code' => 'SUB_UNKNOWN',
+            'customer' => ['customer_code' => 'CUS_SHOULD_NOT_PERSIST'],
+            'status' => 'active',
+        ];
+
+        $row = $this->service()->reconcile('fake', 'SUB_UNKNOWN');
+
+        self::assertNull($row);
+        self::assertNull($this->repo->findGatewaySubscriptionByGatewayId('fake', 'SUB_UNKNOWN'));
+    }
+
     public function testReconcileNormalizesStripeShapedSubscription(): void
     {
+        $this->repo->upsertGatewaySubscription([
+            'gateway' => 'stripe',
+            'gateway_subscription_id' => 'sub_x',
+            'status' => 'active',
+        ]);
+
         // Stripe returns the raw subscription object (no 'data' wrapper) with
         // unix-timestamp period fields, a scalar customer id, and the price under
         // items.data[0].price.id. The previous Paystack-shaped normalizer lost the
@@ -386,6 +430,12 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
 
     public function testReconcileNormalizesCanceledStripeSubscriptionTimestamp(): void
     {
+        $this->repo->upsertGatewaySubscription([
+            'gateway' => 'stripe',
+            'gateway_subscription_id' => 'sub_canceled',
+            'status' => 'active',
+        ]);
+
         // A canceled Stripe subscription carries canceled_at as a unix integer.
         // The previous code passed the epoch straight into the DATETIME column;
         // assert it is now a proper datetime string.

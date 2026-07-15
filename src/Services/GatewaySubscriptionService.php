@@ -88,21 +88,39 @@ final class GatewaySubscriptionService
         $this->subscriptions->upsertGatewaySubscription($row);
     }
 
-    /** @return array<string,mixed>|null */
+    /**
+     * Reconcile a subscription against the provider by the global (gateway,
+     * gateway_subscription_id) locator and return the existing owner's refreshed row.
+     *
+     * Reconciliation uses the same global locator as webhook ownership resolution and
+     * returns the existing owner; it never adopts or moves a projection. An id with no
+     * persisted projection has no owner to reconcile against, so this must not create one --
+     * unlike `applyProviderEvent()`, there is no correlated billing plan here to derive a
+     * tenant from, so inserting would always land a sentinel (`tenant_uuid` = '') row. The
+     * existence check runs before the provider fetch so an unknown id never calls out to the
+     * gateway at all.
+     *
+     * @return array<string,mixed>|null The existing projection's refreshed row, or null when
+     *                                   no projection exists for this id.
+     */
     public function reconcile(string $gateway, string $gatewaySubscriptionId): ?array
     {
+        $existing = $this->subscriptions->findGatewaySubscriptionByGatewayId($gateway, $gatewaySubscriptionId);
+        if ($existing === null) {
+            return null;
+        }
+
         $driver = $this->gateways->subscriptionGateway($gateway);
         $raw = $driver->fetchSubscription($gatewaySubscriptionId);
         $normalized = $this->normalizeProviderSubscription($gateway, $raw);
-        $uuid = $this->subscriptions->upsertGatewaySubscription($this->rowFromNormalized(
+        $this->subscriptions->upsertGatewaySubscription($this->rowFromNormalized(
             $gateway,
             $gatewaySubscriptionId,
             $normalized,
             $raw
         ));
 
-        return $this->subscriptions->findGatewaySubscriptionByGatewayId($gateway, $gatewaySubscriptionId)
-            ?? ['uuid' => $uuid];
+        return $this->subscriptions->findGatewaySubscriptionByGatewayId($gateway, $gatewaySubscriptionId);
     }
 
     /**

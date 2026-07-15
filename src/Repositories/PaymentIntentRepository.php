@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia\Repositories;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Database\Connection;
 use Glueful\Extensions\Payvia\Repositories\Concerns\DetectsUniqueViolations;
+use Glueful\Extensions\Payvia\Repositories\Concerns\NormalizesAmountColumn;
 use Glueful\Extensions\Payvia\Tenancy\PayviaTenantResolver;
 use Glueful\Extensions\Payvia\Tenancy\SentinelTenantResolver;
 use Glueful\Helpers\Utils;
@@ -15,6 +16,7 @@ use Glueful\Repository\BaseRepository;
 final class PaymentIntentRepository extends BaseRepository
 {
     use DetectsUniqueViolations;
+    use NormalizesAmountColumn;
 
     private readonly PayviaTenantResolver $resolver;
 
@@ -145,6 +147,6 @@ final class PaymentIntentRepository extends BaseRepository
             $row['payload'] = is_array($decoded) ? $decoded : null;
         }
 
-        return $row;
+        return $this->normalizeAmountColumn($row);
     }
 }
