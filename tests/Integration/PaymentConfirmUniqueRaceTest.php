@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Tests\Integration;
 
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\GatewayManager;
@@ -30,7 +31,7 @@ final class PaymentConfirmUniqueRaceTest extends PayviaTestCase
                     'status' => 'success',
                     'id' => 'gw_tx_1',
                     'message' => 'ok',
-                    'amount' => 100.0,
+                    'amount' => 10000,
                     'currency' => 'GHS',
                 ];
             }
@@ -62,19 +63,19 @@ final class PaymentConfirmUniqueRaceTest extends PayviaTestCase
             }
 
             /** @param array<string,mixed> $data */
-            public function createPayment(array $data): string
+            public function createPayment(ApplicationContext $context, array $data): string
             {
                 throw new \RuntimeException('SQLSTATE[23000]: UNIQUE constraint failed: payments.reference');
             }
 
             /** @return array<string,mixed>|null */
-            public function findByReference(string $reference): ?array
+            public function findByReference(ApplicationContext $context, string $reference): ?array
             {
                 return null;
             }
 
             /** @param array<string,mixed> $data */
-            public function updateByReference(string $reference, array $data): bool
+            public function updateByReference(ApplicationContext $context, string $reference, array $data): bool
             {
                 $this->updatedReference = $reference;
                 $this->updatedWith = $data;
@@ -89,7 +90,7 @@ final class PaymentConfirmUniqueRaceTest extends PayviaTestCase
         self::assertNotNull($repo->updatedWith);
         // The update path applies the same payload the insert would have.
         self::assertSame('ref_race', $repo->updatedWith['reference']);
-        self::assertSame(100.0, $repo->updatedWith['amount']);
+        self::assertSame(10000, $repo->updatedWith['amount']);
         self::assertSame('success', $repo->updatedWith['status']);
     }
 
@@ -104,19 +105,19 @@ final class PaymentConfirmUniqueRaceTest extends PayviaTestCase
             }
 
             /** @param array<string,mixed> $data */
-            public function createPayment(array $data): string
+            public function createPayment(ApplicationContext $context, array $data): string
             {
                 throw new \RuntimeException('SQLSTATE[HY000]: disk I/O error');
             }
 
             /** @return array<string,mixed>|null */
-            public function findByReference(string $reference): ?array
+            public function findByReference(ApplicationContext $context, string $reference): ?array
             {
                 return null;
             }
 
             /** @param array<string,mixed> $data */
-            public function updateByReference(string $reference, array $data): bool
+            public function updateByReference(ApplicationContext $context, string $reference, array $data): bool
             {
                 $this->updateCalled = true;
                 return true;

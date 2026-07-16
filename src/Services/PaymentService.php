@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Services;
 
 use Glueful\Bootstrap\ApplicationContext;
+use Glueful\Extensions\Contracts\Payments\PayableReference;
+use Glueful\Extensions\Contracts\Payments\PaymentConfirmation;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
@@ -21,6 +23,7 @@ final class PaymentService
         private PaymentRepositoryInterface $payments,
         private GatewayManager $gateways,
         private ?WebhookService $webhooks = null,
+        private ?ConfirmationDispatcher $confirmations = null,
     ) {
         $this->context = $context;
     }
@@ -43,7 +46,10 @@ final class PaymentService
         $status = (string) ($verification['status'] ?? 'failed');
         $providerId = (string) ($verification['id'] ?? '');
         $message = (string) ($verification['message'] ?? '');
-        $amount = (float) ($verification['amount'] ?? 0.0);
+        // Gateways already normalize amounts to integer minor units on the wire;
+        // this is the single integer carried end-to-end into storage, events, and
+        // API responses. No float arithmetic on money.
+        $amount = (int) ($verification['amount'] ?? 0);
         $currency = (string) ($verification['currency'] ?? 'GHS');
 
         // Start with caller-provided metadata
@@ -100,10 +106,10 @@ final class PaymentService
                 : null,
         ];
 
-        $existing = $this->payments->findByReference($reference);
+        $existing = $this->payments->findByReference($this->context, $reference);
         if ($existing === null) {
             try {
-                $this->payments->createPayment($payload);
+                $this->payments->createPayment($this->context, $payload);
             } catch (\Throwable $e) {
                 if (!$this->isUniqueViolation($e)) {
                     throw $e;
@@ -112,10 +118,10 @@ final class PaymentService
                 // Concurrent webhook/client retry inserted the row between our
                 // find and insert (payments.reference is UNIQUE). Apply the same
                 // payload through the update path instead of returning a 500.
-                $this->payments->updateByReference($reference, $payload);
+                $this->payments->updateByReference($this->context, $reference, $payload);
             }
         } else {
-            $this->payments->updateByReference($reference, $payload);
+            $this->payments->updateByReference($this->context, $reference, $payload);
         }
 
         if ($this->webhooks !== null) {
@@ -132,6 +138,7 @@ final class PaymentService
                         'reference' => $reference,
                         'gateway_transaction_id' => $providerId !== '' ? $providerId : null,
                         'amount' => $amount,
+                        'amount_unit' => 'minor',
                         'currency' => $currency,
                         'status' => $status,
                     ],
@@ -140,6 +147,32 @@ final class PaymentService
             } catch (\Throwable) {
                 // Payment confirmation must not regress if the optional outbox path is unavailable.
             }
+        }
+
+        if (
+            $status === 'success'
+            && is_string($payload['payable_type'])
+            && $payload['payable_type'] !== ''
+            && is_string($payload['payable_id'])
+            && $payload['payable_id'] !== ''
+        ) {
+            $this->confirmations?->dispatch(
+                $this->context,
+                new PayableReference(
+                    $payload['payable_type'],
+                    $payload['payable_id'],
+                    $amount,
+                    $currency,
+                    metadata: $metadata
+                ),
+                new PaymentConfirmation(
+                    'paid',
+                    (string) ($verification['reference'] ?? $reference),
+                    $amount,
+                    $currency,
+                    $verification
+                )
+            );
         }
 
         return [

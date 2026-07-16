@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Services;
 
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\InvoiceRepositoryInterface;
 
 /**
@@ -23,27 +24,30 @@ final class InvoiceService
     /**
      * @param array<string,mixed> $data
      */
-    public function create(array $data): string
+    public function create(ApplicationContext $context, array $data): string
     {
-        return $this->invoices->create($data);
+        return $this->invoices->createInvoice($context, $data);
     }
 
-    public function markPaid(string $invoiceUuid, ?\DateTimeImmutable $paidAt = null): bool
-    {
-        return $this->invoices->markPaid($invoiceUuid, $paidAt);
+    public function markPaid(
+        ApplicationContext $context,
+        string $invoiceUuid,
+        ?\DateTimeImmutable $paidAt = null
+    ): bool {
+        return $this->invoices->markPaid($context, $invoiceUuid, $paidAt);
     }
 
-    public function markCanceled(string $invoiceUuid): bool
+    public function markCanceled(ApplicationContext $context, string $invoiceUuid): bool
     {
-        return $this->invoices->markCanceled($invoiceUuid);
+        return $this->invoices->markCanceled($context, $invoiceUuid);
     }
 
     /**
      * @param array<string,mixed> $filters
      * @return array<string,mixed> Paginated payload (items + meta)
      */
-    public function list(int $page = 1, int $perPage = 20, array $filters = []): array
+    public function list(ApplicationContext $context, int $page = 1, int $perPage = 20, array $filters = []): array
     {
-        return $this->invoices->paginateWithFilters($page, $perPage, $filters);
+        return $this->invoices->paginateWithFilters($context, $page, $perPage, $filters);
     }
 }

@@ -24,7 +24,7 @@ final class FakeWebhookGateway implements PaymentGatewayInterface, WebhookCapabl
             'status' => 'success',
             'id' => $options['id'] ?? null,
             'reference' => $reference,
-            'amount' => 1.0,
+            'amount' => 100,
             'currency' => 'GHS',
         ];
     }

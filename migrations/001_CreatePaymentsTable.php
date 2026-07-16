@@ -15,6 +15,7 @@ class CreatePaymentsTable implements MigrationInterface
         $schema->createTable('payments', function ($table) {
             $table->bigInteger('id')->primary()->autoIncrement();
             $table->string('uuid', 12);
+            $table->string('tenant_uuid', 12)->default('');
 
             $table->string('user_uuid', 12)->nullable();
 
@@ -30,7 +31,7 @@ class CreatePaymentsTable implements MigrationInterface
             $table->string('gateway_transaction_id', 100)->nullable();
             $table->string('reference', 100);
 
-            $table->decimal('amount', 12, 2);
+            $table->bigInteger('amount');
             $table->string('currency', 10)->default('GHS');
             $table->string('status', 20)->default('pending');
             $table->string('message', 255)->nullable();
@@ -46,6 +47,8 @@ class CreatePaymentsTable implements MigrationInterface
             $table->timestamp('updated_at')->nullable();
 
             $table->unique('uuid');
+            // Correlation identity: gateways/callbacks reference payments by this
+            // value alone, with no tenant context, so it stays globally unique.
             $table->unique('reference');
             $table->index('user_uuid');
             $table->index(['payable_type', 'payable_id']);
@@ -54,6 +57,14 @@ class CreatePaymentsTable implements MigrationInterface
 
             // user_uuid is an indexed logical reference to users.uuid (owned by glueful/users);
             // no cross-package FK (Phase 5 decoupling — integrity enforced at the service layer).
+        });
+
+        // Declared as a follow-up ALTER (rather than inline on createTable): the
+        // reference unique isn't tenant-prefixed, so nothing else in this table
+        // covers tenant_uuid, and the SQLite/PostgreSQL generators silently drop
+        // plain (non-unique) index() calls made inside a createTable() callback.
+        $schema->alterTable('payments', function ($table) {
+            $table->index('tenant_uuid');
         });
     }
 

@@ -6,6 +6,8 @@ namespace Glueful\Extensions\Payvia\Tests\Unit;
 
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Bootstrap\ConfigurationLoader;
+use Glueful\Extensions\Contracts\Payments\PayableReference;
+use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 use Glueful\Http\Client;
@@ -60,7 +62,10 @@ final class PaystackWebhookSignatureTest extends TestCase
         self::assertSame(EventType::PAYMENT_SUCCEEDED, $event->type());
         self::assertSame('payment.succeeded:R1', $event->logicalEventKey());
         self::assertSame('R1', $event->normalized()['reference']);
-        self::assertSame(50.0, $event->normalized()['amount']);
+        // Wire amounts are already minor units (Paystack sends 5000 = GHS 50.00);
+        // normalization must pass them through untouched, never divide by 100.
+        self::assertSame(5000, $event->normalized()['amount']);
+        self::assertSame('minor', $event->normalized()['amount_unit']);
     }
 
     public function testVerifyIgnoresCallerSuppliedVerifyUrl(): void
@@ -110,6 +115,59 @@ final class PaystackWebhookSignatureTest extends TestCase
 
         self::assertSame('success', $result['status']);
         self::assertSame('REF_1', $result['reference']);
+        // verify() must pass the wire (minor-unit) amount straight through as an int.
+        self::assertSame(5000, $result['amount']);
+    }
+
+    public function testInitializePostsMinorUnitAmountToTrustedPaystackUrl(): void
+    {
+        $http = $this->createMock(Client::class);
+        $response = $this->createMock(HttpResponse::class);
+
+        $response->method('getStatusCode')->willReturn(200);
+        $response->method('toArray')->willReturn([
+            'status' => true,
+            'data' => [
+                'reference' => 'REF_INIT',
+                'authorization_url' => 'https://checkout.paystack.test/REF_INIT',
+            ],
+        ]);
+
+        $http->expects(self::once())
+            ->method('post')
+            ->with(
+                'https://api.paystack.co/transaction/initialize',
+                self::callback(static function (array $options): bool {
+                    return ($options['json']['amount'] ?? null) === 4999
+                        && ($options['json']['currency'] ?? null) === 'GHS'
+                        && ($options['json']['metadata']['payable_type'] ?? null) === 'commerce_order'
+                        && ($options['json']['metadata']['payable_id'] ?? null) === 'ord1'
+                        && str_starts_with((string) ($options['json']['reference'] ?? ''), 'commerce_order_ord1_')
+                        && isset($options['headers']['Authorization']);
+                })
+            )
+            ->willReturn($response);
+
+        $base = sys_get_temp_dir() . '/payvia-paystack-' . uniqid('', true);
+        @mkdir($base . '/config', 0777, true);
+        file_put_contents($base . '/config/payvia.php', "<?php\nreturn " . var_export([
+            'gateways' => [
+                'paystack' => [
+                    'secret_key' => 'secret',
+                    'base_url' => 'https://api.paystack.co',
+                ],
+            ],
+        ], true) . ";\n");
+        $context = new ApplicationContext($base, 'testing');
+        $context->setConfigLoader(new ConfigurationLoader($base, 'testing', $base . '/config'));
+
+        $gateway = new PaystackGateway($http, $context);
+        self::assertInstanceOf(InitiationCapableGateway::class, $gateway);
+
+        $result = $gateway->initialize(new PayableReference('commerce_order', 'ord1', 4999, 'GHS'));
+
+        self::assertSame('REF_INIT', $result['reference']);
+        self::assertSame('https://checkout.paystack.test/REF_INIT', $result['checkout_url']);
     }
 
     public function testCancelSubscriptionPostsCodeAndEmailToken(): void

@@ -42,23 +42,23 @@ final class InvoiceApiTest extends PayviaTestCase
     public function testCreateRejectsInvalidStatus(): void
     {
         $response = $this->controller->create($this->jsonRequest([
-            'amount' => 50.0,
+            'amount' => 5000,
             'status' => 'bogus',
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame([], $this->repo->list([]));
+        self::assertSame([], $this->repo->list($this->context, []));
     }
 
     public function testCreateRejectsInvalidCurrency(): void
     {
         $response = $this->controller->create($this->jsonRequest([
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'CEDIS',
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame([], $this->repo->list([]));
+        self::assertSame([], $this->repo->list($this->context, []));
     }
 
     public function testCreateRejectsZeroAmount(): void
@@ -68,7 +68,7 @@ final class InvoiceApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame([], $this->repo->list([]));
+        self::assertSame([], $this->repo->list($this->context, []));
     }
 
     public function testCreateRejectsNegativeAmount(): void
@@ -78,36 +78,36 @@ final class InvoiceApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame([], $this->repo->list([]));
+        self::assertSame([], $this->repo->list($this->context, []));
     }
 
     public function testCreateUppercasesLowercaseCurrency(): void
     {
         $this->controller->create($this->jsonRequest([
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'usd',
         ]));
 
-        $rows = $this->repo->list([]);
+        $rows = $this->repo->list($this->context, []);
         self::assertSame('USD', $rows[0]['currency']);
     }
 
     public function testCreateAcceptsValidValues(): void
     {
         $response = $this->controller->create($this->jsonRequest([
-            'amount' => 50.0,
+            'amount' => 5000,
             'currency' => 'GHS',
             'status' => 'draft',
         ]));
 
         self::assertSame(201, $response->getStatusCode());
-        self::assertCount(1, $this->repo->list([]));
+        self::assertCount(1, $this->repo->list($this->context, []));
     }
 
     public function testMarkPaidRejectsUnparseablePaidAt(): void
     {
-        $uuid = $this->repo->create([
-            'amount' => 50.0,
+        $uuid = $this->repo->createInvoice($this->context, [
+            'amount' => 5000,
             'currency' => 'GHS',
             'status' => 'pending',
         ]);
@@ -118,13 +118,13 @@ final class InvoiceApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(422, $response->getStatusCode());
-        self::assertSame('pending', $this->repo->list([])[0]['status']);
+        self::assertSame('pending', $this->repo->list($this->context, [])[0]['status']);
     }
 
     public function testMarkPaidAcceptsValidPaidAt(): void
     {
-        $uuid = $this->repo->create([
-            'amount' => 50.0,
+        $uuid = $this->repo->createInvoice($this->context, [
+            'amount' => 5000,
             'currency' => 'GHS',
             'status' => 'pending',
         ]);
@@ -135,7 +135,7 @@ final class InvoiceApiTest extends PayviaTestCase
         ]));
 
         self::assertSame(200, $response->getStatusCode());
-        self::assertSame('paid', $this->repo->list([])[0]['status']);
+        self::assertSame('paid', $this->repo->list($this->context, [])[0]['status']);
     }
 
     public function testIndexCapsPerPageAt100(): void

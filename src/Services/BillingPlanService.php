@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Services;
 
+use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
 
 /**
@@ -23,30 +24,30 @@ final class BillingPlanService
     /**
      * @param array<string,mixed> $data
      */
-    public function create(array $data): string
+    public function create(ApplicationContext $context, array $data): string
     {
-        return $this->plans->create($data);
+        return $this->plans->createPlan($context, $data);
     }
 
     /**
      * @param array<string,mixed> $data
      */
-    public function update(string $planUuid, array $data): bool
+    public function update(ApplicationContext $context, string $planUuid, array $data): bool
     {
-        return $this->plans->update($planUuid, $data);
+        return $this->plans->updatePlan($context, $planUuid, $data);
     }
 
-    public function disable(string $planUuid): bool
+    public function disable(ApplicationContext $context, string $planUuid): bool
     {
-        return $this->plans->disable($planUuid);
+        return $this->plans->disable($context, $planUuid);
     }
 
     /**
      * @param array<string,mixed> $filters
      * @return array<int,array<string,mixed>>
      */
-    public function list(array $filters = []): array
+    public function list(ApplicationContext $context, array $filters = []): array
     {
-        return $this->plans->list($filters);
+        return $this->plans->list($context, $filters);
     }
 }

@@ -5,15 +5,22 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Gateways;
 
 use Glueful\Bootstrap\ApplicationContext;
+use Glueful\Extensions\Contracts\Payments\PayableReference;
+use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
+use Glueful\Helpers\Utils;
 use Glueful\Http\Client as HttpClient;
 
-final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGateway, SubscriptionCapableGateway
+final class PaystackGateway implements
+    PaymentGatewayInterface,
+    InitiationCapableGateway,
+    WebhookCapableGateway,
+    SubscriptionCapableGateway
 {
     private ApplicationContext $context;
     public function __construct(
@@ -81,7 +88,9 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
             ];
         }
 
-        $amount = isset($data['amount']) ? ((float) $data['amount'] / 100.0) : 0.0;
+        // Paystack's wire amount is already an integer minor unit (e.g. 5000 = GHS
+        // 50.00); pass it through untouched — never float-divide by 100.
+        $amount = isset($data['amount']) ? (int) $data['amount'] : 0;
         $currency = (string) ($data['currency'] ?? 'GHS');
 
         return [
@@ -91,6 +100,63 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
             'amount' => $amount,
             'currency' => $currency,
             'message' => $message,
+            'raw' => $decoded,
+        ];
+    }
+
+    public function initialize(PayableReference $payable, array $options = []): array
+    {
+        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
+
+        $secret = (string) ($config['secret_key'] ?? '');
+        if ($secret === '') {
+            throw new \RuntimeException(
+                'Missing Paystack secret key (PAYVIA_PAYSTACK_SECRET_KEY / PAYSTACK_SECRET_KEY)'
+            );
+        }
+
+        $baseUrl = rtrim((string) ($config['base_url'] ?? 'https://api.paystack.co'), '/');
+        $timeout = (int) ($config['timeout'] ?? 15);
+        $reference = isset($options['reference']) && is_string($options['reference']) && $options['reference'] !== ''
+            ? $options['reference']
+            : $this->newReference($payable);
+
+        $json = [
+            'amount' => $payable->amount,
+            'currency' => strtoupper($payable->currency),
+            'reference' => $reference,
+            'metadata' => array_merge($payable->metadata, [
+                'payable_type' => $payable->type,
+                'payable_id' => $payable->id,
+            ]),
+        ];
+
+        if ($payable->description !== null && $payable->description !== '') {
+            $json['metadata']['description'] = $payable->description;
+        }
+
+        foreach (['email', 'callback_url', 'channels'] as $key) {
+            if (array_key_exists($key, $options)) {
+                $json[$key] = $options[$key];
+            }
+        }
+
+        $response = $this->httpClient->post($baseUrl . '/transaction/initialize', [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $secret,
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json',
+            ],
+            'json' => $json,
+            'timeout' => $timeout,
+        ]);
+
+        $decoded = $response->toArray();
+        $data = (array) ($decoded['data'] ?? []);
+
+        return [
+            'reference' => (string) ($data['reference'] ?? $reference),
+            'checkout_url' => isset($data['authorization_url']) ? (string) $data['authorization_url'] : null,
             'raw' => $decoded,
         ];
     }
@@ -228,6 +294,14 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
         };
     }
 
+    private function newReference(PayableReference $payable): string
+    {
+        $safeType = (string) preg_replace('/[^a-zA-Z0-9]+/', '_', $payable->type);
+        $safeId = (string) preg_replace('/[^a-zA-Z0-9]+/', '_', $payable->id);
+
+        return trim($safeType . '_' . $safeId, '_') . '_' . Utils::generateNanoID(10);
+    }
+
     /** @param array<string,mixed> $data */
     private function entityId(string $type, array $data): string
     {
@@ -248,7 +322,9 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
      */
     private function normalizePayload(string $type, array $data): array
     {
-        $amount = isset($data['amount']) ? ((float) $data['amount'] / 100.0) : null;
+        // Paystack's wire amount is already an integer minor unit; pass it through
+        // untouched — never float-divide by 100.
+        $amount = isset($data['amount']) ? (int) $data['amount'] : null;
         $customer = (array) ($data['customer'] ?? []);
 
         return array_filter([
@@ -261,6 +337,9 @@ final class PaystackGateway implements PaymentGatewayInterface, WebhookCapableGa
             'gateway_customer_id' => $customer['customer_code'] ?? $data['customer_code'] ?? null,
             'billing_plan_uuid' => $data['metadata']['billing_plan_uuid'] ?? null,
             'amount' => $amount,
+            // Forward-compat marker for any future consumer/re-normalizer; only set
+            // when a numeric amount is actually present.
+            'amount_unit' => $amount !== null ? 'minor' : null,
             'currency' => $data['currency'] ?? null,
             'status' => $data['status'] ?? null,
             'current_period_end' => $data['next_payment_date'] ?? null,

@@ -167,9 +167,11 @@ final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGate
     private function normalizePaymentIntentVerification(string $reference, array $decoded): array
     {
         $status = (string) ($decoded['status'] ?? 'failed');
+        // Stripe's wire amount is already an integer minor unit (e.g. 5000 = USD
+        // 50.00); pass it through untouched — never float-divide by 100.
         $amount = isset($decoded['amount_received'])
-            ? ((float) $decoded['amount_received'] / 100.0)
-            : ((float) ($decoded['amount'] ?? 0) / 100.0);
+            ? (int) $decoded['amount_received']
+            : (int) ($decoded['amount'] ?? 0);
 
         return [
             'status' => $status === 'succeeded' ? 'success' : ($status === '' ? 'failed' : $status),
@@ -194,7 +196,8 @@ final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGate
             'status' => $paymentStatus === 'paid' ? 'success' : ($paymentStatus !== '' ? $paymentStatus : 'failed'),
             'id' => $decoded['payment_intent'] ?? $decoded['id'] ?? null,
             'reference' => (string) ($decoded['id'] ?? $reference),
-            'amount' => ((float) ($decoded['amount_total'] ?? 0) / 100.0),
+            // Wire amount is already an integer minor unit; pass it through untouched.
+            'amount' => (int) ($decoded['amount_total'] ?? 0),
             'currency' => strtoupper((string) ($decoded['currency'] ?? '')),
             'message' => $paymentStatus,
             'raw' => $decoded,
@@ -224,6 +227,7 @@ final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGate
     private function normalizePayload(string $type, array $object): array
     {
         $currency = isset($object['currency']) ? strtoupper((string) $object['currency']) : null;
+        $amount = $this->amount($object);
 
         return array_filter([
             'type' => $type,
@@ -235,7 +239,10 @@ final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGate
                 : null,
             'gateway_price_id' => $this->priceId($object),
             'billing_plan_uuid' => $this->metadataString($object, 'billing_plan_uuid'),
-            'amount' => $this->amount($object),
+            'amount' => $amount,
+            // Forward-compat marker for any future consumer/re-normalizer; only set
+            // when a numeric amount is actually present.
+            'amount_unit' => $amount !== null ? 'minor' : null,
             'currency' => $currency,
             'status' => $object['status'] ?? $object['payment_status'] ?? null,
             'current_period_start' => $this->timestamp($object['current_period_start'] ?? null),
@@ -308,12 +315,17 @@ final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGate
         return isset($price['id']) && is_scalar($price['id']) ? (string) $price['id'] : null;
     }
 
-    /** @param array<string,mixed> $object */
-    private function amount(array $object): ?float
+    /**
+     * Wire amounts are already integer minor units; pass them through untouched
+     * — never float-divide by 100.
+     *
+     * @param array<string,mixed> $object
+     */
+    private function amount(array $object): ?int
     {
         foreach (['amount_received', 'amount_paid', 'amount_due', 'amount_total', 'amount'] as $key) {
             if (isset($object[$key]) && is_numeric($object[$key])) {
-                return ((float) $object[$key]) / 100.0;
+                return (int) $object[$key];
             }
         }
 

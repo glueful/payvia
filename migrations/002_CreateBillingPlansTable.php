@@ -8,10 +8,12 @@ use Glueful\Database\Schema\Interfaces\SchemaBuilderInterface;
 /**
  * Create billing_plans table
  *
- * Generic catalog of billing/subscription plans. Designed to be
- * tenant-agnostic; applications can link plans to any domain entity
- * (organizations, locations, etc.) via their own tables or via the
- * payments/invoices polymorphic links.
+ * Generic catalog of billing/subscription plans. Carries a sentinel
+ * `tenant_uuid` (default '') so single-store installs behave exactly as
+ * before while multi-tenant hosts get plan names scoped per tenant.
+ * Applications can link plans to any domain entity (organizations,
+ * locations, etc.) via their own tables or via the payments/invoices
+ * polymorphic links.
  */
 class CreateBillingPlansTable implements MigrationInterface
 {
@@ -20,12 +22,13 @@ class CreateBillingPlansTable implements MigrationInterface
         $schema->createTable('billing_plans', function ($table) {
             $table->bigInteger('id')->primary()->autoIncrement();
             $table->string('uuid', 12);
+            $table->string('tenant_uuid', 12)->default('');
 
             $table->string('name', 100);
             $table->text('description')->nullable();
 
-            // Pricing
-            $table->decimal('amount', 12, 2);
+            // Pricing (integer minor units, e.g. cents)
+            $table->bigInteger('amount');
             $table->string('currency', 10)->default('GHS');
             // Interval: monthly, yearly, one_time, etc.
             $table->string('interval', 20)->default('monthly');
@@ -45,7 +48,12 @@ class CreateBillingPlansTable implements MigrationInterface
             $table->timestamp('updated_at')->nullable();
 
             $table->unique('uuid');
-            $table->unique('name');
+            // Scoped uniqueness: a name is unique per (tenant, non-NULL
+            // gateway), not globally. NULLs never collide in a unique index,
+            // so multiple app-managed (gateway = NULL) plans may share a
+            // name within the same tenant.
+            $table->unique(['tenant_uuid', 'gateway', 'name']);
+            $table->index('tenant_uuid');
         });
     }
 

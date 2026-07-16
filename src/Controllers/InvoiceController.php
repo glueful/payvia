@@ -31,7 +31,8 @@ final class InvoiceController extends BaseController
     #[ApiOperation(
         summary: 'Create Invoice',
         description: 'Creates a generic invoice that can be reconciled with payments. Body: `amount` '
-            . '(required; invoice amount), `currency` (currency code, e.g. GHS, USD), `user_uuid` (optional), '
+            . '(required; invoice amount as an integer in the currency\'s minor unit, e.g. cents — 5000 for '
+            . 'GHS 50.00), `currency` (currency code, e.g. GHS, USD), `user_uuid` (optional), '
             . '`billing_plan_uuid` (optional), `payable_type` (optional logical type of the payable, e.g. '
             . 'subscription, order), `payable_id` (optional identifier of the payable), `number` (optional '
             . 'custom invoice number), `status` (draft,pending,paid,canceled,failed; defaults to pending), '
@@ -51,8 +52,10 @@ final class InvoiceController extends BaseController
 
             $errors = [];
             if (!is_numeric($amount)) {
-                $errors['amount'] = 'amount is required and must be numeric';
-            } elseif ((float) $amount <= 0) {
+                $errors['amount'] = 'amount is required and must be an integer (minor units, e.g. cents)';
+            } elseif ((float) $amount != (int) $amount) {
+                $errors['amount'] = 'amount must be a whole number (minor units, e.g. cents)';
+            } elseif ((int) $amount <= 0) {
                 $errors['amount'] = 'amount must be greater than 0';
             }
 
@@ -84,14 +87,14 @@ final class InvoiceController extends BaseController
                     ? $data['payable_id']
                     : null,
                 'number' => isset($data['number']) && is_string($data['number']) ? $data['number'] : null,
-                'amount' => (float) $amount,
+                'amount' => (int) $amount,
                 'currency' => $currency,
                 'status' => $status,
                 'due_at' => isset($data['due_at']) && is_string($data['due_at']) ? $data['due_at'] : null,
                 'metadata' => isset($data['metadata']) && is_array($data['metadata']) ? $data['metadata'] : null,
             ];
 
-            $uuid = $this->invoices->create($payload);
+            $uuid = $this->invoices->create($this->context, $payload);
 
             return $this->created(['uuid' => $uuid], 'Invoice created');
         } catch (\Throwable $e) {
@@ -133,7 +136,7 @@ final class InvoiceController extends BaseController
                 }
             }
 
-            $ok = $this->invoices->markPaid($invoiceUuid, $paidAt);
+            $ok = $this->invoices->markPaid($this->context, $invoiceUuid, $paidAt);
 
             return $ok
                 ? $this->success(['uuid' => $invoiceUuid], 'Invoice marked as paid')
@@ -165,7 +168,7 @@ final class InvoiceController extends BaseController
                 return $this->validationError(['invoice_uuid' => 'invoice_uuid is required']);
             }
 
-            $ok = $this->invoices->markCanceled($invoiceUuid);
+            $ok = $this->invoices->markCanceled($this->context, $invoiceUuid);
 
             return $ok
                 ? $this->success(['uuid' => $invoiceUuid], 'Invoice canceled')
@@ -236,7 +239,7 @@ final class InvoiceController extends BaseController
                 ? min(self::MAX_PER_PAGE, max(1, (int) $query['per_page']))
                 : 20;
 
-            $result = $this->invoices->list($page, $perPage, $filters);
+            $result = $this->invoices->list($this->context, $page, $perPage, $filters);
 
             $data = $result['data'] ?? [];
             $meta = $result;
