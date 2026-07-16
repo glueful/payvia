@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional marketplace/split-payment capability interfaces.
 - Optional refunds/disputes capability interfaces.
 
-## [2.0.0] - 2026-07-14 — Money & Tenancy Hardening
+## [2.0.0] - 2026-07-16 — Money & Tenancy Hardening
 
 ### Breaking Changes
 
@@ -140,17 +140,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tenant resolver is present but no runner is bound, construction fails closed rather than
   running an unscoped query. A permanent test forbids any other runtime code from bypassing
   the query builder with raw PDO/SQL against the five tenant-scoped tables.
-
-
-
-### Changed
-
 - Migrated OpenAPI documentation to the framework 1.57.0 reflect generator. Route
   documentation (summaries, query parameters, request-body fields and response codes)
   is now expressed as typed `#[ApiOperation]`, `#[QueryParam]` and `#[ApiResponse]`
   attributes on the controller methods; the now-inert route-file docblocks were removed.
   Docs-only — no runtime behaviour changes.
 - Raised the minimum framework requirement to `^1.57.0`.
+
+### Fixed
+
+- **Amount columns are normalized to `int` on every read surface.** SQLite (and PDO
+  generally) can hand `bigInteger` columns back as numeric strings; the new
+  `NormalizesAmountColumn` repository concern casts `amount` on every read in the
+  payment/intent/plan/invoice repositories, so JSON responses and internal consumers always
+  see integer minor units regardless of driver.
+- **Cross-tenant UUID global uniqueness is now proven, not assumed.** Schema shape tests
+  pin the plain `UNIQUE(uuid)` constraint (deliberately NOT tenant-composited) on all five
+  domain tables — the webhook ownership resolution above depends on `billing_plan_uuid`
+  being globally unique, and these tests make that dependency permanent.
+- **`GatewaySubscriptionService::reconcile()` no longer creates sentinel projections for
+  unknown subscription ids.** Reconciling an id with no existing projection and no resolvable
+  billing-plan owner previously wrote an ownerless sentinel-tenant row; it now fails closed,
+  matching the webhook path's strict ownership order.
 
 ## [1.0.2] - 2026-06-13
 
