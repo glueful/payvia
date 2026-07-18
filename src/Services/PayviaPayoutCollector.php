@@ -24,10 +24,12 @@ use Glueful\Helpers\Utils;
  * calls the resolved
  * {@see \Glueful\Extensions\Payvia\Contracts\TransferCapableGateway}. A
  * duplicate `(tenant, gateway, idempotency_key)` on that pre-I/O insert
- * means this idempotency key already has an attempt: the collector never
- * mints a second gateway `transfer()` call for it -- it recovers the
- * existing row's already-known result, or reconciles the unresolved
- * (lost-response) row via the gateway's `transferStatus()`.
+ * means this idempotency key already has an attempt: the collector recovers
+ * the existing row's already-known result directly, or -- for an unresolved
+ * (lost-response) row -- recovers it via the gateway's own
+ * `recoverTransfer()`, which uses each provider's safe mechanism (Paystack
+ * verifies by reference; Stripe replays the create under the same
+ * Idempotency-Key) so neither path can move money twice.
  */
 final class PayviaPayoutCollector implements PayoutCollector
 {
@@ -64,9 +66,11 @@ final class PayviaPayoutCollector implements PayoutCollector
 
         if (!$inserted) {
             // Duplicate (tenant, gateway, idempotency_key): this attempt is
-            // already in flight or resolved. Recover it -- never mint a
-            // second gateway transfer() call for the same key.
-            return $this->recoverTransfer($context, $gatewayKey, $request->idempotencyKey);
+            // already in flight or resolved. Recover it via each gateway's
+            // own safe mechanism -- Paystack never gets a second transfer()
+            // call for the same key; Stripe's safe recovery *is* an
+            // idempotent replay of transfer() (see recoverTransfer()).
+            return $this->recoverTransfer($context, $destination, $request, $safeRef);
         }
 
         $gateway = $this->gateways->payoutGateway($gatewayKey);
@@ -125,26 +129,34 @@ final class PayviaPayoutCollector implements PayoutCollector
     }
 
     /**
-     * Recover a duplicate `(tenant, gateway, idempotency_key)` insert
-     * without ever minting a second gateway `transfer()` call: a row that
-     * already carries a known provider result (a provider_ref, or a
+     * Recover a duplicate `(tenant, gateway, idempotency_key)` insert. A row
+     * that already carries a known provider result (a provider_ref, or a
      * definite terminal/retryable decline) is mapped straight from the
-     * durable row; an unresolved attempt (still `pending` with no
-     * provider_ref -- the exact lost-response shape) is reconciled via the
-     * gateway's `transferStatus()`.
+     * durable row. An unresolved attempt (still `pending` with no
+     * provider_ref -- the exact lost-response shape) is recovered via the
+     * gateway's own
+     * {@see \Glueful\Extensions\Payvia\Contracts\TransferCapableGateway::recoverTransfer()},
+     * which uses each provider's safe mechanism -- Paystack verifies the
+     * persisted provider-safe reference (never a second `transfer()` call);
+     * Stripe replays the identical create request under the same
+     * Idempotency-Key ($safeRef), which Stripe de-dupes and returns the
+     * original transfer for. Neither path can move money twice.
      */
     private function recoverTransfer(
         ApplicationContext $context,
-        string $gatewayKey,
-        string $idempotencyKey
+        PayoutDestination $destination,
+        PayoutRequest $request,
+        string $safeRef
     ): PayoutResult {
-        $existing = $this->transfers->findByIdempotencyKey($context, $gatewayKey, $idempotencyKey);
+        $gatewayKey = $destination->provider;
+        $existing = $this->transfers->findByIdempotencyKey($context, $gatewayKey, $request->idempotencyKey);
         if ($existing === null) {
             // The insert lost a uniqueness race but the winning row is not
             // yet visible to this read -- an infra-level ambiguity, not a
             // classifiable outcome.
             throw new \RuntimeException(
-                "Payvia: payout attempt '{$idempotencyKey}' conflicted but no attempt row could be recovered."
+                "Payvia: payout attempt '{$request->idempotencyKey}' conflicted but no attempt row "
+                . 'could be recovered.'
             );
         }
 
@@ -161,20 +173,22 @@ final class PayviaPayoutCollector implements PayoutCollector
             );
         }
 
-        $statusResult = $this->reconcile($context, $gatewayKey, $existing);
+        $gateway = $this->gateways->payoutGateway($gatewayKey);
+        $providerRef = $this->nullableString($existing['provider_ref'] ?? null);
+        $result = $gateway->recoverTransfer($destination, $request, $safeRef, $providerRef);
 
-        // transfer() speaks PayoutResult's 5-state vocabulary; REVERSED only
-        // arises for a transfer that already settled, so it is surfaced
-        // here as PAID -- a later status() call reports the reversal.
-        $status = $statusResult->status === PayoutStatusResult::REVERSED
-            ? PayoutResult::PAID
-            : $statusResult->status;
+        $this->transfers->setResult($context, (string) $existing['uuid'], [
+            'provider_ref' => $result['provider_ref'] ?? $providerRef,
+            'status' => (string) $result['status'],
+            'message' => $result['failure_reason'] ?? null,
+            'raw_payload' => $result['raw'],
+        ]);
 
         return new PayoutResult(
-            status: $status,
-            providerRef: $statusResult->providerRef,
-            failureCode: $statusResult->failureCode,
-            failureReason: $statusResult->failureReason,
+            status: (string) $result['status'],
+            providerRef: $this->nullableString($result['provider_ref'] ?? $providerRef),
+            failureCode: $this->nullableString($result['failure_code'] ?? null),
+            failureReason: $this->nullableString($result['failure_reason'] ?? null),
         );
     }
 

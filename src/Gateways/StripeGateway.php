@@ -220,12 +220,33 @@ final class StripeGateway implements
     }
 
     /**
+     * Recover a possibly-completed transfer WITHOUT moving money twice: a
+     * Stripe transfer whose CREATE reached Stripe but whose RESPONSE was
+     * lost has no known $providerRef, so transferStatus() (provider-id-
+     * based) cannot recover it. Replaying the identical create under the
+     * same Idempotency-Key ($providerSafeRef) is the documented-safe
+     * recovery mechanism -- Stripe de-dupes on that key and returns the
+     * *original* transfer object rather than creating a second one, so
+     * this is never a double-transfer.
+     *
+     * @return array<string,mixed>
+     */
+    public function recoverTransfer(
+        PayoutDestination $destination,
+        PayoutRequest $request,
+        string $providerSafeRef,
+        ?string $providerRef
+    ): array {
+        return $this->transfer($destination, $request, $providerSafeRef);
+    }
+
+    /**
      * Reconcile a transfer's current state. Stripe transfer retrieval is
      * provider-id-based (GET /v1/transfers/{id}), so $providerRef is
      * required here -- when it is not yet known (e.g. the create call's
-     * outcome was itself lost), recovering the original response is the
-     * collector's job (replaying the identical create request under the
-     * same Idempotency-Key), not this method's.
+     * outcome was itself lost), recovering the original response is
+     * {@see recoverTransfer()}'s job (replaying the identical create
+     * request under the same Idempotency-Key), not this method's.
      *
      * Returns `{status, reversed_amount, provider_ref, failure_code,
      * failure_reason, raw}` with `status` one of PayoutStatusResult's six

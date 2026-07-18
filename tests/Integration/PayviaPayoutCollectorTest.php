@@ -94,7 +94,8 @@ final class PayviaPayoutCollectorTest extends PayviaTestCase
         self::assertSame(1, $this->gateway->transferCalls);
 
         // The provider actually processed the transfer -- a replay must
-        // recover it via transferStatus(), never a second transfer() call.
+        // recover it via transferStatus() (verify-by-reference), never a
+        // second transfer() call -- Paystack rejects a duplicate reference.
         $this->gateway->transferException = null;
         $this->gateway->transferStatusResult = [
             'status' => PayoutStatusResult::PAID,
@@ -107,6 +108,7 @@ final class PayviaPayoutCollectorTest extends PayviaTestCase
 
         $result = $collector->transfer($this->context, $destination, $request);
 
+        self::assertSame(1, $this->gateway->recoverTransferCalls);
         self::assertSame(1, $this->gateway->transferCalls, 'transfer() must not be called again');
         self::assertSame(1, $this->gateway->transferStatusCalls);
         self::assertSame(PayoutResult::PAID, $result->status);
@@ -115,6 +117,70 @@ final class PayviaPayoutCollectorTest extends PayviaTestCase
         $row = $this->findRow('paystack', 'payoutAAA03:attempt:1');
         self::assertNotNull($row);
         self::assertSame('TRF_RECOVERED', $row['provider_ref']);
+    }
+
+    public function testStripeLostResponseRecoversViaIdempotentReplayWithoutTransferStatus(): void
+    {
+        // Before the fix, this exact shape (Stripe pre-I/O row, no
+        // provider_ref) reconciled via transferStatus(), which THROWS for
+        // Stripe without a known provider_ref -- the payout stayed UNKNOWN
+        // forever. The fix recovers via the gateway's own recoverTransfer(),
+        // which for Stripe replays transfer() under the same idempotency
+        // key -- a safe replay, never a second money-moving create.
+        $this->gateway->recoverTransferMode = 'replay';
+        $this->gateway->transferException = new \RuntimeException('connection reset');
+        $collector = $this->collector('stripe');
+        $destination = new PayoutDestination('stripe', 'acct_123');
+        $request = new PayoutRequest(5000, 'USD', 'payoutSTRIPE01:attempt:1');
+
+        try {
+            $collector->transfer($this->context, $destination, $request);
+            self::fail('Expected the gateway exception to propagate.');
+        } catch (\RuntimeException) {
+            // Expected -- the row now sits pending with no provider_ref:
+            // the exact lost-response shape that stranded a Stripe payout
+            // permanently as UNKNOWN before this fix.
+        }
+
+        self::assertSame(1, $this->gateway->transferCalls);
+
+        // Stripe actually processed the CREATE, but the response was lost.
+        // A replay under the identical idempotency key must recover the
+        // ORIGINAL transfer.
+        $this->gateway->transferException = null;
+        $this->gateway->transferResult = [
+            'status' => PayoutResult::PAID,
+            'provider_ref' => 'tr_recovered_stripe',
+            'failure_code' => null,
+            'failure_reason' => null,
+            'raw' => ['id' => 'tr_recovered_stripe'],
+        ];
+
+        $result = $collector->transfer($this->context, $destination, $request);
+
+        self::assertSame(1, $this->gateway->recoverTransferCalls);
+        self::assertSame(
+            0,
+            $this->gateway->transferStatusCalls,
+            'Stripe recovery must never call transferStatus() -- it throws without a provider_ref'
+        );
+        self::assertSame(
+            2,
+            $this->gateway->transferCalls,
+            'the replay reuses transfer() under the same idempotency key, not a distinct gateway call'
+        );
+        self::assertCount(2, $this->gateway->transferProviderSafeRefs);
+        self::assertSame(
+            $this->gateway->transferProviderSafeRefs[0],
+            $this->gateway->transferProviderSafeRefs[1],
+            'the replay must reuse the identical Idempotency-Key as the original lost attempt'
+        );
+        self::assertSame(PayoutResult::PAID, $result->status);
+        self::assertSame('tr_recovered_stripe', $result->providerRef);
+
+        $row = $this->findRow('stripe', 'payoutSTRIPE01:attempt:1');
+        self::assertNotNull($row);
+        self::assertSame('tr_recovered_stripe', $row['provider_ref']);
     }
 
     public function testStatusWithNoRowReturnsAttemptNotStarted(): void
@@ -228,11 +294,11 @@ final class PayviaPayoutCollectorTest extends PayviaTestCase
         self::assertSame(PayviaPayoutCollector::class, $services[PayoutCollector::class]['class'] ?? null);
     }
 
-    private function collector(): PayviaPayoutCollector
+    private function collector(string $gatewayKey = 'paystack'): PayviaPayoutCollector
     {
         $this->bind(FakeTransferGateway::class, $this->gateway);
         $manager = new GatewayManager($this->context->getContainer(), $this->context);
-        $manager->registerDriver('paystack', FakeTransferGateway::class);
+        $manager->registerDriver($gatewayKey, FakeTransferGateway::class);
 
         return new PayviaPayoutCollector($manager, new PayoutTransferRepository($this->connection));
     }

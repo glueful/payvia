@@ -185,6 +185,60 @@ final class StripeTransferTest extends TestCase
         $this->gateway($http)->transfer($this->destination(), $this->request(), 'payout_abc:attempt:1');
     }
 
+    public function testRecoverTransferReplaysUnderTheSameIdempotencyKey(): void
+    {
+        $http = $this->createMock(Client::class);
+        $http->expects(self::once())
+            ->method('post')
+            ->with(
+                self::anything(),
+                self::callback(function (array $options): bool {
+                    return ($options['headers']['Idempotency-Key'] ?? null) === 'payout_abc:attempt:1';
+                })
+            )
+            ->willReturn($this->responseOf(200, [
+                'id' => 'tr_original',
+                'balance_transaction' => 'txn_1',
+                'reversed' => false,
+                'amount_reversed' => 0,
+            ]));
+
+        $result = $this->gateway($http)->recoverTransfer(
+            $this->destination(),
+            $this->request(),
+            'payout_abc:attempt:1',
+            null
+        );
+
+        self::assertSame(PayoutResult::PAID, $result['status']);
+        self::assertSame('tr_original', $result['provider_ref']);
+    }
+
+    public function testRecoverTransferSucceedsWithoutAKnownProviderRefUnlikeTransferStatus(): void
+    {
+        // This is the exact gap: transferStatus() throws when $providerRef
+        // is null/empty (see testTransferStatusThrowsWithoutProviderRef).
+        // recoverTransfer() must recover this shape instead, since it never
+        // needs a provider-assigned id -- only the idempotency key.
+        $http = $this->createMock(Client::class);
+        $http->method('post')->willReturn($this->responseOf(200, [
+            'id' => 'tr_recovered',
+            'balance_transaction' => null,
+            'reversed' => false,
+            'amount_reversed' => 0,
+        ]));
+
+        $result = $this->gateway($http)->recoverTransfer(
+            $this->destination(),
+            $this->request(),
+            'payout_abc:attempt:1',
+            null
+        );
+
+        self::assertSame(PayoutResult::PENDING, $result['status']);
+        self::assertSame('tr_recovered', $result['provider_ref']);
+    }
+
     public function testTransferStatusMapsPaidWithNoReversal(): void
     {
         $http = $this->createMock(Client::class);

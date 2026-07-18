@@ -222,6 +222,94 @@ final class PaystackTransferTest extends TestCase
         $this->gateway($http)->transfer($this->destination(), $this->request(), 'py_ref_1');
     }
 
+    public function testRecoverTransferNeverReplaysTheCreate(): void
+    {
+        $http = $this->createMock(Client::class);
+        $http->expects(self::never())->method('post');
+        $http->expects(self::once())
+            ->method('get')
+            ->with(self::stringContains('/transfer/verify/py_ref_1'))
+            ->willReturn($this->responseOf(200, [
+                'status' => true,
+                'message' => 'ok',
+                'data' => [
+                    'reference' => 'py_ref_1',
+                    'transfer_code' => 'TRF_1',
+                    'status' => 'success',
+                    'amount' => 5000,
+                    'transferred_at' => '2024-01-01T00:00:00.000Z',
+                ],
+            ]));
+
+        $result = $this->gateway($http)->recoverTransfer($this->destination(), $this->request(), 'py_ref_1', null);
+
+        self::assertSame(PayoutResult::PAID, $result['status']);
+        self::assertSame('TRF_1', $result['provider_ref']);
+    }
+
+    public function testRecoverTransferDownMapsReversedVerifyToPaid(): void
+    {
+        $http = $this->createMock(Client::class);
+        $http->method('get')->willReturn($this->responseOf(200, [
+            'status' => true,
+            'message' => 'ok',
+            'data' => [
+                'reference' => 'py_ref_1',
+                'transfer_code' => 'TRF_1',
+                'status' => 'reversed',
+                'amount' => 5000,
+            ],
+        ]));
+
+        $result = $this->gateway($http)->recoverTransfer($this->destination(), $this->request(), 'py_ref_1', null);
+
+        // recoverTransfer() speaks transfer()'s five-state PayoutResult
+        // vocabulary -- REVERSED only exists in transferStatus()'s six-state
+        // shape, so a reversed verify still classifies as PAID here (a
+        // later status() call reports the reversal).
+        self::assertSame(PayoutResult::PAID, $result['status']);
+        self::assertSame('TRF_1', $result['provider_ref']);
+    }
+
+    public function testRecoverTransferDownMapsOtpVerifyToPendingWithActionRequired(): void
+    {
+        $http = $this->createMock(Client::class);
+        $http->method('get')->willReturn($this->responseOf(200, [
+            'status' => true,
+            'message' => 'Transfer requires OTP to continue',
+            'data' => [
+                'reference' => 'py_ref_1',
+                'transfer_code' => 'TRF_1',
+                'status' => 'otp',
+                'amount' => 5000,
+            ],
+        ]));
+
+        $result = $this->gateway($http)->recoverTransfer($this->destination(), $this->request(), 'py_ref_1', null);
+
+        self::assertSame(PayoutResult::PENDING, $result['status']);
+        self::assertSame('action_required', $result['failure_code']);
+    }
+
+    public function testRecoverTransferDownMapsFailedVerifyToTerminalFailure(): void
+    {
+        $http = $this->createMock(Client::class);
+        $http->method('get')->willReturn($this->responseOf(200, [
+            'status' => true,
+            'message' => 'ok',
+            'data' => [
+                'reference' => 'py_ref_1',
+                'transfer_code' => 'TRF_1',
+                'status' => 'failed',
+                'amount' => 5000,
+            ],
+        ]));
+
+        $result = $this->gateway($http)->recoverTransfer($this->destination(), $this->request(), 'py_ref_1', null);
+
+        self::assertSame(PayoutResult::TERMINAL_FAILURE, $result['status']);
+    }
+
     public function testTransferStatusMapsPaid(): void
     {
         $http = $this->createMock(Client::class);

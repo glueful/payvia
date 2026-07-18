@@ -47,6 +47,37 @@ interface TransferCapableGateway
     public function transfer(PayoutDestination $destination, PayoutRequest $request, string $providerSafeRef): array;
 
     /**
+     * Recover the outcome of a possibly-completed attempt WITHOUT moving
+     * money twice -- each gateway uses its safe mechanism: Paystack
+     * verifies the persisted provider-safe reference ($providerSafeRef) via
+     * its status-lookup mechanism (never a second `transfer()` call --
+     * Paystack rejects a duplicate reference); Stripe replays the identical
+     * create request under the same Idempotency-Key ($providerSafeRef),
+     * which Stripe de-dupes and returns the original transfer for. This is
+     * the recovery path for the exact shape `transferStatus()` cannot
+     * handle: an unresolved attempt whose provider-assigned $providerRef
+     * was itself never learned (the create's own response was lost).
+     *
+     * Network/timeout/5xx/unparseable responses throw instead of
+     * fabricating a status.
+     *
+     * @return array{
+     *     status: string,
+     *     provider_ref: ?string,
+     *     failure_code: ?string,
+     *     failure_reason: ?string,
+     *     raw: array<string,mixed>
+     * } `status` is one of `PayoutResult`'s constants
+     *   (already classified by the gateway -- do not re-map).
+     */
+    public function recoverTransfer(
+        PayoutDestination $destination,
+        PayoutRequest $request,
+        string $providerSafeRef,
+        ?string $providerRef
+    ): array;
+
+    /**
      * Reconcile the current provider-side state of the transfer identified
      * by $providerSafeRef and, once known, the provider's own $providerRef.
      *

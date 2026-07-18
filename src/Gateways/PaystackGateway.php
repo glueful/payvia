@@ -324,6 +324,42 @@ final class PaystackGateway implements
     }
 
     /**
+     * Recover a possibly-completed transfer WITHOUT moving money twice:
+     * Paystack rejects a duplicate `reference` on transfer(), so recovery
+     * verifies the persisted provider-safe reference ($providerSafeRef) via
+     * {@see transferStatus()} instead of replaying the create. Down-maps
+     * transferStatus()'s six-state PayoutStatusResult vocabulary onto this
+     * method's five-state PayoutResult shape: a settled or reversed verify
+     * both classify as PAID (a later status() call reports the reversal);
+     * pending/otp stays PENDING; failures map straight across.
+     *
+     * @return array<string,mixed>
+     */
+    public function recoverTransfer(
+        PayoutDestination $destination,
+        PayoutRequest $request,
+        string $providerSafeRef,
+        ?string $providerRef
+    ): array {
+        $result = $this->transferStatus($providerSafeRef, $providerRef);
+
+        $status = match ($result['status']) {
+            PayoutStatusResult::PAID, PayoutStatusResult::REVERSED => PayoutResult::PAID,
+            PayoutStatusResult::RETRYABLE_FAILURE => PayoutResult::RETRYABLE_FAILURE,
+            PayoutStatusResult::TERMINAL_FAILURE => PayoutResult::TERMINAL_FAILURE,
+            default => PayoutResult::PENDING,
+        };
+
+        return [
+            'status' => $status,
+            'provider_ref' => $result['provider_ref'],
+            'failure_code' => $result['failure_code'],
+            'failure_reason' => $result['failure_reason'],
+            'raw' => $result['raw'],
+        ];
+    }
+
+    /**
      * Reconcile a transfer's current state via Paystack's verify-by-reference
      * endpoint, using $providerSafeRef (the reference Paystack was given at
      * initiate time) -- Paystack verifies by reference, not by its internal

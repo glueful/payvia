@@ -16,7 +16,26 @@ final class FakeTransferGateway implements PaymentGatewayInterface, TransferCapa
 {
     public int $transferCalls = 0;
     public int $transferStatusCalls = 0;
+    public int $recoverTransferCalls = 0;
     public int $inspectAccountCalls = 0;
+
+    /**
+     * Provider-safe references seen by transfer(), in call order -- lets a
+     * test assert a recovery replay reused the identical idempotency key.
+     *
+     * @var list<string>
+     */
+    public array $transferProviderSafeRefs = [];
+
+    /**
+     * How recoverTransfer() recovers an unresolved (lost-response) attempt:
+     * - 'status' (default): verify-by-reference via transferStatus() --
+     *   mirrors Paystack (never replays transfer()).
+     * - 'replay': replay the identical create via transfer() under the same
+     *   provider-safe reference -- mirrors Stripe's idempotent-replay
+     *   recovery (Stripe de-dupes and returns the original).
+     */
+    public string $recoverTransferMode = 'status';
 
     /** Thrown from transfer() (once set) instead of returning transferResult -- simulates a lost response. */
     public ?\Throwable $transferException = null;
@@ -73,12 +92,26 @@ final class FakeTransferGateway implements PaymentGatewayInterface, TransferCapa
     public function transfer(PayoutDestination $destination, PayoutRequest $request, string $providerSafeRef): array
     {
         $this->transferCalls++;
+        $this->transferProviderSafeRefs[] = $providerSafeRef;
 
         if ($this->transferException !== null) {
             throw $this->transferException;
         }
 
         return $this->transferResult;
+    }
+
+    public function recoverTransfer(
+        PayoutDestination $destination,
+        PayoutRequest $request,
+        string $providerSafeRef,
+        ?string $providerRef
+    ): array {
+        $this->recoverTransferCalls++;
+
+        return $this->recoverTransferMode === 'replay'
+            ? $this->transfer($destination, $request, $providerSafeRef)
+            : $this->transferStatus($providerSafeRef, $providerRef);
     }
 
     public function transferStatus(string $providerSafeRef, ?string $providerRef): array
