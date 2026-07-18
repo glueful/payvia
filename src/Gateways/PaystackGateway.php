@@ -192,7 +192,11 @@ final class PaystackGateway implements
         $payload = json_decode($rawBody, true, flags: JSON_THROW_ON_ERROR);
         $providerType = (string) ($payload['event'] ?? '');
         $data = (array) ($payload['data'] ?? []);
-        $type = $this->normalizeType($providerType, (string) ($data['status'] ?? ''));
+        $type = $this->normalizeType(
+            $providerType,
+            (string) ($data['status'] ?? ''),
+            (string) ($data['resolution'] ?? '')
+        );
         $entityId = $this->entityId($type, $data);
         $normalized = $this->normalizePayload($type, $data);
         $discriminator = $data['updated_at'] ?? $data['paid_at'] ?? $data['created_at'] ?? null;
@@ -684,7 +688,16 @@ final class PaystackGateway implements
         return '';
     }
 
-    private function normalizeType(string $providerType, string $status): string
+    /**
+     * `$resolution` is only meaningful for `charge.dispute.resolve` -- Paystack's Dispute
+     * Resolution API defines it as `{merchant-accepted|declined}`: `merchant-accepted` means
+     * the merchant accepted liability (the chargeback already dispatched at `.create` time
+     * stands, funds stay withdrawn -- no new logical event), while `declined` means the
+     * merchant contested and the dispute resolved in the merchant's favor (funds returned --
+     * a reversal). `charge.dispute.remind` (the periodic reminder) is deliberately left
+     * unrecognized (UNKNOWN) -- it carries no state change.
+     */
+    private function normalizeType(string $providerType, string $status, string $resolution = ''): string
     {
         return match ($providerType) {
             'charge.success' => $status === 'failed' ? EventType::PAYMENT_FAILED : EventType::PAYMENT_SUCCEEDED,
@@ -695,6 +708,10 @@ final class PaystackGateway implements
             'subscription.create' => EventType::SUBSCRIPTION_CREATED,
             'subscription.disable', 'subscription.not_renew' => EventType::SUBSCRIPTION_CANCELED,
             'subscription.expiring_cards' => EventType::SUBSCRIPTION_UPDATED,
+            'charge.dispute.create' => EventType::CHARGEBACK_CREATED,
+            'charge.dispute.resolve' => $resolution === 'declined'
+                ? EventType::CHARGEBACK_REVERSED
+                : EventType::UNKNOWN,
             default => EventType::UNKNOWN,
         };
     }
@@ -718,6 +735,13 @@ final class PaystackGateway implements
             return (string) ($data['invoice_code'] ?? $data['id'] ?? $data['reference'] ?? 'unknown');
         }
 
+        if (EventType::isChargeback($type)) {
+            // The dispute's own id is stable across its create -> resolve lifecycle, so the
+            // "created" and "reversed" logical events for the SAME dispute derive from the
+            // same entityId -- they stay distinct logical keys only because $type differs.
+            return (string) ($data['id'] ?? 'unknown');
+        }
+
         return (string) ($data['reference'] ?? $data['id'] ?? 'unknown');
     }
 
@@ -727,6 +751,10 @@ final class PaystackGateway implements
      */
     private function normalizePayload(string $type, array $data): array
     {
+        if (EventType::isChargeback($type)) {
+            return $this->normalizeDisputePayload($data);
+        }
+
         // Paystack's wire amount is already an integer minor unit; pass it through
         // untouched — never float-divide by 100.
         $amount = isset($data['amount']) ? (int) $data['amount'] : null;
@@ -750,6 +778,50 @@ final class PaystackGateway implements
             'current_period_end' => $data['next_payment_date'] ?? null,
             'cancel_at_period_end' => null,
             'metadata' => isset($data['metadata']) && is_array($data['metadata']) ? $data['metadata'] : null,
+        ], static fn($value): bool => $value !== null);
+    }
+
+    /**
+     * Normalize a Paystack Dispute resource (`charge.dispute.create`/`.resolve`). The
+     * disputed transaction's own id -- not the dispute's own id -- is what
+     * `payments.gateway_transaction_id` was stored as (see the `charge.success` normalization
+     * above, which reads it from the same `transaction.id`-shaped field), so it is read from
+     * the nested `transaction` object rather than the dispute's own top-level `id`.
+     *
+     * @param array<string,mixed> $data
+     * @return array<string,mixed>
+     */
+    private function normalizeDisputePayload(array $data): array
+    {
+        $transaction = (array) ($data['transaction'] ?? []);
+        $amount = isset($data['refund_amount']) && is_numeric($data['refund_amount'])
+            ? (int) $data['refund_amount']
+            : (isset($transaction['amount']) && is_numeric($transaction['amount'])
+                ? (int) $transaction['amount']
+                : null);
+        $disputeId = isset($data['id']) && is_scalar($data['id']) ? (string) $data['id'] : null;
+        $gatewayTransactionId = isset($transaction['id']) && is_scalar($transaction['id'])
+            ? (string) $transaction['id']
+            : null;
+        $currency = isset($data['currency']) && is_scalar($data['currency'])
+            ? (string) $data['currency']
+            : (isset($transaction['currency']) && is_scalar($transaction['currency'])
+                ? (string) $transaction['currency']
+                : null);
+
+        return array_filter([
+            'gateway_transaction_id' => $gatewayTransactionId,
+            'dispute_provider_event_id' => $disputeId,
+            'amount' => $amount,
+            'amount_unit' => $amount !== null ? 'minor' : null,
+            'currency' => $currency,
+            'reason_code' => isset($data['category']) && is_scalar($data['category'])
+                ? (string) $data['category']
+                : null,
+            'status' => isset($data['status']) && is_scalar($data['status']) ? (string) $data['status'] : null,
+            'resolution' => isset($data['resolution']) && is_scalar($data['resolution'])
+                ? (string) $data['resolution']
+                : null,
         ], static fn($value): bool => $value !== null);
     }
 

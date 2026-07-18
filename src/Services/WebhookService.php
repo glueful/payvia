@@ -15,6 +15,16 @@ use Glueful\Extensions\Payvia\GatewayManager;
 final class WebhookService
 {
     /**
+     * WebhookService remains the SOLE durable `provider_events` owner: `$dispatcher` is called
+     * from `dispatch()` only after a delivery has been persisted and atomically claimed for its
+     * logical key, and only `markLogicalDispatched()` (run after `$dispatcher` returns without
+     * throwing) can ever mark a logical dispatch done. `PayviaServiceProvider::makeWebhookService()`
+     * composes `$dispatcher` from two steps run in order: ordinary local `PaymentProviderEvent`
+     * delivery first, then delegation to `Events\ProviderChargebackDispatcher` for recognized
+     * dispute/chargeback types. Neither step is caught here -- any exception from either half
+     * propagates out of `dispatch()` and leaves the logical dispatch unmarked, so the row stays
+     * redispatchable via `relayPending()`.
+     *
      * @param null|callable(PaymentProviderEvent):void $dispatcher
      * @param null|callable(PaymentProviderEventInterface):void $applier
      * @param null|callable(string):void $enqueue

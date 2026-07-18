@@ -460,6 +460,12 @@ final class StripeGateway implements
                 ? EventType::SUBSCRIPTION_PAST_DUE
                 : EventType::SUBSCRIPTION_UPDATED,
             'customer.subscription.deleted' => EventType::SUBSCRIPTION_CANCELED,
+            // A dispute's own `status` becomes `won`/`lost`/`warning_closed` only once closed;
+            // only `won` (funds actually returned) is recognized as a reversal here -- `lost`
+            // and `warning_closed` leave the original chargeback standing, so no new logical
+            // event is produced for them.
+            'charge.dispute.created' => EventType::CHARGEBACK_CREATED,
+            'charge.dispute.closed' => $status === 'won' ? EventType::CHARGEBACK_REVERSED : EventType::UNKNOWN,
             default => EventType::UNKNOWN,
         };
     }
@@ -470,6 +476,10 @@ final class StripeGateway implements
      */
     private function normalizePayload(string $type, array $object): array
     {
+        if (EventType::isChargeback($type)) {
+            return $this->normalizeDisputePayload($object);
+        }
+
         $currency = isset($object['currency']) ? strtoupper((string) $object['currency']) : null;
         $amount = $this->amount($object);
 
@@ -497,6 +507,33 @@ final class StripeGateway implements
         ], static fn($value): bool => $value !== null);
     }
 
+    /**
+     * Normalize a Stripe Dispute object (`charge.dispute.created`/`.closed`). The disputed
+     * charge/PaymentIntent -- not the dispute's own id -- is what `payments.gateway_transaction_id`
+     * was stored as, so `transactionId()`'s existing payment_intent-then-charge priority is
+     * reused as-is (it never falls through to the dispute's own `id` for a real dispute object,
+     * since `charge` is always present).
+     *
+     * @param array<string,mixed> $object
+     * @return array<string,mixed>
+     */
+    private function normalizeDisputePayload(array $object): array
+    {
+        $amount = $this->amount($object);
+        $disputeId = isset($object['id']) && is_scalar($object['id']) ? (string) $object['id'] : null;
+        $reason = isset($object['reason']) && is_scalar($object['reason']) ? (string) $object['reason'] : null;
+
+        return array_filter([
+            'gateway_transaction_id' => $this->transactionId($object),
+            'dispute_provider_event_id' => $disputeId,
+            'amount' => $amount,
+            'amount_unit' => $amount !== null ? 'minor' : null,
+            'currency' => isset($object['currency']) ? strtoupper((string) $object['currency']) : null,
+            'reason_code' => $reason,
+            'status' => isset($object['status']) && is_scalar($object['status']) ? (string) $object['status'] : null,
+        ], static fn($value): bool => $value !== null);
+    }
+
     /** @param array<string,mixed> $object */
     private function entityId(string $type, array $object): string
     {
@@ -505,6 +542,13 @@ final class StripeGateway implements
         }
 
         if (str_starts_with($type, 'invoice.')) {
+            return (string) ($object['id'] ?? 'unknown');
+        }
+
+        if (EventType::isChargeback($type)) {
+            // The dispute's own id is stable across its created -> closed lifecycle, so the
+            // "created" and "closed/reversed" logical events for the SAME dispute derive from
+            // the same entityId -- they stay distinct logical keys only because $type differs.
             return (string) ($object['id'] ?? 'unknown');
         }
 
