@@ -9,6 +9,7 @@ use Glueful\Database\Migrations\MigrationPriority;
 use Glueful\Events\EventService;
 use Glueful\Extensions\Contracts\Payments\PaymentCollector;
 use Glueful\Extensions\Contracts\Payments\PaymentConfirmationHandler;
+use Glueful\Extensions\Contracts\Payments\PayoutCollector;
 use Glueful\Extensions\Contracts\Tenancy\CurrentTenantResolver;
 use Glueful\Extensions\Contracts\Tenancy\TenantContextRunner;
 use Glueful\Extensions\Contracts\Tenancy\TenantTableRegistry;
@@ -37,6 +38,7 @@ use Glueful\Extensions\Payvia\Services\GatewaySubscriptionService;
 use Glueful\Extensions\Payvia\Services\InvoiceService;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Extensions\Payvia\Services\PayviaPaymentCollector;
+use Glueful\Extensions\Payvia\Services\PayviaPayoutCollector;
 use Glueful\Extensions\Payvia\Services\WebhookService;
 use Glueful\Extensions\Payvia\Support\DiagnosticsReport;
 use Glueful\Extensions\Payvia\Tenancy\FailClosedTenantResolver;
@@ -138,6 +140,15 @@ final class PayviaServiceProvider extends ServiceProvider
             ],
             PaymentCollector::class => [
                 'class' => PayviaPaymentCollector::class,
+                'shared' => true,
+                'autowire' => true,
+            ],
+            PayoutTransferRepository::class => [
+                'factory' => [self::class, 'makePayoutTransferRepository'],
+                'shared' => true,
+            ],
+            PayoutCollector::class => [
+                'class' => PayviaPayoutCollector::class,
                 'shared' => true,
                 'autowire' => true,
             ],
@@ -252,6 +263,14 @@ final class PayviaServiceProvider extends ServiceProvider
     public static function makePaymentIntentRepository(ContainerInterface $container): PaymentIntentRepository
     {
         return new PaymentIntentRepository(
+            context: $container->get(ApplicationContext::class),
+            resolver: $container->get(PayviaTenantResolver::class),
+        );
+    }
+
+    public static function makePayoutTransferRepository(ContainerInterface $container): PayoutTransferRepository
+    {
+        return new PayoutTransferRepository(
             context: $container->get(ApplicationContext::class),
             resolver: $container->get(PayviaTenantResolver::class),
         );

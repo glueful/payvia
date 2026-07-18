@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
+use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 use Glueful\Extensions\Payvia\Gateways\StripeGateway;
@@ -78,6 +79,7 @@ final class GatewayManager
         return match ($capability) {
             'webhook' => $driver instanceof WebhookCapableGateway,
             'subscription' => $driver instanceof SubscriptionCapableGateway,
+            'payout' => $driver instanceof TransferCapableGateway,
             default => false,
         };
     }
@@ -97,6 +99,16 @@ final class GatewayManager
         $driver = $this->gateway($gateway);
         if (!$driver instanceof SubscriptionCapableGateway) {
             throw new \RuntimeException("Payvia: gateway '{$gateway}' does not support subscriptions.");
+        }
+
+        return $driver;
+    }
+
+    public function payoutGateway(string $gateway): TransferCapableGateway
+    {
+        $driver = $this->gateway($gateway);
+        if (!$driver instanceof TransferCapableGateway) {
+            throw new \RuntimeException("Payvia: gateway '{$gateway}' does not support payouts.");
         }
 
         return $driver;

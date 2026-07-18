@@ -5,15 +5,27 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Gateways;
 
 use Glueful\Bootstrap\ApplicationContext;
+use Glueful\Extensions\Contracts\Payments\DestinationStatus;
+use Glueful\Extensions\Contracts\Payments\PayoutDestination;
+use Glueful\Extensions\Contracts\Payments\PayoutRequest;
+use Glueful\Extensions\Contracts\Payments\PayoutResult;
+use Glueful\Extensions\Contracts\Payments\PayoutStatusResult;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
+use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
 use Glueful\Http\Client as HttpClient;
+use Glueful\Http\Exceptions\HttpClientException;
+use Glueful\Http\Response\Response as HttpResponse;
 
-final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGateway, SubscriptionCapableGateway
+final class StripeGateway implements
+    PaymentGatewayInterface,
+    WebhookCapableGateway,
+    SubscriptionCapableGateway,
+    TransferCapableGateway
 {
     private ApplicationContext $context;
 
@@ -158,6 +170,217 @@ final class StripeGateway implements PaymentGatewayInterface, WebhookCapableGate
         }
 
         return $response->toArray();
+    }
+
+    /**
+     * Create a Stripe Transfer to $destination->accountRef (a connected-account
+     * id). $providerSafeRef is sent as the Stripe `Idempotency-Key` header --
+     * Stripe accepts the caller's canonical attempt key directly (see
+     * {@see \Glueful\Extensions\Payvia\Support\ProviderSafeReference::forStripe()}).
+     *
+     * Returns a normalized array `{status, provider_ref, failure_code,
+     * failure_reason, raw}` with `status` one of PayoutResult's five
+     * constants. Network/timeout/5xx/unparseable responses throw instead of
+     * fabricating a status.
+     *
+     * @return array<string,mixed>
+     */
+    public function transfer(PayoutDestination $destination, PayoutRequest $request, string $providerSafeRef): array
+    {
+        $secret = $this->secretKey();
+        if ($secret === '') {
+            throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        $options = $this->requestOptions();
+        $options['headers']['Idempotency-Key'] = $providerSafeRef;
+        $options['form_params'] = array_filter([
+            'amount' => $request->amount,
+            'currency' => strtolower($request->currency),
+            'destination' => $destination->accountRef,
+            'description' => $request->reason,
+        ], static fn(mixed $value): bool => $value !== null);
+
+        $response = $this->httpClient->post($this->baseUrl() . '/v1/transfers', $options);
+        [$statusCode, $decoded] = $this->decodeJsonResponse($response, 'Stripe transfer');
+
+        if (isset($decoded['error']) && is_array($decoded['error'])) {
+            return $this->classifyStripeTransferError($statusCode, $decoded['error'], $decoded);
+        }
+
+        $settled = array_key_exists('balance_transaction', $decoded) && $decoded['balance_transaction'] !== null;
+
+        return [
+            'status' => $settled ? PayoutResult::PAID : PayoutResult::PENDING,
+            'provider_ref' => isset($decoded['id']) && is_scalar($decoded['id']) ? (string) $decoded['id'] : null,
+            'failure_code' => null,
+            'failure_reason' => null,
+            'raw' => $decoded,
+        ];
+    }
+
+    /**
+     * Reconcile a transfer's current state. Stripe transfer retrieval is
+     * provider-id-based (GET /v1/transfers/{id}), so $providerRef is
+     * required here -- when it is not yet known (e.g. the create call's
+     * outcome was itself lost), recovering the original response is the
+     * collector's job (replaying the identical create request under the
+     * same Idempotency-Key), not this method's.
+     *
+     * Returns `{status, reversed_amount, provider_ref, failure_code,
+     * failure_reason, raw}` with `status` one of PayoutStatusResult's six
+     * constants. Stripe's own `reversed` boolean distinguishes a full
+     * reversal from a partial one (`amount_reversed` > 0 while `reversed`
+     * stays false) -- see https://stripe.com/docs/api/transfers/object.
+     *
+     * @return array<string,mixed>
+     */
+    public function transferStatus(string $providerSafeRef, ?string $providerRef): array
+    {
+        if ($providerRef === null || $providerRef === '') {
+            throw new \RuntimeException(
+                'Stripe transfer status lookup requires a known provider reference (transfer id); '
+                . 'Stripe transfer retrieval is provider-id-based, not idempotency-key-based.'
+            );
+        }
+
+        $secret = $this->secretKey();
+        if ($secret === '') {
+            throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        $response = $this->httpClient->get(
+            $this->baseUrl() . '/v1/transfers/' . rawurlencode($providerRef),
+            $this->requestOptions()
+        );
+        [$statusCode, $decoded] = $this->decodeJsonResponse($response, 'Stripe transfer status');
+
+        if (isset($decoded['error']) && is_array($decoded['error'])) {
+            $mapped = $this->classifyStripeTransferError($statusCode, $decoded['error'], $decoded);
+
+            return [
+                'status' => $mapped['status'],
+                'reversed_amount' => 0,
+                'provider_ref' => null,
+                'failure_code' => $mapped['failure_code'],
+                'failure_reason' => $mapped['failure_reason'],
+                'raw' => $decoded,
+            ];
+        }
+
+        $reversed = (bool) ($decoded['reversed'] ?? false);
+        $amountReversed = (int) ($decoded['amount_reversed'] ?? 0);
+        $settled = array_key_exists('balance_transaction', $decoded) && $decoded['balance_transaction'] !== null;
+
+        $status = match (true) {
+            $reversed => PayoutStatusResult::REVERSED,
+            !$settled => PayoutStatusResult::PENDING,
+            default => PayoutStatusResult::PAID,
+        };
+
+        return [
+            'status' => $status,
+            'reversed_amount' => $amountReversed,
+            'provider_ref' => isset($decoded['id']) && is_scalar($decoded['id']) ? (string) $decoded['id'] : null,
+            'failure_code' => null,
+            'failure_reason' => null,
+            'raw' => $decoded,
+        ];
+    }
+
+    /**
+     * Inspect a Stripe connected account's payout readiness.
+     * `requirements.disabled_reason` is Stripe's own signal for a
+     * definitively unusable account (e.g. rejected for fraud) -- that maps
+     * to RESTRICTED. `payouts_enabled` false without a disabled_reason means
+     * onboarding/verification is still in progress -- PENDING.
+     *
+     * @return array<string,mixed>
+     */
+    public function inspectAccount(string $accountRef): array
+    {
+        $secret = $this->secretKey();
+        if ($secret === '') {
+            throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        $response = $this->httpClient->get(
+            $this->baseUrl() . '/v1/accounts/' . rawurlencode($accountRef),
+            $this->requestOptions()
+        );
+        [, $decoded] = $this->decodeJsonResponse($response, 'Stripe account inspection');
+
+        if (isset($decoded['error']) && is_array($decoded['error'])) {
+            $error = $decoded['error'];
+            $code = isset($error['code']) && is_scalar($error['code']) ? (string) $error['code'] : 'account_error';
+
+            return ['state' => DestinationStatus::RESTRICTED, 'failure_code' => $code];
+        }
+
+        $requirements = (array) ($decoded['requirements'] ?? []);
+        $disabledReason = isset($requirements['disabled_reason']) && is_scalar($requirements['disabled_reason'])
+            ? (string) $requirements['disabled_reason']
+            : null;
+
+        if ($disabledReason !== null && $disabledReason !== '') {
+            return ['state' => DestinationStatus::RESTRICTED, 'failure_code' => $disabledReason];
+        }
+
+        $payoutsEnabled = (bool) ($decoded['payouts_enabled'] ?? false);
+
+        return [
+            'state' => $payoutsEnabled ? DestinationStatus::READY : DestinationStatus::PENDING,
+            'failure_code' => null,
+        ];
+    }
+
+    /**
+     * Decode a Stripe JSON response without letting a non-2xx status throw
+     * (so a structured error body can still be classified) while a genuine
+     * server error still surfaces as a thrown exception rather than a
+     * fabricated status.
+     *
+     * @return array{0:int,1:array<string,mixed>}
+     */
+    private function decodeJsonResponse(HttpResponse $response, string $context): array
+    {
+        $statusCode = $response->getStatusCode();
+
+        if ($statusCode >= 500) {
+            throw new HttpClientException("{$context} failed with server error {$statusCode}", $statusCode);
+        }
+
+        /** @var array<string,mixed> $decoded */
+        $decoded = $response->getSymfonyResponse()->toArray(false);
+
+        return [$statusCode, $decoded];
+    }
+
+    /**
+     * @param array<string,mixed> $error
+     * @param array<string,mixed> $raw
+     * @return array<string,mixed>
+     */
+    private function classifyStripeTransferError(int $statusCode, array $error, array $raw): array
+    {
+        $code = isset($error['code']) && is_scalar($error['code']) ? (string) $error['code'] : null;
+        $type = isset($error['type']) && is_scalar($error['type']) ? (string) $error['type'] : null;
+        $message = isset($error['message']) && is_scalar($error['message'])
+            ? (string) $error['message']
+            : 'Stripe transfer request failed.';
+
+        // Rate limiting/lock contention are documented-transient; everything
+        // else with a structured Stripe error (bad destination, insufficient
+        // funds that won't self-resolve, etc.) is a definite decline.
+        $retryable = $statusCode === 429 || $type === 'rate_limit_error' || $code === 'lock_timeout';
+
+        return [
+            'status' => $retryable ? PayoutResult::RETRYABLE_FAILURE : PayoutResult::TERMINAL_FAILURE,
+            'provider_ref' => null,
+            'failure_code' => $code ?? $type ?? 'stripe_error',
+            'failure_reason' => $message,
+            'raw' => $raw,
+        ];
     }
 
     /**
