@@ -40,4 +40,26 @@ final class UnresolvedPaymentOwnershipException extends \RuntimeException
             $detail
         ));
     }
+
+    /**
+     * Distinct from {@see forGatewayTransaction()}: this fires when the normalized payload has
+     * no usable `dispute_provider_event_id` at all, so the correlation lookup is never even
+     * attempted -- `gateway_transaction_id` may well be present and perfectly valid. Reusing
+     * `forGatewayTransaction()`'s "could not resolve exactly one payments owner for
+     * gateway_transaction_id X" wording here would misreport a missing dispute id as a failed
+     * ownership lookup against that transaction id, conflating two distinct failure causes.
+     */
+    public static function forMissingDisputeId(string $gateway, ?string $gatewayTransactionId): self
+    {
+        $detail = $gatewayTransactionId !== null && $gatewayTransactionId !== ''
+            ? sprintf('gateway_transaction_id "%s" was present', $gatewayTransactionId)
+            : 'no gateway_transaction_id was present either';
+
+        return new self(sprintf(
+            '%s: no usable dispute_provider_event_id in the normalized provider payload for %s (%s)',
+            self::MARKER,
+            $gateway,
+            $detail
+        ));
+    }
 }

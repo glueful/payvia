@@ -320,14 +320,19 @@ final class PayviaServiceProvider extends ServiceProvider
 
     /**
      * The chargeback dispatcher's own `$dispatch` callable is a THIN wrapper around
-     * `EventService::dispatch()` -- same optional-container-presence guard `makeWebhookService`'s
-     * local `PaymentProviderEvent` dispatcher already uses. Note `EventService::dispatch()`
-     * itself fault-isolates registered listeners (catches + logs, never rethrows), so a
-     * downstream contracts-listener exception never actually reaches this callable in
-     * production; the "propagate on listener failure" contract this composes into
-     * `makeWebhookService()`'s callback is exercised directly at the `ProviderChargebackDispatcher`
-     * boundary (e.g. `findPaymentOwnerByGatewayTxn` failing closed) and by tests injecting a
-     * throwing `$dispatch` callable.
+     * `EventService::dispatchOrFail()` -- same optional-container-presence guard
+     * `makeWebhookService`'s local `PaymentProviderEvent` dispatcher already uses, but STRICT
+     * dispatch rather than the fault-isolated `dispatch()` ordinary events use. Framework
+     * `EventDispatcher::dispatchOrFail()` logs then RETHROWS the original exception from the
+     * first listener that fails, stopping delivery -- so a downstream contracts-listener
+     * exception (e.g. from a subscribed chargeback-ingestion consumer) DOES propagate straight
+     * back out of this callable, through `ProviderChargebackDispatcher::handle()`, out of
+     * `makeWebhookService()`'s composed callback, and out of `WebhookService::dispatch()`,
+     * leaving the triggering `provider_events` row's logical dispatch unmarked. Because listener
+     * delivery is therefore at-least-once, every listener wired to `ProviderChargebackEvent` MUST
+     * be idempotent. Ordinary local `PaymentProviderEvent` delivery in `makeWebhookService()`
+     * deliberately stays on the fault-isolated `dispatch()` path -- only the chargeback event
+     * goes strict.
      */
     public static function makeProviderChargebackDispatcher(
         ContainerInterface $container
@@ -336,7 +341,7 @@ final class PayviaServiceProvider extends ServiceProvider
             $container->get(ProviderCorrelationRepository::class),
             static function (ProviderChargebackEvent $event) use ($container): void {
                 if ($container->has(EventService::class)) {
-                    $container->get(EventService::class)->dispatch($event);
+                    $container->get(EventService::class)->dispatchOrFail($event);
                 }
             }
         );

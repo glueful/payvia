@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia\Events;
 use Glueful\Extensions\Contracts\Payments\PayableReference;
 use Glueful\Extensions\Contracts\Payments\ProviderChargebackEvent;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
+use Glueful\Extensions\Payvia\Exceptions\MalformedChargebackEventException;
 use Glueful\Extensions\Payvia\Exceptions\UnresolvedPaymentOwnershipException;
 use Glueful\Extensions\Payvia\Repositories\ProviderCorrelationRepository;
 
@@ -21,8 +22,10 @@ use Glueful\Extensions\Payvia\Repositories\ProviderCorrelationRepository;
  * been persisted and claimed for this delivery. Ownership is resolved through the same
  * fail-closed, tenantless correlation seam `ProviderCorrelationRepository::
  * findPaymentOwnerByGatewayTxn()` (Task 2) added: exactly one persisted `payments` row located
- * by (gateway, gateway_transaction_id). Zero or multiple matches throw
- * `UnresolvedPaymentOwnershipException` -- since this runs from inside
+ * by (gateway, gateway_transaction_id). A missing dispute id, missing/unresolvable
+ * gateway-transaction ownership (zero or multiple matches), or a malformed non-positive disputed
+ * amount each throw their own distinctly-worded exception (`UnresolvedPaymentOwnershipException`
+ * or `MalformedChargebackEventException`) -- since this runs from inside
  * `WebhookService::dispatch()`'s dispatcher callback, letting that exception (or any failure
  * from the injected `$dispatch` callable) propagate keeps the logical dispatch UNMARKED, so the
  * durable row stays redispatchable instead of a fabricated event ever going out.
@@ -34,7 +37,16 @@ use Glueful\Extensions\Payvia\Repositories\ProviderCorrelationRepository;
  */
 final class ProviderChargebackDispatcher
 {
-    /** @param callable(ProviderChargebackEvent):void $dispatch */
+    /**
+     * The chargeback `$dispatch` callable is dispatched STRICT (in production, a thin wrapper
+     * around `EventService::dispatchOrFail()` -- {@see
+     * \Glueful\Extensions\Payvia\PayviaServiceProvider::makeProviderChargebackDispatcher()}):
+     * unlike ordinary local `PaymentProviderEvent` delivery, a downstream contracts-listener
+     * failure here is NOT fault-isolated -- it rethrows and propagates straight out of `handle()`,
+     * so `WebhookService` never marks the row dispatched on a listener failure.
+     *
+     * @param callable(ProviderChargebackEvent):void $dispatch
+     */
     public function __construct(
         private readonly ProviderCorrelationRepository $correlation,
         private $dispatch,
@@ -51,7 +63,11 @@ final class ProviderChargebackDispatcher
         $gatewayTransactionId = $this->stringOrNull($normalized['gateway_transaction_id'] ?? null);
         $disputeId = $this->stringOrNull($normalized['dispute_provider_event_id'] ?? null);
 
-        $owner = $gatewayTransactionId !== null && $disputeId !== null
+        if ($disputeId === null) {
+            throw UnresolvedPaymentOwnershipException::forMissingDisputeId($event->gateway(), $gatewayTransactionId);
+        }
+
+        $owner = $gatewayTransactionId !== null
             ? $this->correlation->findPaymentOwnerByGatewayTxn($event->gateway(), $gatewayTransactionId)
             : null;
 
@@ -71,6 +87,13 @@ final class ProviderChargebackDispatcher
 
         $isReversal = EventType::isChargebackReversal($event->type());
         $amount = $this->intOrNull($normalized['amount'] ?? null) ?? $payable->amount;
+
+        // A literal `0` (or any non-positive resolved amount) is a malformed/poison event, not a
+        // real dispute -- fail closed HERE rather than letting the contract's own `amount > 0`
+        // invariant throw a generic, unclassified `\InvalidArgumentException` during construction.
+        if ($amount <= 0) {
+            throw MalformedChargebackEventException::forNonPositiveAmount($event->gateway(), $disputeId, $amount);
+        }
 
         $chargeback = new ProviderChargebackEvent(
             tenantUuid: (string) $owner['tenant_uuid'],

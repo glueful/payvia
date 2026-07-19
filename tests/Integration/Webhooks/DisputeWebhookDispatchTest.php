@@ -5,12 +5,16 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Tests\Integration\Webhooks;
 
 use Glueful\Bootstrap\ConfigurationLoader;
+use Glueful\Events\EventDispatcher;
+use Glueful\Events\EventService;
+use Glueful\Events\ListenerProvider;
 use Glueful\Extensions\Contracts\Payments\ProviderChargebackEvent;
 use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentsTable;
 use Glueful\Extensions\Payvia\Database\Migrations\CreateProviderEventsTable;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\PaymentProviderEvent;
 use Glueful\Extensions\Payvia\Events\ProviderChargebackDispatcher;
+use Glueful\Extensions\Payvia\Exceptions\MalformedChargebackEventException;
 use Glueful\Extensions\Payvia\Exceptions\UnresolvedPaymentOwnershipException;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 use Glueful\Extensions\Payvia\Gateways\StripeGateway;
@@ -122,6 +126,43 @@ final class DisputeWebhookDispatchTest extends PayviaTestCase
         };
 
         return new WebhookService($this->context, $manager, $this->events, $dispatcher);
+    }
+
+    /**
+     * Wires a `WebhookService` against a REAL `EventService`/`EventDispatcher`/`ListenerProvider`
+     * stack -- mirroring `PayviaServiceProvider::makeWebhookService()`/
+     * `makeProviderChargebackDispatcher()` exactly: ordinary local `PaymentProviderEvent`
+     * delivery through the real fault-isolated `EventService::dispatch()`, then the chargeback
+     * event through the real STRICT `EventService::dispatchOrFail()`. Unlike `service()` (which
+     * captures dispatched events in plain in-memory arrays, bypassing the framework event bus
+     * entirely), this is what proves the strict-dispatch redelivery guarantee end-to-end rather
+     * than only at the injected-callable boundary.
+     *
+     * @return array{0: WebhookService, 1: EventService}
+     */
+    private function realEventServiceWiredService(): array
+    {
+        $listenerProvider = new ListenerProvider();
+        $eventDispatcher = new EventDispatcher($listenerProvider);
+        $eventService = new EventService($eventDispatcher, $listenerProvider);
+        $this->bind(EventService::class, $eventService);
+
+        $chargebackDispatcher = new ProviderChargebackDispatcher(
+            $this->correlation,
+            static function (ProviderChargebackEvent $event) use ($eventService): void {
+                $eventService->dispatchOrFail($event);
+            }
+        );
+
+        $dispatcher = static function (PaymentProviderEvent $event) use ($eventService, $chargebackDispatcher): void {
+            $eventService->dispatch($event);
+            $chargebackDispatcher->handle($event->event);
+        };
+
+        $manager = new GatewayManager($this->context->getContainer(), $this->context);
+        $service = new WebhookService($this->context, $manager, $this->events, $dispatcher);
+
+        return [$service, $eventService];
     }
 
     private function stripeSignature(string $body): string
@@ -440,7 +481,12 @@ final class DisputeWebhookDispatchTest extends PayviaTestCase
         $stored = $this->events->findByDeliveryKey('stripe', 'evt_dispute_3');
         self::assertNotNull($stored);
         self::assertNotSame('dispatched', $stored['dispatch_status']);
-        self::assertSame('failed', $stored['status'], 'processStored()s own catch marks the row failed/retryable');
+        self::assertSame(
+            'processed',
+            $stored['status'],
+            'processing already succeeded before the ownership resolution failure (a dispatch-phase failure), so'
+                . ' status stays processed -- not failed -- keeping the row discoverable by relayPending()'
+        );
 
         // Redispatchable: once ownership becomes resolvable, replaying the SAME stored row
         // succeeds and dispatches exactly one chargeback. The first attempt's logical claim
@@ -501,64 +547,78 @@ final class DisputeWebhookDispatchTest extends PayviaTestCase
         self::assertSame([], $this->chargebacks);
     }
 
-    public function testContractsListenerFailureLeavesLogicalDispatchUnmarkedThenRelayPendingRedeliversOnce(): void
+    /**
+     * THE key redelivery test: drives the REAL `EventService::dispatchOrFail()` (never an
+     * injected callable), reusing `PayviaServiceProvider`'s exact production wiring via
+     * `realEventServiceWiredService()`. A real listener throws on its first invocation and
+     * succeeds on its second. `ingest()` (not a directly-seeded row) must propagate that first
+     * failure -- proving the strict rethrow travels all the way from the framework
+     * `EventDispatcher` through `ProviderChargebackDispatcher` and `WebhookService::dispatch()`
+     * -- leaving the durable row undispatched, still `status='processed'` (only DISPATCH failed,
+     * not processing), so `relayPending()` can discover and redeliver it. The retry succeeds and
+     * the row is marked dispatched exactly once; the listener is retried but only appends once.
+     */
+    public function testRealEventServiceStrictDispatchRedeliversAfterAListenerFailureThenSucceeds(): void
     {
         $this->insertPayment();
-
-        // Seed a 'processed' provider_events row directly (mirroring RelayEventsTest's
-        // pattern), shaped exactly as StripeGateway::parseWebhookEvent() would have produced
-        // for a `charge.dispute.created` delivery.
-        $uuid = $this->events->insertReceived([
-            'gateway' => 'stripe',
-            'source' => 'webhook',
-            'provider_event_id' => 'evt_dispute_5',
-            'delivery_key' => 'evt_dispute_5',
-            'logical_event_key' => 'chargeback.created:dp_5',
-            'type' => EventType::CHARGEBACK_CREATED,
-            'signature_valid' => true,
-            'normalized_payload' => [
-                'gateway_transaction_id' => 'pi_123',
-                'dispute_provider_event_id' => 'dp_5',
-                'amount' => 5000,
-                'amount_unit' => 'minor',
-                'currency' => 'USD',
-                'reason_code' => 'fraudulent',
-            ],
-            'raw_payload' => [],
-        ]);
-        self::assertNotNull($uuid);
-        $this->events->markProcessed($uuid);
+        [$service, $eventService] = $this->realEventServiceWiredService();
 
         $attempts = 0;
-        $this->chargebackDispatch = function (ProviderChargebackEvent $event) use (&$attempts): void {
-            $attempts++;
-            if ($attempts === 1) {
-                throw new \RuntimeException('simulated contracts-listener failure');
+        /** @var list<ProviderChargebackEvent> $delivered */
+        $delivered = [];
+        $eventService->addListener(
+            ProviderChargebackEvent::class,
+            function (ProviderChargebackEvent $event) use (&$attempts, &$delivered): void {
+                $attempts++;
+                if ($attempts === 1) {
+                    throw new \RuntimeException('simulated real EventService listener failure');
+                }
+                $delivered[] = $event;
             }
-            $this->chargebacks[] = $event;
-        };
+        );
 
-        $service = $this->service();
+        $body = json_encode([
+            'id' => 'evt_dispute_real',
+            'type' => 'charge.dispute.created',
+            'created' => 1700000000,
+            'data' => [
+                'object' => [
+                    'id' => 'dp_real',
+                    'object' => 'dispute',
+                    'amount' => 5000,
+                    'currency' => 'usd',
+                    'reason' => 'fraudulent',
+                    'status' => 'needs_response',
+                    'payment_intent' => 'pi_123',
+                    'charge' => 'ch_real',
+                ],
+            ],
+        ], JSON_THROW_ON_ERROR);
 
         try {
-            $service->relayPending();
-            self::fail('Expected the simulated listener failure to propagate out of relayPending()');
+            $service->ingest('stripe', $body, ['Stripe-Signature' => $this->stripeSignature($body)]);
+            self::fail('Expected the real EventService::dispatchOrFail() listener failure to propagate');
         } catch (\RuntimeException $e) {
-            self::assertSame('simulated contracts-listener failure', $e->getMessage());
+            self::assertSame('simulated real EventService listener failure', $e->getMessage());
         }
 
-        // Local delivery already happened on this (failed) attempt.
-        self::assertCount(1, $this->delivered);
-        self::assertSame([], $this->chargebacks);
+        self::assertSame(1, $attempts);
+        self::assertSame([], $delivered);
 
-        $afterFailure = $this->events->findByUuid($uuid);
-        self::assertNotNull($afterFailure);
-        self::assertNotSame('dispatched', $afterFailure['dispatch_status']);
+        $stored = $this->events->findByDeliveryKey('stripe', 'evt_dispute_real');
+        self::assertNotNull($stored);
+        self::assertNotSame('dispatched', $stored['dispatch_status']);
+        self::assertSame(
+            'processed',
+            $stored['status'],
+            'processing succeeded; only strict-dispatch delivery failed, so the row must stay'
+                . ' discoverable by relayPending()'
+        );
 
         // Backdate the claim so a staleSeconds:0 retry deterministically reclaims it, rather
         // than depending on real wall-clock elapsing between these two calls.
         $this->connection->table('provider_events')
-            ->where(['uuid' => $uuid])
+            ->where(['uuid' => $stored['uuid']])
             ->update([
                 'dispatch_claimed_at' => $this->connection->getDriver()
                     ->formatDateTime((new \DateTimeImmutable('-2 seconds'))->format('Y-m-d H:i:s')),
@@ -567,16 +627,253 @@ final class DisputeWebhookDispatchTest extends PayviaTestCase
         $count = $service->relayPending(staleSeconds: 0);
 
         self::assertSame(1, $count);
-        self::assertCount(2, $this->delivered, 'local delivery reruns on each full retry of the callback');
-        self::assertCount(1, $this->chargebacks, 'the chargeback dispatches exactly once, on the successful retry');
+        self::assertSame(2, $attempts, 'the listener is retried on redelivery');
+        self::assertCount(1, $delivered, 'the chargeback is delivered exactly once, on the successful retry');
 
-        $afterSuccess = $this->events->findByUuid($uuid);
+        $afterSuccess = $this->events->findByUuid((string) $stored['uuid']);
         self::assertNotNull($afterSuccess);
         self::assertSame('dispatched', $afterSuccess['dispatch_status']);
 
         // A further relay finds nothing left to do.
         self::assertSame(0, $service->relayPending(staleSeconds: 0));
+        self::assertCount(1, $delivered);
+    }
+
+    /**
+     * I-1: a permanently-unresolvable poison row must not starve every other due row behind it
+     * in the same `relayPending()` sweep. The poison row (received first, so the sweep visits it
+     * first) throws `UnresolvedPaymentOwnershipException` on every attempt; the healthy row
+     * (received second) must still dispatch in the SAME sweep call.
+     */
+    public function testRelayPendingIsolatesAPoisonRowFromAHealthyRowInTheSameSweep(): void
+    {
+        $this->insertPayment();
+        $driver = $this->connection->getDriver();
+        $now = new \DateTimeImmutable();
+
+        $poisonUuid = $this->events->insertReceived([
+            'gateway' => 'stripe',
+            'source' => 'webhook',
+            'provider_event_id' => 'evt_poison',
+            'delivery_key' => 'evt_poison',
+            'logical_event_key' => 'chargeback.created:dp_poison',
+            'type' => EventType::CHARGEBACK_CREATED,
+            'signature_valid' => true,
+            'normalized_payload' => [
+                // No payments row will ever match this gateway_transaction_id in this test.
+                'gateway_transaction_id' => 'pi_never_exists',
+                'dispute_provider_event_id' => 'dp_poison',
+                'amount' => 4000,
+                'amount_unit' => 'minor',
+                'currency' => 'USD',
+                'reason_code' => 'fraudulent',
+            ],
+            'raw_payload' => [],
+            'received_at' => $driver->formatDateTime($now->modify('-10 seconds')->format('Y-m-d H:i:s')),
+        ]);
+        self::assertNotNull($poisonUuid);
+        $this->events->markProcessed($poisonUuid);
+
+        $healthyUuid = $this->events->insertReceived([
+            'gateway' => 'stripe',
+            'source' => 'webhook',
+            'provider_event_id' => 'evt_healthy',
+            'delivery_key' => 'evt_healthy',
+            'logical_event_key' => 'chargeback.created:dp_healthy',
+            'type' => EventType::CHARGEBACK_CREATED,
+            'signature_valid' => true,
+            'normalized_payload' => [
+                'gateway_transaction_id' => 'pi_123',
+                'dispute_provider_event_id' => 'dp_healthy',
+                'amount' => 5000,
+                'amount_unit' => 'minor',
+                'currency' => 'USD',
+                'reason_code' => 'fraudulent',
+            ],
+            'raw_payload' => [],
+            'received_at' => $driver->formatDateTime($now->format('Y-m-d H:i:s')),
+        ]);
+        self::assertNotNull($healthyUuid);
+        $this->events->markProcessed($healthyUuid);
+
+        $count = $this->service()->relayPending();
+
+        self::assertSame(1, $count, 'only the healthy row dispatches; the poison row must not abort the sweep');
         self::assertCount(1, $this->chargebacks);
+        self::assertSame('dp_healthy', $this->chargebacks[0]->providerEventId);
+
+        $poisonRow = $this->events->findByUuid($poisonUuid);
+        self::assertNotNull($poisonRow);
+        self::assertNotSame('dispatched', $poisonRow['dispatch_status'], 'the poison row stays retryable');
+
+        $healthyRow = $this->events->findByUuid($healthyUuid);
+        self::assertNotNull($healthyRow);
+        self::assertSame('dispatched', $healthyRow['dispatch_status']);
+    }
+
+    /**
+     * M-1: a literal `0` disputed amount bypasses the `?? $payable->amount` fallback (`0` is not
+     * `null`). It must fail closed as a classified `MalformedChargebackEventException` BEFORE
+     * ever constructing the contracts event -- never dispatching a fabricated event, and never
+     * surfacing as an unhandled contract `\InvalidArgumentException`.
+     */
+    public function testZeroDisputedAmountFailsClosedWithoutDispatchingAFabricatedEvent(): void
+    {
+        $this->insertPayment();
+
+        $body = json_encode([
+            'id' => 'evt_dispute_zero',
+            'type' => 'charge.dispute.created',
+            'created' => 1700000000,
+            'data' => [
+                'object' => [
+                    'id' => 'dp_zero',
+                    'object' => 'dispute',
+                    'amount' => 0,
+                    'currency' => 'usd',
+                    'reason' => 'fraudulent',
+                    'status' => 'needs_response',
+                    'payment_intent' => 'pi_123',
+                    'charge' => 'ch_zero',
+                ],
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        try {
+            $this->service()->ingest('stripe', $body, ['Stripe-Signature' => $this->stripeSignature($body)]);
+            self::fail('Expected MalformedChargebackEventException to propagate');
+        } catch (MalformedChargebackEventException $e) {
+            self::assertStringContainsString(MalformedChargebackEventException::MARKER, $e->getMessage());
+        }
+
+        self::assertCount(1, $this->delivered, 'ordinary local delivery must still happen before the malformed check');
+        self::assertSame([], $this->chargebacks, 'no fabricated zero-amount event may ever be dispatched');
+
+        $stored = $this->events->findByDeliveryKey('stripe', 'evt_dispute_zero');
+        self::assertNotNull($stored);
+        self::assertNotSame('dispatched', $stored['dispatch_status']);
+        self::assertSame(
+            'processed',
+            $stored['status'],
+            'processing succeeded; only the malformed disputed amount blocked dispatch'
+        );
+    }
+
+    /**
+     * M-2: a normalized_payload missing ONLY `dispute_provider_event_id` (with a perfectly
+     * resolvable `gateway_transaction_id`) must not be misreported as a failed ownership lookup
+     * against that gateway_transaction_id -- the correlation query is never even attempted.
+     */
+    public function testMissingDisputeIdReportsDistinctlyFromAnUnresolvedGatewayTransaction(): void
+    {
+        $this->insertPayment();
+
+        $uuid = $this->events->insertReceived([
+            'gateway' => 'stripe',
+            'source' => 'webhook',
+            'provider_event_id' => 'evt_missing_dispute_id',
+            'delivery_key' => 'evt_missing_dispute_id',
+            'logical_event_key' => 'chargeback.created:missing',
+            'type' => EventType::CHARGEBACK_CREATED,
+            'signature_valid' => true,
+            'normalized_payload' => [
+                'gateway_transaction_id' => 'pi_123',
+                'amount' => 5000,
+                'amount_unit' => 'minor',
+                'currency' => 'USD',
+            ],
+            'raw_payload' => [],
+        ]);
+        self::assertNotNull($uuid);
+        $this->events->markProcessed($uuid);
+
+        try {
+            $this->service()->processStored($uuid);
+            self::fail('Expected UnresolvedPaymentOwnershipException to propagate');
+        } catch (UnresolvedPaymentOwnershipException $e) {
+            self::assertStringContainsString(UnresolvedPaymentOwnershipException::MARKER, $e->getMessage());
+            self::assertStringContainsString('dispute_provider_event_id', $e->getMessage());
+            self::assertStringContainsString(
+                'pi_123',
+                $e->getMessage(),
+                'must still name the present gateway_transaction_id'
+            );
+            self::assertStringNotContainsString(
+                'could not resolve exactly one payments owner',
+                $e->getMessage(),
+                'a missing dispute id must not be misreported as a failed ownership lookup'
+            );
+        }
+
+        self::assertSame([], $this->chargebacks);
+    }
+
+    /**
+     * Regression guard: ordinary local `PaymentProviderEvent` delivery MUST stay on the
+     * fault-isolated `EventService::dispatch()` path -- only the chargeback event goes strict. A
+     * throwing non-chargeback listener must never abort ingestion, and the chargeback branch
+     * must still run afterward.
+     */
+    public function testOrdinaryLocalDeliveryStaysFaultIsolatedWhenANonChargebackListenerThrows(): void
+    {
+        $this->insertPayment();
+        [$service, $eventService] = $this->realEventServiceWiredService();
+
+        $localAttempts = 0;
+        $eventService->addListener(
+            PaymentProviderEvent::class,
+            function (PaymentProviderEvent $event) use (&$localAttempts): void {
+                $localAttempts++;
+                throw new \RuntimeException('a broken ordinary local listener must never abort dispatch');
+            }
+        );
+
+        $chargebackAttempts = 0;
+        /** @var list<ProviderChargebackEvent> $delivered */
+        $delivered = [];
+        $eventService->addListener(
+            ProviderChargebackEvent::class,
+            function (ProviderChargebackEvent $event) use (&$chargebackAttempts, &$delivered): void {
+                $chargebackAttempts++;
+                $delivered[] = $event;
+            }
+        );
+
+        $body = json_encode([
+            'id' => 'evt_dispute_fault_isolated',
+            'type' => 'charge.dispute.created',
+            'created' => 1700000000,
+            'data' => [
+                'object' => [
+                    'id' => 'dp_fault_isolated',
+                    'object' => 'dispute',
+                    'amount' => 5000,
+                    'currency' => 'usd',
+                    'reason' => 'fraudulent',
+                    'status' => 'needs_response',
+                    'payment_intent' => 'pi_123',
+                    'charge' => 'ch_fault_isolated',
+                ],
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $result = $service->ingest('stripe', $body, ['Stripe-Signature' => $this->stripeSignature($body)]);
+
+        self::assertTrue(
+            $result->accepted,
+            'a fault-isolated local listener failure must never surface as an ingest failure'
+        );
+        self::assertSame(1, $localAttempts);
+        self::assertSame(
+            1,
+            $chargebackAttempts,
+            'the chargeback dispatch must still run after the fault-isolated local delivery'
+        );
+        self::assertCount(1, $delivered);
+
+        $stored = $this->events->findByDeliveryKey('stripe', 'evt_dispute_fault_isolated');
+        self::assertNotNull($stored);
+        self::assertSame('dispatched', $stored['dispatch_status']);
     }
 
     public function testNoCommerceClassIsReferencedAnywhereInTheDisputeDispatchPath(): void
@@ -586,6 +883,7 @@ final class DisputeWebhookDispatchTest extends PayviaTestCase
                 __DIR__ . '/../../../src/Events/EventType.php',
                 __DIR__ . '/../../../src/Events/ProviderChargebackDispatcher.php',
                 __DIR__ . '/../../../src/Exceptions/UnresolvedPaymentOwnershipException.php',
+                __DIR__ . '/../../../src/Exceptions/MalformedChargebackEventException.php',
                 __DIR__ . '/../../../src/Gateways/StripeGateway.php',
                 __DIR__ . '/../../../src/Gateways/PaystackGateway.php',
                 __DIR__ . '/../../../src/Services/WebhookService.php',

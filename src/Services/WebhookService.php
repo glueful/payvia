@@ -92,6 +92,20 @@ final class WebhookService
         return $uuid;
     }
 
+    /**
+     * The applier (domain-effect application, e.g. `GatewaySubscriptionService::
+     * applyProviderEvent()`) and the dispatch (delivery to local + contracts listeners) phases
+     * are deliberately isolated from each other: an applier failure means processing never
+     * completed, so the row is marked `failed` and a full retry (re-apply + re-dispatch) is
+     * correct. A DISPATCH-phase failure -- e.g. a strict-dispatch chargeback listener throwing --
+     * happens strictly AFTER `markProcessed()`, meaning processing/application already
+     * succeeded; downgrading the row's `status` back to `failed` there would hide it from
+     * `relayPending()`'s `findDispatchable()` query (`status = 'processed'` only), silently
+     * breaking the "a listener failure leaves the row retryable and relayPending() redelivers
+     * exactly once on success" guarantee. So a dispatch failure is left uncaught here: the row
+     * stays `status='processed'`, only `dispatch_status` remains un-dispatched, and the
+     * exception still propagates to the caller (e.g. `ingest()`).
+     */
     public function processStored(string $uuid): void
     {
         $row = $this->events->findByUuid($uuid);
@@ -110,20 +124,37 @@ final class WebhookService
             if ($this->applier !== null) {
                 ($this->applier)($event);
             }
-            $this->events->markProcessed($uuid);
-            $this->dispatch($event, $uuid);
         } catch (\Throwable $e) {
             $this->events->markFailed($uuid, $e->getMessage());
             throw $e;
         }
+
+        $this->events->markProcessed($uuid);
+        $this->dispatch($event, $uuid);
     }
 
+    /**
+     * Independent per row: a throwing dispatch (e.g. an unresolvable payment owner, or -- since
+     * chargeback dispatch is strict -- a still-failing contracts listener) is logged and
+     * skipped rather than allowed to abort the sweep. The failing row is simply left unclaimed/
+     * unmarked (retryable on a later sweep); every other due row in this same call still gets
+     * its chance to dispatch. Return/count semantics are unchanged: only rows that actually
+     * dispatched on THIS call count towards the returned total.
+     */
     public function relayPending(int $limit = 100, int $staleSeconds = 300): int
     {
         $count = 0;
         foreach ($this->events->findDispatchable($limit, $staleSeconds) as $row) {
-            if ($this->dispatch($this->reconstruct($row), (string) $row['uuid'], $staleSeconds)) {
-                $count++;
+            try {
+                if ($this->dispatch($this->reconstruct($row), (string) $row['uuid'], $staleSeconds)) {
+                    $count++;
+                }
+            } catch (\Throwable $e) {
+                error_log(sprintf(
+                    '[Payvia] relayPending(): dispatch failed for provider_events uuid=%s: %s',
+                    (string) ($row['uuid'] ?? ''),
+                    $e->getMessage()
+                ));
             }
         }
 
