@@ -13,8 +13,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PayPal/Braintree gateway driver.
 - Adyen gateway driver.
 - Checkout.com gateway driver.
-- Optional marketplace/split-payment capability interfaces.
-- Optional refunds/disputes capability interfaces.
+- Optional split-payment (split-at-charge) capability interface — marketplace *payouts* landed in 2.1.0 via `TransferCapableGateway`; splitting a single charge across recipients at capture time is still pending.
+- Optional `RefundCollector` gateway binding — dispute ingestion landed in 2.1.0; refunds still fall back to commerce's manual path.
+
+## [2.1.0] - 2026-07-20 — Provider Payouts & Dispute Ingestion
+
+Payvia gains an outbound payout surface and inbound dispute ingestion, both through the neutral
+`glueful/extension-contracts` payment ports — so a consuming application (e.g. the commerce
+marketplace) settles seller payouts and reacts to chargebacks without any concrete-provider
+reference. Requires framework 1.71.0 (strict `dispatchOrFail` event delivery) and
+extension-contracts 1.5.0 (the `PayoutCollector` port and `ProviderChargebackEvent`). One new
+migration; no new env vars or config keys.
+
+### Added
+- **Provider payouts** — `PayviaPayoutCollector` binds the contracts `PayoutCollector` port, backed by
+  a `TransferCapableGateway` capability arm (`transfer()`, `recoverTransfer()`, `transferStatus()`,
+  `inspectAccount()`) implemented by `StripeGateway` and `PaystackGateway`. Payouts are recorded in a
+  new `payvia_transfers` table via `PayoutTransferRepository` with a pre-I/O pending row keyed by the
+  idempotency key, so a transfer is issued exactly once even across retries.
+- **Lost-response recovery** — `recoverTransfer()` reconciles a transfer whose provider response was
+  lost mid-flight without double-paying: Stripe replays under the idempotency key (the provider
+  de-duplicates), Paystack verifies by reference. A destination that can't be resolved fails closed.
+- **Dispute ingestion** — `ProviderChargebackDispatcher` turns a provider dispute/chargeback webhook
+  into a neutral contracts `ProviderChargebackEvent` (chargeback and reversal kinds), correlating it
+  to the owning payment by gateway transaction id. Correlation is fail-closed and row-authoritative:
+  an ambiguous or unresolved owner raises `UnresolvedPaymentOwnershipException` rather than guessing,
+  and a malformed webhook raises `MalformedChargebackEventException`.
+- **Guaranteed delivery** — chargeback events dispatch strictly via the framework 1.71.0
+  `EventService::dispatchOrFail()` seam: a listener failure rethrows so the webhook can be retried,
+  and stored-event redelivery is isolated per row so one poison event never starves the relay.
+  Ordinary (non-chargeback) Payvia events keep their existing fault-isolated dispatch.
+
+### Migrations
+- **`008_CreatePayviaTransfersTable`** — the `payvia_transfers` ledger (idempotency-keyed, with a
+  null-exempt unique on the idempotency key across MySQL, PostgreSQL, and SQLite). Run
+  `php glueful migrate:run` after upgrading; the table is only written when a `TransferCapableGateway`
+  payout is actually issued.
 
 ## [2.0.0] - 2026-07-16 — Money & Tenancy Hardening
 

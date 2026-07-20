@@ -14,6 +14,11 @@ final class EventType
     public const SUBSCRIPTION_UPDATED = 'subscription.updated';
     public const SUBSCRIPTION_PAST_DUE = 'subscription.past_due';
     public const SUBSCRIPTION_CANCELED = 'subscription.canceled';
+    // A dispute/chargeback webhook and its closing reversal/won counterpart are each a
+    // one-time occurrence for a given provider dispute id (the entityId gateways derive for
+    // these types) -- mirrored below into IMMUTABLE alongside the other one-shot types.
+    public const CHARGEBACK_CREATED = 'chargeback.created';
+    public const CHARGEBACK_REVERSED = 'chargeback.reversed';
     public const UNKNOWN = 'unknown';
 
     /** @var list<string> */
@@ -23,6 +28,8 @@ final class EventType
         self::INVOICE_PAYMENT_FAILED,
         self::SUBSCRIPTION_CREATED,
         self::SUBSCRIPTION_CANCELED,
+        self::CHARGEBACK_CREATED,
+        self::CHARGEBACK_REVERSED,
     ];
 
     /** @var list<string> */
@@ -45,5 +52,19 @@ final class EventType
     {
         return in_array($type, self::IMMUTABLE, true)
             || in_array($type, self::MUTABLE, true);
+    }
+
+    /**
+     * True for either half of the dispute lifecycle a gateway can recognize: the initial
+     * chargeback report, or its closing reversal/won counterpart.
+     */
+    public static function isChargeback(string $type): bool
+    {
+        return $type === self::CHARGEBACK_CREATED || $type === self::CHARGEBACK_REVERSED;
+    }
+
+    public static function isChargebackReversal(string $type): bool
+    {
+        return $type === self::CHARGEBACK_REVERSED;
     }
 }

@@ -74,6 +74,53 @@ final class ProviderCorrelationRepository extends BaseRepository
         return $row;
     }
 
+    /**
+     * Correlate a provider dispute/webhook payload to its persisted payment OWNER.
+     *
+     * Runs through the same tenantless `system()` seam as the subscription/billing-plan
+     * correlations above -- a dispute webhook arrives with no request tenant bound, so this
+     * cannot be an interactive tenant-scoped read. Fails closed on ambiguity: `gateway` +
+     * `gateway_transaction_id` is not a persisted-unique key (unlike `reference`), so if the
+     * bounded lookup returns anything other than exactly one row -- zero matches, or multiple
+     * rows even when owned by different tenants -- this returns null rather than ever guessing
+     * an owner.
+     *
+     * @return array{
+     *     tenant_uuid: string,
+     *     reference: string,
+     *     payable_type: mixed,
+     *     payable_id: mixed,
+     *     amount: int,
+     *     currency: string
+     * }|null
+     */
+    public function findPaymentOwnerByGatewayTxn(string $gateway, string $gatewayTransactionId): ?array
+    {
+        if ($gateway === '' || $gatewayTransactionId === '') {
+            return null;
+        }
+
+        /** @var list<array<string,mixed>> $rows */
+        $rows = $this->system(fn (): mixed => $this->db->table('payments')
+            ->where(['gateway' => $gateway, 'gateway_transaction_id' => $gatewayTransactionId])
+            ->get());
+
+        if (count($rows) !== 1) {
+            return null;
+        }
+
+        $row = $rows[0];
+
+        return [
+            'tenant_uuid' => (string) $row['tenant_uuid'],
+            'reference' => (string) $row['reference'],
+            'payable_type' => $row['payable_type'],
+            'payable_id' => $row['payable_id'],
+            'amount' => (int) $row['amount'],
+            'currency' => (string) $row['currency'],
+        ];
+    }
+
     /** @return array<string,mixed>|null */
     public function findBillingPlanByUuid(string $uuid): ?array
     {

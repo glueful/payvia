@@ -150,6 +150,67 @@ final class ProviderEventTest extends TestCase
         self::assertNotSame($first->logicalEventKey(), $second->logicalEventKey());
     }
 
+    public function testChargebackCreatedIsImmutableAndLogicalKeyIsTypeColonDisputeId(): void
+    {
+        self::assertTrue(EventType::isImmutable(EventType::CHARGEBACK_CREATED));
+
+        $event = ProviderEvent::create(
+            gateway: 'stripe',
+            type: EventType::CHARGEBACK_CREATED,
+            providerEventId: 'evt_1',
+            deliveryKey: 'evt_1',
+            entityId: 'dp_1',
+            occurredAt: new \DateTimeImmutable('2026-07-01T00:00:00Z'),
+            normalized: ['dispute_provider_event_id' => 'dp_1'],
+            raw: [],
+        );
+
+        self::assertSame('chargeback.created:dp_1', $event->logicalEventKey());
+    }
+
+    public function testChargebackReversedIsImmutableAndSharesEntityWithDistinctLogicalKey(): void
+    {
+        self::assertTrue(EventType::isImmutable(EventType::CHARGEBACK_REVERSED));
+
+        $created = ProviderEvent::create(
+            'stripe',
+            EventType::CHARGEBACK_CREATED,
+            'evt_1',
+            'evt_1',
+            'dp_1',
+            new \DateTimeImmutable(),
+            [],
+            []
+        );
+        $reversed = ProviderEvent::create(
+            'stripe',
+            EventType::CHARGEBACK_REVERSED,
+            'evt_2',
+            'evt_2',
+            'dp_1',
+            new \DateTimeImmutable(),
+            [],
+            []
+        );
+
+        // Same dispute (entityId), but the two lifecycle events are DISTINCT logical events --
+        // each still dispatches exactly once, independent of the other.
+        self::assertSame('chargeback.created:dp_1', $created->logicalEventKey());
+        self::assertSame('chargeback.reversed:dp_1', $reversed->logicalEventKey());
+        self::assertNotSame($created->logicalEventKey(), $reversed->logicalEventKey());
+    }
+
+    public function testIsChargebackHelpersClassifyOnlyChargebackTypes(): void
+    {
+        self::assertTrue(EventType::isChargeback(EventType::CHARGEBACK_CREATED));
+        self::assertTrue(EventType::isChargeback(EventType::CHARGEBACK_REVERSED));
+        self::assertFalse(EventType::isChargeback(EventType::PAYMENT_SUCCEEDED));
+        self::assertFalse(EventType::isChargeback(EventType::UNKNOWN));
+
+        self::assertTrue(EventType::isChargebackReversal(EventType::CHARGEBACK_REVERSED));
+        self::assertFalse(EventType::isChargebackReversal(EventType::CHARGEBACK_CREATED));
+    }
+
     public function testBaseEventCarriesTypedVo(): void
     {
         $vo = ProviderEvent::create(

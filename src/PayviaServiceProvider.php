@@ -9,6 +9,8 @@ use Glueful\Database\Migrations\MigrationPriority;
 use Glueful\Events\EventService;
 use Glueful\Extensions\Contracts\Payments\PaymentCollector;
 use Glueful\Extensions\Contracts\Payments\PaymentConfirmationHandler;
+use Glueful\Extensions\Contracts\Payments\PayoutCollector;
+use Glueful\Extensions\Contracts\Payments\ProviderChargebackEvent;
 use Glueful\Extensions\Contracts\Tenancy\CurrentTenantResolver;
 use Glueful\Extensions\Contracts\Tenancy\TenantContextRunner;
 use Glueful\Extensions\Contracts\Tenancy\TenantTableRegistry;
@@ -22,6 +24,7 @@ use Glueful\Extensions\Payvia\Controllers\InvoiceController;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
 use Glueful\Extensions\Payvia\Controllers\WebhookController;
 use Glueful\Extensions\Payvia\Events\PaymentProviderEvent;
+use Glueful\Extensions\Payvia\Events\ProviderChargebackDispatcher;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 use Glueful\Extensions\Payvia\Gateways\StripeGateway;
 use Glueful\Extensions\Payvia\Jobs\ProcessWebhookJob;
@@ -37,6 +40,7 @@ use Glueful\Extensions\Payvia\Services\GatewaySubscriptionService;
 use Glueful\Extensions\Payvia\Services\InvoiceService;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Extensions\Payvia\Services\PayviaPaymentCollector;
+use Glueful\Extensions\Payvia\Services\PayviaPayoutCollector;
 use Glueful\Extensions\Payvia\Services\WebhookService;
 use Glueful\Extensions\Payvia\Support\DiagnosticsReport;
 use Glueful\Extensions\Payvia\Tenancy\FailClosedTenantResolver;
@@ -141,8 +145,21 @@ final class PayviaServiceProvider extends ServiceProvider
                 'shared' => true,
                 'autowire' => true,
             ],
+            PayoutTransferRepository::class => [
+                'factory' => [self::class, 'makePayoutTransferRepository'],
+                'shared' => true,
+            ],
+            PayoutCollector::class => [
+                'class' => PayviaPayoutCollector::class,
+                'shared' => true,
+                'autowire' => true,
+            ],
             ConfirmationDispatcher::class => [
                 'factory' => [self::class, 'makeConfirmationDispatcher'],
+                'shared' => true,
+            ],
+            ProviderChargebackDispatcher::class => [
+                'factory' => [self::class, 'makeProviderChargebackDispatcher'],
                 'shared' => true,
             ],
             PaymentService::class => [
@@ -257,6 +274,14 @@ final class PayviaServiceProvider extends ServiceProvider
         );
     }
 
+    public static function makePayoutTransferRepository(ContainerInterface $container): PayoutTransferRepository
+    {
+        return new PayoutTransferRepository(
+            context: $container->get(ApplicationContext::class),
+            resolver: $container->get(PayviaTenantResolver::class),
+        );
+    }
+
     /**
      * `tenancyResolverPresent` mirrors the exact condition `makePayviaTenantResolver()` uses to
      * decide sentinel-vs-fail-closed: whether the HOST has bound the shared `CurrentTenantResolver`
@@ -293,17 +318,56 @@ final class PayviaServiceProvider extends ServiceProvider
         );
     }
 
+    /**
+     * The chargeback dispatcher's own `$dispatch` callable is a THIN wrapper around
+     * `EventService::dispatchOrFail()` -- same optional-container-presence guard
+     * `makeWebhookService`'s local `PaymentProviderEvent` dispatcher already uses, but STRICT
+     * dispatch rather than the fault-isolated `dispatch()` ordinary events use. Framework
+     * `EventDispatcher::dispatchOrFail()` logs then RETHROWS the original exception from the
+     * first listener that fails, stopping delivery -- so a downstream contracts-listener
+     * exception (e.g. from a subscribed chargeback-ingestion consumer) DOES propagate straight
+     * back out of this callable, through `ProviderChargebackDispatcher::handle()`, out of
+     * `makeWebhookService()`'s composed callback, and out of `WebhookService::dispatch()`,
+     * leaving the triggering `provider_events` row's logical dispatch unmarked. Because listener
+     * delivery is therefore at-least-once, every listener wired to `ProviderChargebackEvent` MUST
+     * be idempotent. Ordinary local `PaymentProviderEvent` delivery in `makeWebhookService()`
+     * deliberately stays on the fault-isolated `dispatch()` path -- only the chargeback event
+     * goes strict.
+     */
+    public static function makeProviderChargebackDispatcher(
+        ContainerInterface $container
+    ): ProviderChargebackDispatcher {
+        return new ProviderChargebackDispatcher(
+            $container->get(ProviderCorrelationRepository::class),
+            static function (ProviderChargebackEvent $event) use ($container): void {
+                if ($container->has(EventService::class)) {
+                    $container->get(EventService::class)->dispatchOrFail($event);
+                }
+            }
+        );
+    }
+
     public static function makeWebhookService(ContainerInterface $container): WebhookService
     {
         $context = $container->get(ApplicationContext::class);
         $subscriptions = $container->get(GatewaySubscriptionService::class);
+        $chargebacks = $container->get(ProviderChargebackDispatcher::class);
         $queueEnabled = (bool) config($context, 'payvia.webhooks.queue', false);
         $queueName = (string) config($context, 'payvia.webhooks.queue_name', 'default');
 
-        $dispatcher = static function (PaymentProviderEvent $event) use ($container): void {
+        // FIRST preserve ordinary local delivery (unconditional, unaffected by dispute
+        // recognition), THEN delegate recognized dispute/chargeback types to the named
+        // dispatcher. Nothing here catches ProviderChargebackDispatcher::handle()'s exceptions
+        // (UnresolvedPaymentOwnershipException, or any failure from its injected $dispatch
+        // callable) -- they propagate straight out of this callback, so
+        // WebhookService::dispatch() never reaches markLogicalDispatched() and the durable
+        // provider_events row stays redispatchable via relayPending().
+        $dispatcher = static function (PaymentProviderEvent $event) use ($container, $chargebacks): void {
             if ($container->has(EventService::class)) {
                 $container->get(EventService::class)->dispatch($event);
             }
+
+            $chargebacks->handle($event->event);
         };
 
         $applier = static function (PaymentProviderEventInterface $event) use ($subscriptions): void {

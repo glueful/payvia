@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia\Tests\Integration\Tenancy;
 use Glueful\Extensions\Contracts\Tenancy\TenantContextRunner;
 use Glueful\Extensions\Payvia\Database\Migrations\CreateBillingPlansTable;
 use Glueful\Extensions\Payvia\Database\Migrations\CreateGatewaySubscriptionsTable;
+use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentsTable;
 use Glueful\Extensions\Payvia\Repositories\ProviderCorrelationRepository;
 use Glueful\Extensions\Payvia\Tests\Support\PayviaTestCase;
 
@@ -19,6 +20,24 @@ final class ProviderCorrelationRepositoryTest extends PayviaTestCase
         $schema = $this->connection->getSchemaBuilder();
         (new CreateGatewaySubscriptionsTable())->up($schema);
         (new CreateBillingPlansTable())->up($schema);
+        (new CreatePaymentsTable())->up($schema);
+    }
+
+    /** @param array<string,mixed> $overrides */
+    private function insertPayment(array $overrides = []): void
+    {
+        $this->connection->table('payments')->insert(array_merge([
+            'uuid' => 'payAAAAAAAA1',
+            'tenant_uuid' => 'tenantAAAA01',
+            'gateway' => 'stripe',
+            'gateway_transaction_id' => 'txn_1',
+            'reference' => 'refAAAAAAAA1',
+            'payable_type' => 'order',
+            'payable_id' => 'order_1',
+            'amount' => 5000,
+            'currency' => 'GHS',
+            'status' => 'succeeded',
+        ], $overrides));
     }
 
     public function testFindsGatewaySubscriptionByGlobalKeyRegardlessOfTenant(): void
@@ -56,6 +75,69 @@ final class ProviderCorrelationRepositoryTest extends PayviaTestCase
         self::assertSame('tenantAAAA01', $found['tenant_uuid']);
         self::assertNull($repo->findBillingPlanByUuid('missing'));
         self::assertNull($repo->findBillingPlanByUuid(''));
+    }
+
+    public function testFindsPaymentOwnerByGatewayTxnRegardlessOfTenant(): void
+    {
+        // No request tenant is bound anywhere in this harness -- a dispute webhook arrives
+        // with no caller tenant, and this correlation must still resolve the persisted owner.
+        $repo = new ProviderCorrelationRepository($this->connection);
+        $this->insertPayment();
+
+        $found = $repo->findPaymentOwnerByGatewayTxn('stripe', 'txn_1');
+
+        self::assertSame([
+            'tenant_uuid' => 'tenantAAAA01',
+            'reference' => 'refAAAAAAAA1',
+            'payable_type' => 'order',
+            'payable_id' => 'order_1',
+            'amount' => 5000,
+            'currency' => 'GHS',
+        ], $found);
+    }
+
+    public function testFindPaymentOwnerByGatewayTxnReturnsNullOnZeroMatches(): void
+    {
+        $repo = new ProviderCorrelationRepository($this->connection);
+
+        self::assertNull($repo->findPaymentOwnerByGatewayTxn('stripe', 'txn_missing'));
+        self::assertNull($repo->findPaymentOwnerByGatewayTxn('', ''));
+    }
+
+    public function testFindPaymentOwnerByGatewayTxnFailsClosedWhenMultipleTenantsShareTheSameKey(): void
+    {
+        $repo = new ProviderCorrelationRepository($this->connection);
+
+        // Two payments collide on the same (gateway, gateway_transaction_id) but are owned by
+        // DIFFERENT tenants. The correlation must never guess -- it returns null rather than
+        // picking either row.
+        $this->insertPayment([
+            'uuid' => 'payAAAAAAAA1',
+            'tenant_uuid' => 'tenantAAAA01',
+            'gateway_transaction_id' => 'txn_dupe',
+            'reference' => 'refAAAAAAAA1',
+        ]);
+        $this->insertPayment([
+            'uuid' => 'payAAAAAAAA2',
+            'tenant_uuid' => 'tenantBBBB02',
+            'gateway_transaction_id' => 'txn_dupe',
+            'reference' => 'refAAAAAAAA2',
+        ]);
+
+        self::assertNull($repo->findPaymentOwnerByGatewayTxn('stripe', 'txn_dupe'));
+    }
+
+    public function testFindPaymentOwnerByGatewayTxnInvokesRunAsSystemWhenARunnerIsSupplied(): void
+    {
+        $systemCalls = 0;
+        $runner = $this->countingRunner($systemCalls);
+        $repo = new ProviderCorrelationRepository($this->connection, tenancyResolverPresent: true, runner: $runner);
+        $this->insertPayment();
+
+        $found = $repo->findPaymentOwnerByGatewayTxn('stripe', 'txn_1');
+
+        self::assertIsArray($found);
+        self::assertGreaterThan(0, $systemCalls);
     }
 
     public function testUpsertNeverMovesOwnershipToADifferentCallerSuppliedTenant(): void
