@@ -7,7 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-
 ### Planned
 - Flutterwave gateway driver.
 - PayPal/Braintree gateway driver.
@@ -15,6 +14,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Checkout.com gateway driver.
 - Optional split-payment (split-at-charge) capability interface — marketplace *payouts* landed in 2.1.0 via `TransferCapableGateway`; splitting a single charge across recipients at capture time is still pending.
 - Optional `RefundCollector` gateway binding — dispute ingestion landed in 2.1.0; refunds still fall back to commerce's manual path.
+
+## [2.2.0] - 2026-07-25 — Host Settings Seam & Graceful Degradation
+
+Payvia becomes runtime-configurable by its host: a consuming application can bind the new
+settings seam to make the default gateway, per-gateway enablement, and the API keys
+themselves editable from an admin screen (Thallo ships exactly that as its Payments tab),
+and an installed-but-unconfigured payvia now degrades checkout to manual collection instead
+of failing it. No new migrations, env vars, or config keys; existing installs without a
+seam binding behave exactly as before.
+
+
+### Added
+- **Host settings seam** (`PayviaSettingsOverride` + `PayviaSettings`): a consuming application
+  can bind `Glueful\Extensions\Payvia\Support\PayviaSettingsOverride` to make a whitelisted
+  subset of `payvia.*` keys runtime-editable (an admin Payments screen backed by a settings
+  table) — `payvia.default_gateway` and, per configured gateway, `enabled`, `secret_key`, and
+  `webhook_secret`. All internal reads of those keys (GatewayManager, both gateway drivers,
+  PaymentService, PayviaPaymentCollector) now go through the `PayviaSettings` reader:
+  override-first, defensive casting (malformed values fall back to config), null-never-throw,
+  and pure config/env passthrough when no override is bound — existing installs are unchanged.
+  Overrides can reconfigure a configured gateway but never invent a new one; ops knobs
+  (base URLs, timeouts, middleware profiles) deliberately stay config/env-only. Secrets cross
+  the seam as plaintext — if the host stores them encrypted, decryption is the host binding's
+  job, and payvia never persists or logs seam values.
+- **Graceful degradation for unconfigured gateways**: `PayviaPaymentCollector` now falls back to
+  MANUAL collection (`status: manual`, operator marks paid — the same posture as commerce's own
+  `ManualPaymentCollector`) when the default gateway is disabled or declares a `secret_key` slot
+  with no value in it, instead of initiating a charge with empty credentials. Installing payvia
+  before entering keys no longer breaks a store's checkout; the moment a key lands (env or a
+  host settings screen), hosted initiation takes over. Drivers that genuinely need no secret
+  simply omit the `secret_key` slot from their config.
+
+### Fixed
+- **Route registration failed on every host that loads routes through the provider**
+  (`ServiceProvider::loadRoutesFrom()`): `routes.php` read `config($context, ...)` trusting the
+  `RouteManifest::load()` injection contract, but the provider loader injects only `$router` —
+  "Undefined variable $context". In production the failure was swallowed (all Payvia endpoints
+  silently missing); in development the rethrow escaped the framework's single extension-boot
+  guard and aborted every provider booted after Payvia, taking unrelated extensions down with it.
+  `routes.php` now derives `$context = $router->getContext()` (the same pattern as
+  glueful/commerce) and works under both loaders.
 
 ## [2.1.0] - 2026-07-20 — Provider Payouts & Dispute Ingestion
 

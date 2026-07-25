@@ -17,6 +17,7 @@ use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
+use Glueful\Extensions\Payvia\Support\PayviaSettings;
 use Glueful\Http\Client as HttpClient;
 use Glueful\Http\Exceptions\HttpClientException;
 use Glueful\Http\Response\Response as HttpResponse;
@@ -648,7 +649,7 @@ final class StripeGateway implements
     /** @return array<string,mixed> */
     private function config(): array
     {
-        return (array) config($this->context, 'payvia.gateways.stripe', []);
+        return PayviaSettings::gatewayConfig($this->context, 'stripe');
     }
 
     private function secretKey(): string

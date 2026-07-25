@@ -19,6 +19,7 @@ use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
+use Glueful\Extensions\Payvia\Support\PayviaSettings;
 use Glueful\Helpers\Utils;
 use Glueful\Http\Client as HttpClient;
 use Glueful\Http\Exceptions\HttpClientException;
@@ -41,7 +42,7 @@ final class PaystackGateway implements
 
     public function verify(string $reference, array $options = []): array
     {
-        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
+        $config = $this->gatewayConfig();
 
         $secret = (string) ($config['secret_key'] ?? '');
         if ($secret === '') {
@@ -115,7 +116,7 @@ final class PaystackGateway implements
 
     public function initialize(PayableReference $payable, array $options = []): array
     {
-        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
+        $config = $this->gatewayConfig();
 
         $secret = (string) ($config['secret_key'] ?? '');
         if ($secret === '') {
@@ -177,7 +178,7 @@ final class PaystackGateway implements
             return false;
         }
 
-        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
+        $config = $this->gatewayConfig();
         $secret = (string) ($config['webhook_secret'] ?? $config['secret_key'] ?? '');
         if ($secret === '') {
             return false;
@@ -216,7 +217,7 @@ final class PaystackGateway implements
 
     public function fetchSubscription(string $gatewaySubscriptionId): array
     {
-        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
+        $config = $this->gatewayConfig();
         $secret = (string) ($config['secret_key'] ?? '');
         if ($secret === '') {
             return ['status' => 'failed', 'message' => 'Missing Paystack secret key'];
@@ -237,7 +238,7 @@ final class PaystackGateway implements
 
     public function cancelSubscription(string $gatewaySubscriptionId, bool $atPeriodEnd = true): array
     {
-        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
+        $config = $this->gatewayConfig();
         $secret = (string) ($config['secret_key'] ?? '');
         if ($secret === '') {
             return ['status' => 'failed', 'message' => 'Missing Paystack secret key'];
@@ -293,7 +294,7 @@ final class PaystackGateway implements
      */
     public function transfer(PayoutDestination $destination, PayoutRequest $request, string $providerSafeRef): array
     {
-        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
+        $config = $this->gatewayConfig();
         $secret = (string) ($config['secret_key'] ?? '');
         if ($secret === '') {
             throw new \RuntimeException(
@@ -380,7 +381,7 @@ final class PaystackGateway implements
      */
     public function transferStatus(string $providerSafeRef, ?string $providerRef): array
     {
-        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
+        $config = $this->gatewayConfig();
         $secret = (string) ($config['secret_key'] ?? '');
         if ($secret === '') {
             throw new \RuntimeException(
@@ -419,7 +420,7 @@ final class PaystackGateway implements
      */
     public function inspectAccount(string $accountRef): array
     {
-        $config = (array) config($this->context, 'payvia.gateways.paystack', []);
+        $config = $this->gatewayConfig();
         $secret = (string) ($config['secret_key'] ?? '');
         if ($secret === '') {
             throw new \RuntimeException(
@@ -840,5 +841,11 @@ final class PaystackGateway implements
     private function stringOrNull(mixed $value): ?string
     {
         return is_scalar($value) && (string) $value !== '' ? (string) $value : null;
+    }
+
+    /** @return array<string,mixed> Effective config — host settings overlays applied. */
+    private function gatewayConfig(): array
+    {
+        return PayviaSettings::gatewayConfig($this->context, 'paystack');
     }
 }

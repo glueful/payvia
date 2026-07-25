@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia\Services;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Contracts\Payments\PayableReference;
 use Glueful\Extensions\Contracts\Payments\PaymentConfirmation;
+use Glueful\Extensions\Payvia\Support\PayviaSettings;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
@@ -37,7 +38,7 @@ final class PaymentService
         ?string $gatewayName = null,
         array $context = []
     ): array {
-        $gatewayKey = $gatewayName ?: (string) config($this->context, 'payvia.default_gateway', 'paystack');
+        $gatewayKey = $gatewayName ?: PayviaSettings::defaultGateway($this->context);
 
         $options = (array) ($context['options'] ?? []);
         $gateway = $this->gateways->gateway($gatewayKey);

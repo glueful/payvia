@@ -6,6 +6,7 @@ namespace Glueful\Extensions\Payvia;
 
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
+use Glueful\Extensions\Payvia\Support\PayviaSettings;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
@@ -38,7 +39,7 @@ final class GatewayManager
             return $this->resolved[$name];
         }
 
-        $config = (array) config($this->context, 'payvia.gateways', []);
+        $config = PayviaSettings::gateways($this->context);
         if (!isset($config[$name]) && !isset($this->drivers[$name])) {
             throw new \RuntimeException("Payvia: gateway '{$name}' is not configured or disabled.");
         }
