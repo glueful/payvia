@@ -10,7 +10,11 @@ use Glueful\Extensions\Payvia\Controllers\InvoiceController;
 use Glueful\Extensions\Payvia\Controllers\WebhookController;
 
 /** @var Router $router Router instance injected by RouteManifest::load() */
-/** @var ApplicationContext $context Application context injected by RouteManifest::load() */
+
+// RouteManifest::load() injects $context, but ServiceProvider::loadRoutesFrom() — the path this
+// file actually loads through — injects ONLY $router. Keep an injected context when the includer
+// provided one; derive it from the router otherwise (glueful/commerce's routes.php pattern).
+$context ??= $router->getContext();
 
 // Three ordered middleware profiles (spec: "Tenant context on HTTP routes"). Payvia never
 // names host-specific middleware aliases in its defaults -- a tenancy-enabled host configures

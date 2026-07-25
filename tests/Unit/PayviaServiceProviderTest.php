@@ -20,6 +20,6 @@ final class PayviaServiceProviderTest extends TestCase
     {
         $provider = new PayviaServiceProvider($this->createStub(ContainerInterface::class));
 
-        self::assertSame('2.0.0', $provider->getVersion());
+        self::assertSame('2.2.0', $provider->getVersion());
     }
 }

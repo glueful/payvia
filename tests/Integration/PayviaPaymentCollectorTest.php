@@ -75,6 +75,51 @@ final class PayviaPaymentCollectorTest extends PayviaTestCase
         self::assertSame(PayviaPaymentCollector::class, $services[PaymentCollector::class]['class'] ?? null);
     }
 
+    public function testKeylessDeclaredGatewayDegradesToManualCollection(): void
+    {
+        // The shipped paystack config declares a secret_key slot (env default null). Installed-
+        // but-unconfigured must mean MANUAL collection, never an initiation with an empty secret.
+        $collector = new PayviaPaymentCollector(
+            new GatewayManager($this->context->getContainer(), $this->context),
+            new PaymentIntentRepository($this->connection),
+        );
+
+        $config = require __DIR__ . '/../../config/payvia.php';
+        $config['default_gateway'] = 'paystack';
+        $this->context->mergeConfigDefaults('payvia', $config);
+
+        $result = $collector->initiate(
+            $this->context,
+            new PayableReference('commerce_order', 'ord3', 4999, 'GHS')
+        );
+
+        self::assertSame('manual', $result->status);
+        self::assertStringContainsString('Payment is collected manually', $result->payload['instructions']);
+        self::assertStringContainsString("'paystack' is not configured", $result->payload['instructions']);
+    }
+
+    public function testDisabledDefaultGatewayDegradesToManualCollection(): void
+    {
+        $gateway = new FakeInitiationGateway();
+        $this->bind(FakeInitiationGateway::class, $gateway);
+
+        $manager = new GatewayManager($this->context->getContainer(), $this->context);
+        $manager->registerDriver('fake', FakeInitiationGateway::class);
+        $config = require __DIR__ . '/../../config/payvia.php';
+        $config['default_gateway'] = 'fake';
+        $config['gateways']['fake'] = ['enabled' => false, 'driver' => 'fake'];
+        $this->context->mergeConfigDefaults('payvia', $config);
+
+        $collector = new PayviaPaymentCollector($manager, new PaymentIntentRepository($this->connection));
+        $result = $collector->initiate(
+            $this->context,
+            new PayableReference('commerce_order', 'ord4', 4999, 'GHS')
+        );
+
+        self::assertSame('manual', $result->status);
+        self::assertSame(0, $gateway->initializeCalls);
+    }
+
     private function useGateway(string $gateway): void
     {
         $config = require __DIR__ . '/../../config/payvia.php';
