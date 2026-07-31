@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Payable metadata convention for hosted initiation** — `PayviaPaymentCollector` now lifts three
+  well-known `PayableReference::metadata` keys (`email`, `callback_url`, `cancel_url`) into the
+  gateway initiation options. The seam is payable-type-agnostic: whoever builds a payable (an
+  order flow, a subscription flow, an invoice flow) supplies its own values; the collector never
+  inspects `payable_type` and initiation exceptions still propagate to the caller. Paystack's
+  required `email` and per-install `callback_url` can now be satisfied per payment instead of via
+  the dashboard-global callback.
+- **Stripe hosted checkout** — `StripeGateway` implements `InitiationCapableGateway` via Stripe
+  Checkout Sessions: `mode=payment`, one line item from the payable's amount/currency/description,
+  `customer_email` when supplied, `success_url`/`cancel_url` from the metadata convention
+  (callback REQUIRED; cancel falls back to callback), and a deterministic per-payable
+  `Idempotency-Key` so concurrent initiations cannot mint two sessions. The response is validated
+  (non-empty `cs_…` id, absolute HTTPS checkout URL) before any intent is persisted, and the
+  returned session id is exactly the reference `verify()`'s existing checkout-session branch
+  resolves.
+
 ### Planned
 - Flutterwave gateway driver.
 - PayPal/Braintree gateway driver.

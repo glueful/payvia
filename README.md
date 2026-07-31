@@ -166,6 +166,31 @@ return [
 ];
 ```
 
+## Hosted Payment Initiation (the payable metadata convention)
+
+`PayviaPaymentCollector` starts hosted payment flows through `InitiationCapableGateway`
+(Paystack redirect pages; Stripe Checkout Sessions). It is **payable-type-agnostic**: it never
+inspects `payable_type`, and per-consumer parameters are never threaded through it. Instead,
+whoever *builds* a `PayableReference` supplies three well-known `metadata` keys, and the
+collector lifts them into the gateway options once:
+
+| Metadata key   | Meaning |
+|----------------|---------|
+| `email`        | The payer's email (Paystack requires it; Stripe pre-fills the session). |
+| `callback_url` | Absolute HTTPS URL the visitor returns to after paying (Stripe: REQUIRED — session creation throws without it; Paystack: falls back to the dashboard callback). |
+| `cancel_url`   | Absolute HTTPS URL for an abandoned Stripe session; falls back to `callback_url`. |
+
+An order flow, a subscription flow, and an invoice flow each set their own values when
+constructing their payable — nothing here is order-specific. Two invariants:
+
+- **Webhooks stay the settlement authority.** The callback/cancel URLs are browser navigation
+  only; payment truth always comes from webhook verification (`verify()` / provider events).
+- **Initiation exceptions propagate.** The collector has no catch — mapping failures (e.g. to an
+  `init_failed` result) is the calling application's job.
+
+Stripe session creation sends a deterministic `Idempotency-Key` per payable and validates the
+response (a `cs_…` session id and an absolute HTTPS checkout URL) before any intent is persisted.
+
 ## Webhooks and Provider Events
 
 Payvia persists provider deliveries in `provider_events`, normalizes them into `ProviderEvent`, applies idempotent side effects, then dispatches `PaymentProviderEvent` through the framework event bus.

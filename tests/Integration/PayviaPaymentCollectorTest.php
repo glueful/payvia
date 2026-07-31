@@ -48,6 +48,74 @@ final class PayviaPaymentCollectorTest extends PayviaTestCase
         self::assertSame(1, $gateway->initializeCalls);
     }
 
+    public function testMetadataConventionKeysReachTheGatewayOptions(): void
+    {
+        // The payable-type-agnostic initiation seam: whoever BUILDS a payable supplies the
+        // well-known metadata keys; the collector lifts them into gateway options ONCE — no
+        // per-consumer parameters, no payable_type special-casing.
+        $gateway = new FakeInitiationGateway();
+        $this->bind(FakeInitiationGateway::class, $gateway);
+
+        $manager = new GatewayManager($this->context->getContainer(), $this->context);
+        $manager->registerDriver('fake', FakeInitiationGateway::class);
+        $this->useGateway('fake');
+
+        $collector = new PayviaPaymentCollector($manager, new PaymentIntentRepository($this->connection));
+        $collector->initiate($this->context, new PayableReference(
+            'commerce_order',
+            'ordmeta1',
+            4999,
+            'GHS',
+            'Order THL-1',
+            [
+                'email' => 'buyer@example.test',
+                'callback_url' => 'https://shop.test/checkout/return/THL-1',
+                'cancel_url' => 'https://shop.test/checkout/cancel/THL-1',
+                'unrelated' => 'never-lifted',
+            ],
+        ));
+
+        self::assertSame([
+            'email' => 'buyer@example.test',
+            'callback_url' => 'https://shop.test/checkout/return/THL-1',
+            'cancel_url' => 'https://shop.test/checkout/cancel/THL-1',
+        ], $gateway->lastOptions);
+    }
+
+    public function testEmptyMetadataPassesNoOptions(): void
+    {
+        $gateway = new FakeInitiationGateway();
+        $this->bind(FakeInitiationGateway::class, $gateway);
+
+        $manager = new GatewayManager($this->context->getContainer(), $this->context);
+        $manager->registerDriver('fake', FakeInitiationGateway::class);
+        $this->useGateway('fake');
+
+        $collector = new PayviaPaymentCollector($manager, new PaymentIntentRepository($this->connection));
+        $collector->initiate($this->context, new PayableReference('commerce_order', 'ordmeta2', 4999, 'GHS'));
+
+        self::assertSame([], $gateway->lastOptions);
+    }
+
+    public function testGatewayInitializationExceptionsPropagate(): void
+    {
+        // The collector deliberately has NO catch: initiation failures are the CALLER's to map
+        // (commerce catches and records init_failed). Pinned so a future "helpful" catch here
+        // cannot silently change that ownership.
+        $gateway = new ThrowingInitiationGateway();
+        $this->bind(ThrowingInitiationGateway::class, $gateway);
+
+        $manager = new GatewayManager($this->context->getContainer(), $this->context);
+        $manager->registerDriver('fake', ThrowingInitiationGateway::class);
+        $this->useGateway('fake');
+
+        $collector = new PayviaPaymentCollector($manager, new PaymentIntentRepository($this->connection));
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('gateway exploded');
+        $collector->initiate($this->context, new PayableReference('commerce_order', 'ordmeta3', 4999, 'GHS'));
+    }
+
     public function testNonCapableGatewayReturnsManualInitiation(): void
     {
         $gateway = new FakeWebhookGateway();
@@ -136,6 +204,8 @@ final class PayviaPaymentCollectorTest extends PayviaTestCase
 final class FakeInitiationGateway implements PaymentGatewayInterface, InitiationCapableGateway
 {
     public int $initializeCalls = 0;
+    /** @var array<string,mixed> */
+    public array $lastOptions = [];
 
     public function verify(string $reference, array $options = []): array
     {
@@ -145,10 +215,24 @@ final class FakeInitiationGateway implements PaymentGatewayInterface, Initiation
     public function initialize(PayableReference $payable, array $options = []): array
     {
         $this->initializeCalls++;
+        $this->lastOptions = $options;
 
         return [
             'reference' => 'ref-' . $this->initializeCalls,
             'checkout_url' => 'https://checkout.test/ref-' . $this->initializeCalls,
         ];
+    }
+}
+
+final class ThrowingInitiationGateway implements PaymentGatewayInterface, InitiationCapableGateway
+{
+    public function verify(string $reference, array $options = []): array
+    {
+        return ['status' => 'success', 'reference' => $reference];
+    }
+
+    public function initialize(PayableReference $payable, array $options = []): array
+    {
+        throw new \RuntimeException('gateway exploded');
     }
 }

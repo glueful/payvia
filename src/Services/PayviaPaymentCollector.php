@@ -54,7 +54,18 @@ final class PayviaPaymentCollector implements PaymentCollector
             ]);
         }
 
-        $result = $gateway->initialize($payable);
+        // The payable-type-agnostic initiation seam: whoever BUILDS a payable supplies the
+        // well-known metadata keys (email, callback_url, cancel_url) — orders, subscriptions,
+        // invoices alike — and this ONE lift hands them to the gateway as options. Never add
+        // per-consumer parameters or payable_type special-casing here. Initiation exceptions
+        // deliberately PROPAGATE: mapping failures (e.g. to init_failed) is the caller's job.
+        $options = array_filter([
+            'email' => $payable->metadata['email'] ?? null,
+            'callback_url' => $payable->metadata['callback_url'] ?? null,
+            'cancel_url' => $payable->metadata['cancel_url'] ?? null,
+        ], static fn (mixed $value): bool => is_string($value) && $value !== '');
+
+        $result = $gateway->initialize($payable, $options);
         $created = $this->intents->createOpen($context, [
             'payable_type' => $payable->type,
             'payable_id' => $payable->id,

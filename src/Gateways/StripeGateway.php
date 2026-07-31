@@ -6,10 +6,12 @@ namespace Glueful\Extensions\Payvia\Gateways;
 
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Contracts\Payments\DestinationStatus;
+use Glueful\Extensions\Contracts\Payments\PayableReference;
 use Glueful\Extensions\Contracts\Payments\PayoutDestination;
 use Glueful\Extensions\Contracts\Payments\PayoutRequest;
 use Glueful\Extensions\Contracts\Payments\PayoutResult;
 use Glueful\Extensions\Contracts\Payments\PayoutStatusResult;
+use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
@@ -24,6 +26,7 @@ use Glueful\Http\Response\Response as HttpResponse;
 
 final class StripeGateway implements
     PaymentGatewayInterface,
+    InitiationCapableGateway,
     WebhookCapableGateway,
     SubscriptionCapableGateway,
     TransferCapableGateway
@@ -71,6 +74,102 @@ final class StripeGateway implements
         return $isCheckoutSession
             ? $this->normalizeCheckoutSessionVerification($reference, $decoded)
             : $this->normalizePaymentIntentVerification($reference, $decoded);
+    }
+
+    /**
+     * Start a hosted Stripe Checkout Session for a payable. The session id (`cs_…`) is the
+     * provider reference — exactly what {@see verify()}'s checkout-session branch resolves.
+     *
+     * `callback_url` (the success URL) is REQUIRED — Stripe rejects a session without one, so a
+     * missing value throws here, before any request; `cancel_url` falls back to it. The
+     * Idempotency-Key is deterministic per payable, so concurrent initiations of the SAME payable
+     * cannot mint two hosted sessions. The response is validated (non-empty `cs_` id, absolute
+     * HTTPS checkout URL) BEFORE returning, so a caller can never persist an intent for a
+     * malformed session.
+     *
+     * @param array<string,mixed> $options
+     * @return array<string,mixed>
+     */
+    public function initialize(PayableReference $payable, array $options = []): array
+    {
+        $secret = $this->secretKey();
+        if ($secret === '') {
+            throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        $callback = isset($options['callback_url']) && is_string($options['callback_url'])
+            ? trim($options['callback_url'])
+            : '';
+        if ($callback === '') {
+            throw new \RuntimeException(
+                'Stripe Checkout requires a callback_url (success URL) in the initiation options'
+            );
+        }
+        $cancelOption = isset($options['cancel_url']) && is_string($options['cancel_url'])
+            ? trim($options['cancel_url'])
+            : '';
+        $cancel = $cancelOption !== '' ? $cancelOption : $callback;
+
+        $form = [
+            'mode' => 'payment',
+            'client_reference_id' => $payable->id,
+            'success_url' => $callback,
+            'cancel_url' => $cancel,
+            'line_items' => [[
+                'quantity' => 1,
+                'price_data' => [
+                    'currency' => strtolower($payable->currency),
+                    'unit_amount' => $payable->amount,
+                    'product_data' => [
+                        'name' => $payable->description !== null && $payable->description !== ''
+                            ? $payable->description
+                            : 'Payment',
+                    ],
+                ],
+            ]],
+            'metadata' => [
+                'payable_type' => $payable->type,
+                'payable_id' => $payable->id,
+            ],
+        ];
+        $email = $options['email'] ?? null;
+        if (is_string($email) && $email !== '') {
+            $form['customer_email'] = $email;
+        }
+
+        $requestOptions = $this->requestOptions();
+        $requestOptions['headers']['Idempotency-Key'] = 'payvia-init-' . $payable->type . '-' . $payable->id;
+        $requestOptions['form_params'] = $form;
+
+        $response = $this->httpClient->post($this->baseUrl() . '/v1/checkout/sessions', $requestOptions);
+        [, $decoded] = $this->decodeJsonResponse($response, 'Stripe checkout session');
+
+        if (isset($decoded['error']) && is_array($decoded['error'])) {
+            throw new \RuntimeException(
+                'Stripe checkout session failed: ' . (string) ($decoded['error']['message'] ?? 'unknown error')
+            );
+        }
+
+        $sessionId = $decoded['id'] ?? '';
+        if (!is_string($sessionId) || !str_starts_with($sessionId, 'cs_')) {
+            throw new \RuntimeException('Stripe checkout session returned no usable session id');
+        }
+        $url = $decoded['url'] ?? '';
+        $parts = is_string($url) ? parse_url($url) : false;
+        if (
+            !is_string($url)
+            || !is_array($parts)
+            || ($parts['scheme'] ?? '') !== 'https'
+            || ($parts['host'] ?? '') === ''
+        ) {
+            throw new \RuntimeException('Stripe checkout session returned no usable HTTPS checkout URL');
+        }
+
+        return [
+            'reference' => $sessionId,
+            'checkout_url' => $url,
+            'raw' => $decoded,
+        ];
     }
 
     public function verifyWebhookSignature(string $rawBody, array $headers): bool
