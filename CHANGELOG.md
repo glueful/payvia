@@ -5,8 +5,6 @@ All notable changes to the Payvia (Payments) extension will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ### Planned
 - Flutterwave gateway driver.
 - PayPal/Braintree gateway driver.
@@ -14,6 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Checkout.com gateway driver.
 - Optional split-payment (split-at-charge) capability interface — marketplace *payouts* landed in 2.1.0 via `TransferCapableGateway`; splitting a single charge across recipients at capture time is still pending.
 - Optional `RefundCollector` gateway binding — dispute ingestion landed in 2.1.0; refunds still fall back to commerce's manual path.
+
+## [Unreleased]
+
+## [2.3.0] - 2026-08-01 — Hosted Initiation Metadata & Stripe Checkout
+
+The hosted-initiation seam becomes payable-type-agnostic and Stripe gains a hosted checkout flow.
+Additive throughout: no new migrations, env vars, or config keys; existing installs whose payables
+carry no metadata behave exactly as 2.2.0 (the collector's manual/keyless fallbacks are
+byte-identical, pinned by tests).
+
+### Added
+- **Payable metadata convention for hosted initiation** — `PayviaPaymentCollector` now lifts three
+  well-known `PayableReference::metadata` keys (`email`, `callback_url`, `cancel_url`) into the
+  gateway initiation options. The seam is payable-type-agnostic: whoever builds a payable (an
+  order flow, a subscription flow, an invoice flow) supplies its own values; the collector never
+  inspects `payable_type` and initiation exceptions still propagate to the caller. Paystack's
+  required `email` and per-install `callback_url` can now be satisfied per payment instead of via
+  the dashboard-global callback.
+- **Stripe hosted checkout** — `StripeGateway` implements `InitiationCapableGateway` via Stripe
+  Checkout Sessions: `mode=payment`, one line item from the payable's amount/currency/description,
+  `customer_email` when supplied, `success_url`/`cancel_url` from the metadata convention
+  (callback REQUIRED; cancel falls back to callback), and a deterministic per-payable
+  `Idempotency-Key` so concurrent initiations cannot mint two sessions. The response is validated
+  (non-empty `cs_…` id, absolute HTTPS checkout URL) before any intent is persisted, and the
+  returned session id is exactly the reference `verify()`'s existing checkout-session branch
+  resolves.
+
 
 ## [2.2.0] - 2026-07-25 — Host Settings Seam & Graceful Degradation
 
