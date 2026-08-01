@@ -5,7 +5,22 @@ All notable changes to the Payvia (Payments) extension will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### Planned
+- Flutterwave gateway driver.
+- PayPal/Braintree gateway driver.
+- Adyen gateway driver.
+- Checkout.com gateway driver.
+- Optional split-payment (split-at-charge) capability interface — marketplace *payouts* landed in 2.1.0 via `TransferCapableGateway`; splitting a single charge across recipients at capture time is still pending.
+- Optional `RefundCollector` gateway binding — dispute ingestion landed in 2.1.0; refunds still fall back to commerce's manual path.
+
 ## [Unreleased]
+
+## [2.3.0] - 2026-08-01 — Hosted Initiation Metadata & Stripe Checkout
+
+The hosted-initiation seam becomes payable-type-agnostic and Stripe gains a hosted checkout flow.
+Additive throughout: no new migrations, env vars, or config keys; existing installs whose payables
+carry no metadata behave exactly as 2.2.0 (the collector's manual/keyless fallbacks are
+byte-identical, pinned by tests).
 
 ### Added
 - **Payable metadata convention for hosted initiation** — `PayviaPaymentCollector` now lifts three
@@ -24,13 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returned session id is exactly the reference `verify()`'s existing checkout-session branch
   resolves.
 
-### Planned
-- Flutterwave gateway driver.
-- PayPal/Braintree gateway driver.
-- Adyen gateway driver.
-- Checkout.com gateway driver.
-- Optional split-payment (split-at-charge) capability interface — marketplace *payouts* landed in 2.1.0 via `TransferCapableGateway`; splitting a single charge across recipients at capture time is still pending.
-- Optional `RefundCollector` gateway binding — dispute ingestion landed in 2.1.0; refunds still fall back to commerce's manual path.
 
 ## [2.2.0] - 2026-07-25 — Host Settings Seam & Graceful Degradation
 
