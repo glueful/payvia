@@ -16,6 +16,7 @@ use Glueful\Extensions\Contracts\Tenancy\TenantContextRunner;
 use Glueful\Extensions\Contracts\Tenancy\TenantTableRegistry;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\InvoiceRepositoryInterface;
+use Glueful\Extensions\Payvia\Contracts\LogicalDispatchLeaseRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
@@ -355,6 +356,14 @@ final class PayviaServiceProvider extends ServiceProvider
         $queueEnabled = (bool) config($context, 'payvia.webhooks.queue', false);
         $queueName = (string) config($context, 'payvia.webhooks.queue_name', 'default');
 
+        // Resolved ONCE and reused both as the durable `ProviderEventRepositoryInterface` and,
+        // when it also implements the additive lease capability, as WebhookService's optional
+        // final constructor argument. A custom legacy implementation that doesn't implement
+        // LogicalDispatchLeaseRepositoryInterface simply passes null here and WebhookService
+        // keeps its byte-identical claim/reclaim/mark fallback -- construction never fails.
+        $events = $container->get(ProviderEventRepositoryInterface::class);
+        $logicalDispatchLeases = $events instanceof LogicalDispatchLeaseRepositoryInterface ? $events : null;
+
         // FIRST preserve ordinary local delivery (unconditional, unaffected by dispute
         // recognition), THEN delegate recognized dispute/chargeback types to the named
         // dispatcher. Nothing here catches ProviderChargebackDispatcher::handle()'s exceptions
@@ -388,11 +397,12 @@ final class PayviaServiceProvider extends ServiceProvider
         return new WebhookService(
             $context,
             $container->get(GatewayManager::class),
-            $container->get(ProviderEventRepositoryInterface::class),
+            $events,
             $dispatcher,
             $applier,
             $queueEnabled,
-            $enqueue
+            $enqueue,
+            $logicalDispatchLeases
         );
     }
 
