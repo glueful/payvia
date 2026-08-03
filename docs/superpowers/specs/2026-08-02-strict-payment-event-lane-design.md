@@ -68,7 +68,9 @@ Pins (from the design ruling):
   sibling listener's failure re-invokes listeners that already succeeded.
   `handle()` throwing prevents the webhook's dispatch-marking and produces a
   retryable delivery (non-2xx response in inline mode; a retried job in
-  queue mode).
+  queue mode). Payvia releases the logical dispatch claim before rethrowing,
+  so the next attempt can run immediately rather than waiting for stale-claim
+  recovery.
 
 ## 2. The lane
 
@@ -86,17 +88,37 @@ Details:
 
 - **Collection:** the provider resolves the tag exactly as
   `makeConfirmationDispatcher()` does (`$container->has(TAG) ? $container->get(TAG) : []`,
-  iterable-guarded). Absent tag ⇒ empty lane ⇒ zero behavior change.
-- **Deterministic order:** listeners sorted by FQCN (`get_class`) before
-  invocation. Sufficient for v1; a priority mechanism is deliberately
-  omitted (YAGNI) and would be a conscious follow-up.
-- **Failure semantics need no new plumbing.** An escaping exception already
-  leaves `markLogicalDispatched()` unreached (the row stays redeliverable by
-  `relayPending()`), already surfaces from `WebhookService::ingest()` →
-  `WebhookController::handle()` as a non-2xx, and already propagates out of
-  `ProcessWebhookJob::handle()` so the queue worker retries. The existing
-  redelivery-re-runs-ordinary-listeners posture is unchanged — it is already
-  true for the chargeback lane today.
+  iterable-guarded). Absent tag ⇒ empty lane ⇒ zero behavior change. Every
+  resolved item MUST implement `StrictPaymentEventListener`; an invalid item
+  fails service construction loudly rather than being skipped.
+- **Deterministic order:** listener concrete classes are unique. The factory
+  rejects a duplicate FQCN with `LogicException`, then sorts the unique
+  listeners by FQCN (`get_class`) before invocation. A priority mechanism is
+  deliberately omitted (YAGNI); the uniqueness rule closes the otherwise
+  ambiguous equal-key case.
+- **Immediate retry requires an explicit claim release.** Today
+  `claimLogicalForDispatch()` changes the row to `dispatching`; if dispatch
+  throws, an immediate provider or queue retry cannot reclaim it until the
+  default 300-second stale window and can be acknowledged without invoking
+  listeners. Add this repository contract:
+
+  ```php
+  public function releaseLogicalDispatch(string $gateway, string $logicalEventKey): void;
+  ```
+
+  Its implementation updates only matching `dispatch_status='dispatching'`
+  rows to `dispatch_status='pending'` and clears `dispatch_claimed_at`.
+  `WebhookService::dispatch()` wraps only the composed dispatcher invocation:
+  on any escaping exception it releases the claim and rethrows the original
+  exception; `markLogicalDispatched()` remains reachable only on success.
+  If releasing itself fails, Payvia logs that secondary failure and rethrows
+  the original dispatch exception; stale-claim recovery remains the final
+  backstop. This applies equally to the existing strict chargeback lane.
+- **Observable failure:** after release, the original exception still surfaces
+  from `WebhookService::ingest()` through the HTTP error path and from
+  `ProcessWebhookJob::handle()` to the queue worker. Ordinary bus listener
+  exceptions remain swallowed inside `EventService::dispatch()` and therefore
+  do not trigger claim release.
 - The `makeProviderChargebackDispatcher()` docblock is updated to describe
   BOTH strict lanes and point at the shared contract language.
 
@@ -105,8 +127,21 @@ Details:
 The subscriptions repo amends its unpublished 2.0.0 (spec + plan + CHANGELOG
 amendment; **no 2.0.1**):
 
-- `PayviaSubscriptionEventBridge` implements `StrictPaymentEventListener`.
-  `supports()` uses a **closed event set** — not a prefix rule:
+- **Preserve Payvia as an optional dependency.** The existing
+  `PayviaSubscriptionEventBridge` remains Payvia-type-neutral and keeps its
+  wrapper-based `__invoke()` entry point for the ≤2.3 fallback. It MUST NOT
+  implement a Payvia-owned interface: subscriptions only `suggest`s Payvia,
+  and the bridge is currently an unconditional service definition, so doing
+  so would make loading subscriptions without Payvia fatal.
+- Add a separate `StrictPayviaSubscriptionEventBridge` that implements
+  `StrictPaymentEventListener` and delegates projection of the inner event to
+  shared logic on the neutral bridge. The strict adapter class is referenced,
+  resolved, and tagged only while the strict interface exists; the
+  Payvia-absent container never loads it. Payvia 2.4 is a subscriptions
+  **development** dependency for contract/type tests, not a runtime
+  requirement; runtime `composer.json` keeps Payvia under `suggest`.
+- The strict adapter's `supports()` uses a **closed event set** — not a prefix
+  rule:
 
   ```php
   private const SUPPORTED_TYPES = [
@@ -119,49 +154,91 @@ amendment; **no 2.0.1**):
   ];
   ```
 
-  `supports()` returns true iff BOTH: `type()` is in that exact set AND
-  `normalized()['gateway_subscription_id']` is a non-empty string. This
-  excludes one-off payments, unknown future event types, and unrelated
-  provider objects; expanding the projector's vocabulary requires
-  consciously expanding this list and its tests. (The projector keeps its
-  own guards unchanged — the bridge filter is the lane gate, not the
-  validation authority.)
+  The type MUST be in that set and
+  `normalized()['gateway_subscription_id']` MUST be a non-empty string. Those
+  conditions classify vocabulary and shape, not ownership: another Payvia
+  consumer may legitimately own a provider subscription with the same event
+  shape. Therefore one of these ownership proofs is also required:
+
+  1. `SubscriptionRepository::findByProviderSubscription(context, gateway, id)`
+     finds an existing local subscription; or
+  2. `normalized()['metadata']['glueful_consumer'] === 'subscriptions'`.
+
+  The repository lookup runs through
+  `TenantIntegration::runAsSystemOr(...)`, matching webhook projection's
+  system-context discipline; it must not depend on a current tenant being
+  established. The explicit, flat provider-metadata marker is written by
+  whichever host flow creates a subscriptions-owned provider subscription
+  and retained in later normalized events. It is what lets a strict
+  `subscription.created` enter the retry path during the narrow race before
+  the local row is committed. Existing linked subscriptions need no marker
+  because the repository mapping is sufficient. `glueful_consumer` joins
+  `ProviderEventData`'s metadata allowlist so accepted events and receipts
+  retain the ownership evidence without retaining arbitrary metadata.
+  Unknown types, missing IDs, unmapped events without the marker, and one-off
+  payments return false. Expanding the projector vocabulary requires a
+  conscious list-and-tests change. The projector remains the validation and
+  subject/scope authority after this routing decision.
 - **Exactly one lane** (no double invocation): when payvia ≥ 2.4 is
-  installed (`interface_exists(StrictPaymentEventListener::class)`), the
-  subscriptions provider registers the bridge ONLY under the container tag
-  and does NOT `EventService::addListener()`. With payvia ≤ 2.3 the current
-  bus listener remains as a **documented degraded fallback** (fault-isolated
-  delivery; the retryable-unmapped guarantee does not hold). The strict
-  guarantee applies only with payvia ≥ 2.4 — stated in subscriptions'
+  installed (`interface_exists(StrictPaymentEventListener::class)`),
+  `SubscriptionsServiceProvider::services()` conditionally defines the strict
+  adapter and `static tags()` publishes that adapter under
+  `StrictPaymentEventListener::CONTAINER_TAG`; `boot()` does NOT call
+  `EventService::addListener()`. With Payvia ≤2.3, `tags()` returns no strict
+  entry and `boot()` keeps the existing neutral bridge as the bus listener.
+  With Payvia absent, neither lane registers. A small pure registration-mode
+  decision (`strict|bus|none`) takes the two capability booleans so all three
+  branches are testable without redefining runtime classes. The strict
+  guarantee applies only with Payvia ≥2.4 and is stated in subscriptions'
   CHANGELOG/README and BYOP §6.
 
 ## 4. Testing
 
 **Payvia (this repo):**
-- Contract/lane units: FQCN ordering deterministic across registration
-  orders; `supports()` false ⇒ `handle()` never called; empty tag ⇒
-  dispatcher behaves byte-identically to today.
-- Failure semantics (service-level): a throwing strict listener leaves the
-  logical dispatch unmarked and the exception escapes `processStored()`;
-  redelivery invokes the same listener again (at-least-once proven); a
-  strict failure does not prevent ordinary listeners having run (existing
-  posture); ordinary-listener exceptions remain swallowed (fault isolation
-  untouched).
-- Controller-level: `ingest()` inline mode surfaces the escaping exception
-  (the existing error path); queue mode enqueues normally (the job-side
-  propagation is already covered by the job's own contract).
+- Contract/lane units: FQCN ordering is identical across registration orders;
+  duplicate concrete classes and non-contract tagged values fail loudly;
+  `supports()` false ⇒ `handle()` never called; empty tag ⇒ dispatcher
+  behaves byte-identically to today.
+- Repository unit: `releaseLogicalDispatch()` changes only the matching
+  `dispatching` logical claim to `pending`, clears `dispatch_claimed_at`, and
+  cannot reopen a `dispatched` row or another logical key.
+- Failure semantics (service-level): a throwing strict listener releases the
+  claim, leaves logical dispatch unmarked, and the original exception escapes
+  `processStored()`; an **immediate** second attempt with the same delivery and
+  logical key invokes it again without altering timestamps or waiting 300
+  seconds. A fail-once listener then succeeds and reaches `dispatched` exactly
+  once. Ordinary listeners run again under the established at-least-once
+  posture; their own exceptions remain fault-isolated.
+- Existing chargeback tests are strengthened to prove the same immediate
+  retry behavior now that all escaping composed-dispatch failures release the
+  claim. A simulated release failure proves stale reclaim remains available
+  and the original listener exception is the one rethrown.
+- Inline/controller path: the first strict failure escapes into the HTTP error
+  path; immediate provider redelivery re-executes rather than receiving a
+  false duplicate success. Queue path: a fail-once strict listener makes the
+  first `ProcessWebhookJob::handle()` throw and the immediate retry execute
+  again and complete; it must not silently return while the claim is fresh.
 
 **Subscriptions (companion, inside the 2.0.0 amendment):**
-- `supports()` decision matrix on the existing `FakePaymentProviderEvent`
-  (each supported type × with/without `gateway_subscription_id`; an
-  unsupported type with an id; empty-string id).
-- Registration branch: with the contract interface present the provider
-  defines the bridge tagged and skips `addListener`; the ≤ 2.3 fallback
-  branch keeps the listener (tested via the provider's definition arrays,
-  not runtime class fakery).
-- Neither suite executes the other repo's code; each side tests its half of
-  the shared contract. The true end-to-end lands when both are installed in
-  a host (Thallo Phase 2).
+- Add Payvia `^2.4` as a development dependency and test the strict adapter
+  against the real published interface. Payvia remains only a runtime
+  suggestion.
+- `supports()` matrix: each closed type; missing/empty ID; unknown type with
+  an ID; mapped local subscription without marker; unmapped event with the
+  exact ownership marker; unmapped event without it; hostile/lookalike marker;
+  and one-off payment. The marker survives `ProviderEventData::sanitize()`.
+- The neutral bus bridge and strict adapter feed byte-identical
+  `ProviderSubscriptionEvent` values into the same projector logic.
+- The pure registration-mode decision covers `strict`, `bus`, and `none`;
+  provider definition/tag tests prove strict mode defines and tags only the
+  strict adapter, boot does not add the bus listener, fallback mode adds only
+  the neutral listener, and absent mode does neither. A compiled-container
+  test proves a Payvia-absent subscriptions install never loads the optional
+  strict adapter or its interface.
+- Payvia's suite does not execute subscriptions code. Subscriptions' suite
+  consumes only Payvia's released contract in its strict-adapter tests; the
+  full cross-package webhook round trip lands when both are installed in a
+  host (Thallo Phase 2).
 
 ## 5. Out of scope
 
