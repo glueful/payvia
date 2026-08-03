@@ -234,24 +234,26 @@ interface StrictPaymentEventListener
 }
 ```
 
-Register your listener in the service provider with the `payvia.strict_payment_event_listeners` tag:
+Register your listener from your extension's **static** `services()` map, and publish the tag with the definition-level `'tags'` key on the listener's own definition:
 
 ```php
-public function services(): array
+use Glueful\Extensions\Payvia\Contracts\StrictPaymentEventListener;
+
+public static function services(): array
 {
     return [
         // ... other services ...
-        MyStrictEventListener::class => fn() => new MyStrictEventListener(),
-    ];
-}
-
-public function tags(): array
-{
-    return [
-        'payvia.strict_payment_event_listeners' => [MyStrictEventListener::class],
+        MyStrictEventListener::class => [
+            'class' => MyStrictEventListener::class,
+            'shared' => true,
+            'autowire' => true,
+            'tags' => [StrictPaymentEventListener::CONTAINER_TAG],
+        ],
     ];
 }
 ```
+
+> **`static tags()` does not work here.** `ContainerFactory::loadExtensionDefinitions()` only consults a provider's static `tags()` for typed `defs()`-based providers; for a `services()`-based (DSL) provider the tag comes exclusively from each definition's own `'tags'` key. A `services()`-based provider that publishes the tag via `tags()` is silently registered untagged, and `composeStrictLane()` never sees the listener. See the §3 correction in `docs/superpowers/specs/2026-08-02-strict-payment-event-lane-design.md`.
 
 #### Listener Obligations
 

@@ -218,6 +218,22 @@ amendment; **no 2.0.1**):
   payments return false. Expanding the projector vocabulary requires a
   conscious list-and-tests change. The projector remains the validation and
   subject/scope authority after this routing decision.
+
+  **§3 CORRECTION (spec-owner ruling, final fix wave) — `subscription.created`
+  requires NO ownership proof.** The two proofs above apply to the five
+  non-created types only. At creation time there is by definition no local
+  (gateway, id) link, and the legacy tenant-metadata relink flow
+  (`metadata.tenant_uuid`, no `glueful_consumer`) carries no marker — so
+  demanding proof for `subscription.created` silently strands every 1.x-shaped
+  checkout the moment the strict lane is enabled. A created event with a
+  non-empty `gateway_subscription_id` is therefore supported outright. This is
+  safe because the projector, not `supports()`, remains the sole
+  subject/scope/receipt/rejection/retry authority after routing: a foreign
+  created event resolves to no subject or no local row and is rejected or
+  thrown back as retryable-unmapped, never mis-projected. The accepted cost is
+  foreign created-event **retries**; a cryptographic correlation token minted
+  at checkout and echoed by the provider is the only clean fix, and is out of
+  scope for this release.
 - **Exactly one lane** (no double invocation): when payvia ≥ 2.4 is
   installed (`interface_exists(StrictPaymentEventListener::class)`),
   `SubscriptionsServiceProvider::services()` conditionally defines the strict

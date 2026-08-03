@@ -169,14 +169,21 @@ final class DisputeWebhookDispatchTest extends PayviaTestCase
     }
 
     /**
-     * Task 3 ordering guard: composes all THREE lanes `PayviaServiceProvider::
-     * makeWebhookService()` actually chains -- real fault-isolated ordinary bus dispatch (via a
-     * REAL `EventService`, not an injected callable), the tagged strict lane (composed through the
+     * Task 3 ordering shape: HAND-BUILDS all three lanes `PayviaServiceProvider::
+     * makeWebhookService()` chains -- real fault-isolated ordinary bus dispatch (via a REAL
+     * `EventService`, not an injected callable), the tagged strict lane (composed through the
      * production `PayviaServiceProvider::composeStrictLane()`), then a real
      * `ProviderChargebackDispatcher` -- and has each one push a marker onto a single shared
-     * `$order` array. No other test builds all three lanes together, so this is the only test that
-     * would catch a regression that reorders the strict `foreach` and `$chargebacks->handle()`
-     * lines inside `makeWebhookService()`'s composed dispatcher.
+     * `$order` array.
+     *
+     * NOT a regression guard for the production closure (fix wave I5 corrects this docblock's
+     * earlier over-claim): the dispatcher assembled below is a COPY of the one
+     * `makeWebhookService()` builds, so reordering the strict `foreach` and
+     * `$chargebacks->handle()` lines in the real factory would leave this test GREEN. What it
+     * does prove is that the three lanes compose correctly against real collaborators. The
+     * production closure itself is covered by
+     * {@see \Glueful\Extensions\Payvia\Tests\Integration\Container\ProductionWebhookServiceCompositionTest},
+     * which resolves `WebhookService` from a real `ContainerFactory` container.
      *
      * @param list<string> $order
      * @return array{0: WebhookService, 1: EventService}
@@ -959,11 +966,10 @@ final class DisputeWebhookDispatchTest extends PayviaTestCase
 
     /**
      * Task 3: pins the FULL three-lane order -- ordinary bus dispatch, THEN the tagged strict
-     * lane, THEN chargebacks -- in one composed dispatcher, using a real recognized dispute-type
-     * event so it actually reaches the chargeback dispatcher. Every other test in this file
-     * either composes ordinary+chargebacks (no strict lane) or, in StrictDispatchFailureTest,
-     * ordinary+strict (no chargebacks) -- neither would fail if the strict `foreach` and
-     * `$chargebacks->handle()` lines in `makeWebhookService()` were swapped.
+     * lane, THEN chargebacks -- in one HAND-COMPOSED dispatcher, using a real recognized
+     * dispute-type event so it actually reaches the chargeback dispatcher. See
+     * {@see orderedThreeLaneService()}: this pins the order of a copy, not of the shipped
+     * factory's closure; `ProductionWebhookServiceCompositionTest` pins that one.
      */
     public function testAllThreeLanesRunInExactOrderOrdinaryThenStrictThenChargebacks(): void
     {
