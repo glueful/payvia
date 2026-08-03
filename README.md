@@ -213,6 +213,60 @@ The webhook route intentionally has no `auth` middleware. Payvia verifies the pr
 
 `payvia:relay-events` replays processed provider events that were not dispatched yet, including crash recovery for rows stuck in `dispatching`.
 
+### Strict Delivery and Listener Contracts
+
+Payvia supports an **opt-in strict-delivery lane** for consumers that require guaranteed at-least-once event delivery and are willing to pay the cost of mandatory idempotency.
+
+#### Strict Listener Interface
+
+Implement `Glueful\Extensions\Payvia\Contracts\StrictPaymentEventListener`:
+
+```php
+namespace Glueful\Extensions\Payvia\Contracts;
+
+interface StrictPaymentEventListener
+{
+    public const CONTAINER_TAG = 'payvia.strict_payment_event_listeners';
+
+    public function supports(PaymentProviderEventInterface $event): bool;
+
+    public function handle(PaymentProviderEventInterface $event): void;
+}
+```
+
+Register your listener in the service provider with the `payvia.strict_payment_event_listeners` tag:
+
+```php
+public function services(): array
+{
+    return [
+        // ... other services ...
+        MyStrictEventListener::class => fn() => new MyStrictEventListener(),
+    ];
+}
+
+public function tags(): array
+{
+    return [
+        'payvia.strict_payment_event_listeners' => [MyStrictEventListener::class],
+    ];
+}
+```
+
+#### Listener Obligations
+
+Strict listeners are invoked in a **deterministic, FQCN-sorted order** between ordinary (fault-isolated) listeners and chargebacks. **A listener exception prevents dispatch-marking and produces a retryable delivery** — both inline (non-2xx webhook response) and queued (retried job).
+
+Implementations **MUST be idempotent** — delivery is at-least-once by design:
+
+- **Idempotency:** a single business fact may be delivered multiple times (e.g. after a sibling listener fails, the strict lane re-runs from the start). Your handler must detect and skip duplicates or apply the same logic safely multiple times without side effects.
+- **At-least-once:** a handler failure leaves the delivery marked retryable; a subsequent delivery will reinvoke all strict listeners, including those that already succeeded. Design handlers to tolerate re-execution.
+- **Failure is observable:** if your handler throws, the exception propagates (after releasing the internal lease), producing a `500` response in inline mode or a retried job in queue mode. Payvia does **not** log or swallow strict listener exceptions — that's your contract: throw to signal "this delivery must be retried."
+
+#### Chargeback Lane
+
+The existing chargeback delivery lane (the final step) is **also strict** — exceptions prevent dispatch-marking and produce retryable delivery. Chargeback listeners already operate under the at-least-once / idempotency contract; no change is required, but the timing of re-execution has improved (immediate retry instead of waiting for stale-lease recovery).
+
 ## Provider Subscriptions
 
 Payvia persists gateway-owned subscription state in `gateway_subscriptions` and exposes `GatewaySubscriptionService::reconcile($gateway, $gatewaySubscriptionId)`. It stays tenancy-agnostic: tenant ownership and entitlement decisions belong to `glueful/subscriptions`.
