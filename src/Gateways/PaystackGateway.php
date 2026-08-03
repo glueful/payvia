@@ -14,6 +14,7 @@ use Glueful\Extensions\Contracts\Payments\PayoutStatusResult;
 use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionCancellationModeProvider;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
@@ -30,6 +31,7 @@ final class PaystackGateway implements
     InitiationCapableGateway,
     WebhookCapableGateway,
     SubscriptionCapableGateway,
+    SubscriptionCancellationModeProvider,
     TransferCapableGateway
 {
     private ApplicationContext $context;
@@ -276,6 +278,18 @@ final class PaystackGateway implements
         ]);
 
         return $response->toArray();
+    }
+
+    /**
+     * Paystack's subscription-disable API (behind the existing `cancelSubscription()`, driven
+     * by its `atPeriodEnd` flag) only ever stops future renewal -- there is no Paystack API to
+     * immediately revoke an in-progress billing period, so `immediate` is deliberately absent.
+     *
+     * @return list<'stop_renewal'|'immediate'>
+     */
+    public function cancellationModes(): array
+    {
+        return ['stop_renewal'];
     }
 
     /**
