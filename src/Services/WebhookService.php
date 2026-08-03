@@ -32,12 +32,18 @@ final class WebhookService
      * `markLogicalDispatched()` (run after `$dispatcher` returns without throwing) can ever mark
      * that logical dispatch done, and a dispatcher failure leaves the row stuck `dispatching`
      * until `relayPending()`'s stale-claim reclaim recovers it. `PayviaServiceProvider::
-     * makeWebhookService()` composes `$dispatcher` from two steps run in order: ordinary local
-     * `PaymentProviderEvent` delivery first, then delegation to `Events\ProviderChargebackDispatcher`
-     * for recognized dispute/chargeback types. Neither step is caught here -- any exception from
-     * either half propagates out of `dispatch()` (after the lease-path release, if applicable) and
-     * leaves the logical dispatch unmarked, so the row stays redispatchable via `relayPending()`
-     * (or, on the lease path, immediately retryable via `processStored()`).
+     * makeWebhookService()` composes `$dispatcher` from THREE steps run in order: ordinary local
+     * `PaymentProviderEvent` delivery first (through the framework's fault-isolated
+     * `EventService::dispatch()` -- a single bad listener there can never abort delivery or this
+     * method), then the opt-in tagged strict lane (`Contracts\StrictPaymentEventListener`,
+     * composed via `PayviaServiceProvider::composeStrictLane()`), then delegation to
+     * `Events\ProviderChargebackDispatcher` for recognized dispute/chargeback types, always last.
+     * Only the first step is fault-isolated; the strict lane and the chargeback dispatcher are
+     * both uncaught here -- any exception from either propagates out of `dispatch()` (after the
+     * lease-path release, if applicable) and leaves the logical dispatch unmarked, so the row
+     * stays redispatchable via `relayPending()` (or, on the lease path, immediately retryable via
+     * `processStored()`). An empty strict lane (no tagged listeners registered) makes this
+     * three-step composition behaviorally identical to the original two-step one.
      *
      * @param null|callable(PaymentProviderEvent):void $dispatcher
      * @param null|callable(PaymentProviderEventInterface):void $applier
