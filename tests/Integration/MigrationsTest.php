@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Tests\Integration;
 
+use Glueful\Extensions\Payvia\Database\Migrations\AddProviderEventDispatchClaimToken;
 use Glueful\Extensions\Payvia\Database\Migrations\AddProviderEventsDispatchIndex;
 use Glueful\Extensions\Payvia\Database\Migrations\CreateBillingPlansTable;
 use Glueful\Extensions\Payvia\Database\Migrations\CreateGatewaySubscriptionsTable;
@@ -155,6 +156,59 @@ final class MigrationsTest extends PayviaTestCase
         ksort($columns);
 
         return array_values($columns);
+    }
+
+    public function testDispatchClaimTokenMigrationAddsNullableColumn(): void
+    {
+        $schema = $this->connection->getSchemaBuilder();
+        (new CreateProviderEventsTable())->up($schema);
+
+        self::assertFalse($schema->hasColumn('provider_events', 'dispatch_claim_token'));
+
+        (new AddProviderEventDispatchClaimToken())->up($schema);
+
+        self::assertTrue($schema->hasColumn('provider_events', 'dispatch_claim_token'));
+
+        // Nullable: inserting a row without the column must not fail.
+        $this->connection->table('provider_events')->insert([
+            'uuid' => 'nul1',
+            'gateway' => 'fake',
+            'source' => 'webhook',
+            'delivery_key' => 'nul1',
+            'logical_event_key' => 'payment.succeeded:NUL1',
+            'type' => 'payment.succeeded',
+        ]);
+        $row = $this->connection->table('provider_events')->where(['uuid' => 'nul1'])->first();
+        self::assertNull($row['dispatch_claim_token']);
+    }
+
+    public function testDispatchClaimTokenMigrationIsIdempotent(): void
+    {
+        $schema = $this->connection->getSchemaBuilder();
+        (new CreateProviderEventsTable())->up($schema);
+
+        $migration = new AddProviderEventDispatchClaimToken();
+        $migration->up($schema);
+        // Running up() a second time must not throw on a duplicate column.
+        $migration->up($schema);
+
+        self::assertTrue($schema->hasColumn('provider_events', 'dispatch_claim_token'));
+    }
+
+    public function testDispatchClaimTokenMigrationDownDropsColumn(): void
+    {
+        $schema = $this->connection->getSchemaBuilder();
+        (new CreateProviderEventsTable())->up($schema);
+
+        $migration = new AddProviderEventDispatchClaimToken();
+        $migration->up($schema);
+        $migration->down($schema);
+
+        self::assertFalse($schema->hasColumn('provider_events', 'dispatch_claim_token'));
+
+        // down() is guarded and safe to run again without the column present.
+        $migration->down($schema);
+        self::assertFalse($schema->hasColumn('provider_events', 'dispatch_claim_token'));
     }
 
     public function testGatewaySubscriptionsTableShape(): void
