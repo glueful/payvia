@@ -68,9 +68,9 @@ Pins (from the design ruling):
   sibling listener's failure re-invokes listeners that already succeeded.
   `handle()` throwing prevents the webhook's dispatch-marking and produces a
   retryable delivery (non-2xx response in inline mode; a retried job in
-  queue mode). Payvia releases the logical dispatch claim before rethrowing,
-  so the next attempt can run immediately rather than waiting for stale-claim
-  recovery.
+  queue mode). Payvia releases that worker's owner-fenced logical dispatch
+  lease before rethrowing, so the next attempt can run immediately rather
+  than waiting for stale-lease recovery.
 
 ## 2. The lane
 
@@ -96,24 +96,63 @@ Details:
   listeners by FQCN (`get_class`) before invocation. A priority mechanism is
   deliberately omitted (YAGNI); the uniqueness rule closes the otherwise
   ambiguous equal-key case.
-- **Immediate retry requires an explicit claim release.** Today
+- **Immediate retry requires an owner-fenced claim release.** Today
   `claimLogicalForDispatch()` changes the row to `dispatching`; if dispatch
   throws, an immediate provider or queue retry cannot reclaim it until the
   default 300-second stale window and can be acknowledged without invoking
-  listeners. Add this repository contract:
+  listeners. Adding a method to the existing public
+  `ProviderEventRepositoryInterface` would break third-party implementations
+  in a minor release, so that interface remains byte-for-byte unchanged. Add
+  a separate additive capability contract:
 
   ```php
-  public function releaseLogicalDispatch(string $gateway, string $logicalEventKey): void;
+  interface LogicalDispatchLeaseRepositoryInterface
+  {
+      public function acquireLogicalDispatchLease(
+          string $gateway,
+          string $logicalEventKey,
+          int $staleSeconds = 300,
+      ): ?string;
+
+      public function completeLogicalDispatch(
+          string $gateway,
+          string $logicalEventKey,
+          string $leaseToken,
+      ): bool;
+
+      public function releaseLogicalDispatch(
+          string $gateway,
+          string $logicalEventKey,
+          string $leaseToken,
+      ): bool;
+  }
   ```
 
-  Its implementation updates only matching `dispatch_status='dispatching'`
-  rows to `dispatch_status='pending'` and clears `dispatch_claimed_at`.
-  `WebhookService::dispatch()` wraps only the composed dispatcher invocation:
-  on any escaping exception it releases the claim and rethrows the original
-  exception; `markLogicalDispatched()` remains reachable only on success.
-  If releasing itself fails, Payvia logs that secondary failure and rethrows
-  the original dispatch exception; stale-claim recovery remains the final
-  backstop. This applies equally to the existing strict chargeback lane.
+  Migration `009` adds nullable `dispatch_claim_token VARCHAR(64)`.
+  Acquisition atomically claims either pending rows or a stale dispatching
+  lease and stamps a fresh opaque token plus `dispatch_claimed_at`. Completion
+  and release compare `(gateway, logical_event_key, dispatch_status,
+  dispatch_claim_token)`: a worker can only complete or release the lease it
+  acquired. This fencing is load-bearing. Without it, worker A can exceed the
+  stale window, worker B can reclaim the key, and A's later failure can reset
+  B's live claim to pending. A concurrent test pins that B remains owner after
+  precisely that sequence.
+
+  `ProviderEventRepository` implements both the unchanged legacy repository
+  interface and the new lease capability. `WebhookService` receives the lease
+  capability as a new optional final constructor argument; Payvia's production
+  factory passes the same repository instance for both roles when it implements
+  the capability; a custom implementation of only the old interface receives
+  `null`. Existing direct constructors/custom repositories therefore remain
+  source-compatible and retain the old stale-recovery behavior when the
+  optional capability is absent.
+
+  On the lease path, `WebhookService::dispatch()` wraps only the composed
+  dispatcher invocation: on any escaping exception it releases its own lease
+  and rethrows the original exception; lease completion is reachable only on
+  success. If releasing itself fails, Payvia logs that secondary failure and
+  rethrows the original dispatch exception; stale-lease recovery remains the
+  final backstop. This applies equally to the existing strict chargeback lane.
 - **Observable failure:** after release, the original exception still surfaces
   from `WebhookService::ingest()` through the HTTP error path and from
   `ProcessWebhookJob::handle()` to the queue worker. Ordinary bus listener
@@ -199,20 +238,25 @@ amendment; **no 2.0.1**):
   duplicate concrete classes and non-contract tagged values fail loudly;
   `supports()` false ⇒ `handle()` never called; empty tag ⇒ dispatcher
   behaves byte-identically to today.
-- Repository unit: `releaseLogicalDispatch()` changes only the matching
-  `dispatching` logical claim to `pending`, clears `dispatch_claimed_at`, and
-  cannot reopen a `dispatched` row or another logical key.
-- Failure semantics (service-level): a throwing strict listener releases the
-  claim, leaves logical dispatch unmarked, and the original exception escapes
+- Repository/migration units: migration `009` adds and rolls back the nullable
+  claim-token column; lease acquisition returns a fresh opaque token and
+  claims only the matching logical key; completion/release require that exact
+  token and cannot affect a dispatched row, another key, or a successor lease.
+  The stale-worker race is explicit: A claims, B reclaims after A is made stale,
+  then A's release and completion both fail while B remains `dispatching`.
+- Failure semantics (service-level): a throwing strict listener releases its
+  lease, leaves logical dispatch unmarked, and the original exception escapes
   `processStored()`; an **immediate** second attempt with the same delivery and
   logical key invokes it again without altering timestamps or waiting 300
   seconds. A fail-once listener then succeeds and reaches `dispatched` exactly
   once. Ordinary listeners run again under the established at-least-once
   posture; their own exceptions remain fault-isolated.
 - Existing chargeback tests are strengthened to prove the same immediate
-  retry behavior now that all escaping composed-dispatch failures release the
-  claim. A simulated release failure proves stale reclaim remains available
-  and the original listener exception is the one rethrown.
+  retry behavior now that all escaping composed-dispatch failures release their
+  lease. A simulated release failure proves stale reclaim remains available
+  and the original listener exception is the one rethrown. The secondary log
+  is asserted concretely by redirecting PHP's `error_log` to a temporary file;
+  documenting instead of testing it is not an acceptable substitute.
 - Inline/controller path: the first strict failure escapes into the HTTP error
   path; immediate provider redelivery re-executes rather than receiving a
   false duplicate success. Queue path: a fail-once strict listener makes the
@@ -222,7 +266,10 @@ amendment; **no 2.0.1**):
 **Subscriptions (companion, inside the 2.0.0 amendment):**
 - Add Payvia `^2.4` as a development dependency and test the strict adapter
   against the real published interface. Payvia remains only a runtime
-  suggestion.
+  suggestion. Add a dedicated strict-lane fake that implements
+  `PaymentProviderEventInterface`; the existing `FakePaymentProviderEvent` is
+  a bus wrapper and its inner fake deliberately does not implement Payvia's
+  optional interface, so neither is reused for the strict contract tests.
 - `supports()` matrix: each closed type; missing/empty ID; unknown type with
   an ID; mapped local subscription without marker; unmapped event with the
   exact ownership marker; unmapped event without it; hostile/lookalike marker;
@@ -232,9 +279,11 @@ amendment; **no 2.0.1**):
 - The pure registration-mode decision covers `strict`, `bus`, and `none`;
   provider definition/tag tests prove strict mode defines and tags only the
   strict adapter, boot does not add the bus listener, fallback mode adds only
-  the neutral listener, and absent mode does neither. A compiled-container
-  test proves a Payvia-absent subscriptions install never loads the optional
-  strict adapter or its interface.
+  the neutral listener, and absent mode does neither. A real
+  `ContainerFactory`/compiler test over the generated `bus` and `none`
+  definitions proves a Payvia-absent subscriptions install never reflects or
+  loads the optional strict adapter or its interface; a source-array/string
+  assertion is not an acceptable replacement for this gate.
 - Payvia's suite does not execute subscriptions code. Subscriptions' suite
   consumes only Payvia's released contract in its strict-adapter tests; the
   full cross-package webhook round trip lands when both are installed in a
