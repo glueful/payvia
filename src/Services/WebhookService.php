@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Services;
 
 use Glueful\Bootstrap\ApplicationContext;
+use Glueful\Extensions\Payvia\Contracts\LogicalDispatchLeaseRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
 use Glueful\Extensions\Payvia\Events\EventType;
@@ -17,13 +18,32 @@ final class WebhookService
     /**
      * WebhookService remains the SOLE durable `provider_events` owner: `$dispatcher` is called
      * from `dispatch()` only after a delivery has been persisted and atomically claimed for its
-     * logical key, and only `markLogicalDispatched()` (run after `$dispatcher` returns without
-     * throwing) can ever mark a logical dispatch done. `PayviaServiceProvider::makeWebhookService()`
-     * composes `$dispatcher` from two steps run in order: ordinary local `PaymentProviderEvent`
-     * delivery first, then delegation to `Events\ProviderChargebackDispatcher` for recognized
-     * dispute/chargeback types. Neither step is caught here -- any exception from either half
-     * propagates out of `dispatch()` and leaves the logical dispatch unmarked, so the row stays
-     * redispatchable via `relayPending()`.
+     * logical key. Completion of that claim depends on which claim mechanism won it: when
+     * `$logicalDispatchLeases` is present, `dispatch()` acquires an owner-fenced lease via
+     * {@see LogicalDispatchLeaseRepositoryInterface::acquireLogicalDispatchLease()} and, on a
+     * dispatcher failure, releases ONLY that lease (never legacy `markLogicalDispatched()`) before
+     * rethrowing -- so the row goes straight back to `pending` and an immediate retry (no clock
+     * manipulation, no waiting out `staleSeconds`) can reclaim and redispatch it. Completion on
+     * success goes exclusively through the fenced `completeLogicalDispatch()`; the two APIs are
+     * never mixed on the same row within this code path. When `$logicalDispatchLeases` is absent
+     * (the default -- e.g. a custom `ProviderEventRepositoryInterface` implementation that
+     * doesn't also implement the lease capability, or a direct constructor call from existing
+     * code), `dispatch()` falls back to today's byte-identical claim/reclaim/mark flow: only
+     * `markLogicalDispatched()` (run after `$dispatcher` returns without throwing) can ever mark
+     * that logical dispatch done, and a dispatcher failure leaves the row stuck `dispatching`
+     * until `relayPending()`'s stale-claim reclaim recovers it. `PayviaServiceProvider::
+     * makeWebhookService()` composes `$dispatcher` from THREE steps run in order: ordinary local
+     * `PaymentProviderEvent` delivery first (through the framework's fault-isolated
+     * `EventService::dispatch()` -- a single bad listener there can never abort delivery or this
+     * method), then the opt-in tagged strict lane (`Contracts\StrictPaymentEventListener`,
+     * composed via `PayviaServiceProvider::composeStrictLane()`), then delegation to
+     * `Events\ProviderChargebackDispatcher` for recognized dispute/chargeback types, always last.
+     * Only the first step is fault-isolated; the strict lane and the chargeback dispatcher are
+     * both uncaught here -- any exception from either propagates out of `dispatch()` (after the
+     * lease-path release, if applicable) and leaves the logical dispatch unmarked, so the row
+     * stays redispatchable via `relayPending()` (or, on the lease path, immediately retryable via
+     * `processStored()`). An empty strict lane (no tagged listeners registered) makes this
+     * three-step composition behaviorally identical to the original two-step one.
      *
      * @param null|callable(PaymentProviderEvent):void $dispatcher
      * @param null|callable(PaymentProviderEventInterface):void $applier
@@ -37,6 +57,7 @@ final class WebhookService
         private $applier = null,
         private bool $queue = false,
         private $enqueue = null,
+        private ?LogicalDispatchLeaseRepositoryInterface $logicalDispatchLeases = null,
     ) {
     }
 
@@ -173,21 +194,62 @@ final class WebhookService
             return false;
         }
 
-        $claimed = $this->events->claimLogicalForDispatch($event->gateway(), $event->logicalEventKey());
-        if ($claimed === 0) {
-            $claimed = $this->events->reclaimStaleDispatching(
+        $leaseToken = null;
+        if ($this->logicalDispatchLeases !== null) {
+            $leaseToken = $this->logicalDispatchLeases->acquireLogicalDispatchLease(
                 $event->gateway(),
                 $event->logicalEventKey(),
                 $staleSeconds
             );
-        }
+            if ($leaseToken === null) {
+                return false;
+            }
+        } else {
+            $claimed = $this->events->claimLogicalForDispatch($event->gateway(), $event->logicalEventKey());
+            if ($claimed === 0) {
+                $claimed = $this->events->reclaimStaleDispatching(
+                    $event->gateway(),
+                    $event->logicalEventKey(),
+                    $staleSeconds
+                );
+            }
 
-        if ($claimed === 0) {
-            return false;
+            if ($claimed === 0) {
+                return false;
+            }
         }
 
         if ($this->dispatcher !== null) {
-            ($this->dispatcher)(new PaymentProviderEvent($event));
+            try {
+                ($this->dispatcher)(new PaymentProviderEvent($event));
+            } catch (\Throwable $dispatchFailure) {
+                if ($leaseToken !== null && $this->logicalDispatchLeases !== null) {
+                    try {
+                        $this->logicalDispatchLeases->releaseLogicalDispatch(
+                            $event->gateway(),
+                            $event->logicalEventKey(),
+                            $leaseToken,
+                        );
+                    } catch (\Throwable $releaseFailure) {
+                        error_log(sprintf(
+                            '[Payvia] logical dispatch lease release failed for %s/%s: %s '
+                            . '(stale-lease recovery remains the backstop)',
+                            $event->gateway(),
+                            $event->logicalEventKey(),
+                            $releaseFailure->getMessage()
+                        ));
+                    }
+                }
+                throw $dispatchFailure;
+            }
+        }
+
+        if ($leaseToken !== null && $this->logicalDispatchLeases !== null) {
+            return $this->logicalDispatchLeases->completeLogicalDispatch(
+                $event->gateway(),
+                $event->logicalEventKey(),
+                $leaseToken,
+            );
         }
 
         $this->events->markLogicalDispatched($event->gateway(), $event->logicalEventKey());

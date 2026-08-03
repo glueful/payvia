@@ -9,6 +9,8 @@ use Glueful\Events\EventDispatcher;
 use Glueful\Events\EventService;
 use Glueful\Events\ListenerProvider;
 use Glueful\Extensions\Contracts\Payments\ProviderChargebackEvent;
+use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
+use Glueful\Extensions\Payvia\Contracts\StrictPaymentEventListener;
 use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentsTable;
 use Glueful\Extensions\Payvia\Database\Migrations\CreateProviderEventsTable;
 use Glueful\Extensions\Payvia\Events\EventType;
@@ -19,6 +21,7 @@ use Glueful\Extensions\Payvia\Exceptions\UnresolvedPaymentOwnershipException;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 use Glueful\Extensions\Payvia\Gateways\StripeGateway;
 use Glueful\Extensions\Payvia\GatewayManager;
+use Glueful\Extensions\Payvia\PayviaServiceProvider;
 use Glueful\Extensions\Payvia\Repositories\ProviderCorrelationRepository;
 use Glueful\Extensions\Payvia\Repositories\ProviderEventRepository;
 use Glueful\Extensions\Payvia\Services\WebhookService;
@@ -156,6 +159,91 @@ final class DisputeWebhookDispatchTest extends PayviaTestCase
 
         $dispatcher = static function (PaymentProviderEvent $event) use ($eventService, $chargebackDispatcher): void {
             $eventService->dispatch($event);
+            $chargebackDispatcher->handle($event->event);
+        };
+
+        $manager = new GatewayManager($this->context->getContainer(), $this->context);
+        $service = new WebhookService($this->context, $manager, $this->events, $dispatcher);
+
+        return [$service, $eventService];
+    }
+
+    /**
+     * Task 3 ordering shape: HAND-BUILDS all three lanes `PayviaServiceProvider::
+     * makeWebhookService()` chains -- real fault-isolated ordinary bus dispatch (via a REAL
+     * `EventService`, not an injected callable), the tagged strict lane (composed through the
+     * production `PayviaServiceProvider::composeStrictLane()`), then a real
+     * `ProviderChargebackDispatcher` -- and has each one push a marker onto a single shared
+     * `$order` array.
+     *
+     * NOT a regression guard for the production closure (fix wave I5 corrects this docblock's
+     * earlier over-claim): the dispatcher assembled below is a COPY of the one
+     * `makeWebhookService()` builds, so reordering the strict `foreach` and
+     * `$chargebacks->handle()` lines in the real factory would leave this test GREEN. What it
+     * does prove is that the three lanes compose correctly against real collaborators. The
+     * production closure itself is covered by
+     * {@see \Glueful\Extensions\Payvia\Tests\Integration\Container\ProductionWebhookServiceCompositionTest},
+     * which resolves `WebhookService` from a real `ContainerFactory` container.
+     *
+     * @param list<string> $order
+     * @return array{0: WebhookService, 1: EventService}
+     */
+    private function orderedThreeLaneService(array &$order): array
+    {
+        $listenerProvider = new ListenerProvider();
+        $eventDispatcher = new EventDispatcher($listenerProvider);
+        $eventService = new EventService($eventDispatcher, $listenerProvider);
+        $this->bind(EventService::class, $eventService);
+        $eventService->addListener(
+            PaymentProviderEvent::class,
+            static function () use (&$order): void {
+                $order[] = 'ordinary';
+            }
+        );
+
+        $strictListener = new class (static function () use (&$order): void {
+            $order[] = 'strict';
+        }) implements StrictPaymentEventListener {
+            /** @var callable():void */
+            private $onHandle;
+
+            public function __construct(callable $onHandle)
+            {
+                $this->onHandle = $onHandle;
+            }
+
+            public function supports(PaymentProviderEventInterface $event): bool
+            {
+                return true;
+            }
+
+            public function handle(PaymentProviderEventInterface $event): void
+            {
+                ($this->onHandle)();
+            }
+        };
+        $strict = PayviaServiceProvider::composeStrictLane([$strictListener]);
+
+        $chargebackDispatcher = new ProviderChargebackDispatcher(
+            $this->correlation,
+            static function (ProviderChargebackEvent $event) use (&$order): void {
+                $order[] = 'chargebacks';
+            }
+        );
+
+        // Mirrors PayviaServiceProvider::makeWebhookService()'s composed dispatcher exactly:
+        // ordinary bus dispatch, THEN the strict lane, THEN chargebacks, always last.
+        $dispatcher = static function (PaymentProviderEvent $event) use (
+            $eventService,
+            $strict,
+            $chargebackDispatcher
+        ): void {
+            $eventService->dispatch($event);
+            foreach ($strict as $listener) {
+                if ($listener->supports($event->event)) {
+                    $listener->handle($event->event);
+                }
+            }
             $chargebackDispatcher->handle($event->event);
         };
 
@@ -874,6 +962,43 @@ final class DisputeWebhookDispatchTest extends PayviaTestCase
         $stored = $this->events->findByDeliveryKey('stripe', 'evt_dispute_fault_isolated');
         self::assertNotNull($stored);
         self::assertSame('dispatched', $stored['dispatch_status']);
+    }
+
+    /**
+     * Task 3: pins the FULL three-lane order -- ordinary bus dispatch, THEN the tagged strict
+     * lane, THEN chargebacks -- in one HAND-COMPOSED dispatcher, using a real recognized
+     * dispute-type event so it actually reaches the chargeback dispatcher. See
+     * {@see orderedThreeLaneService()}: this pins the order of a copy, not of the shipped
+     * factory's closure; `ProductionWebhookServiceCompositionTest` pins that one.
+     */
+    public function testAllThreeLanesRunInExactOrderOrdinaryThenStrictThenChargebacks(): void
+    {
+        $this->insertPayment();
+        $order = [];
+        [$service] = $this->orderedThreeLaneService($order);
+
+        $body = json_encode([
+            'id' => 'evt_dispute_order',
+            'type' => 'charge.dispute.created',
+            'created' => 1700000000,
+            'data' => [
+                'object' => [
+                    'id' => 'dp_order',
+                    'object' => 'dispute',
+                    'amount' => 5000,
+                    'currency' => 'usd',
+                    'reason' => 'fraudulent',
+                    'status' => 'needs_response',
+                    'payment_intent' => 'pi_123',
+                    'charge' => 'ch_order',
+                ],
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $result = $service->ingest('stripe', $body, ['Stripe-Signature' => $this->stripeSignature($body)]);
+
+        self::assertTrue($result->accepted);
+        self::assertSame(['ordinary', 'strict', 'chargebacks'], $order);
     }
 
     public function testNoCommerceClassIsReferencedAnywhereInTheDisputeDispatchPath(): void

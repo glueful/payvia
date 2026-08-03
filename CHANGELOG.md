@@ -15,6 +15,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-08-03 — Opt-in Strict Payment-Event Lane
+
+Payvia gains an opt-in strict-delivery lane for payment provider events, allowing consumers
+(e.g. `glueful/subscriptions`) to receive guaranteed at-least-once delivery with mandatory
+idempotency. The lane composes a discrete step in the webhook pipeline, ordered between
+ordinary (fault-isolated) listener dispatch and the existing chargeback lane. Ordinary
+listener semantics are completely unchanged. No new migrations beyond the owner-fenced lease
+capability; chargeback delivery inherits the same release-on-failure behavior.
+
+### Added
+
+- **Opt-in strict payment-event lane** (`StrictPaymentEventListener` contract) — a discrete,
+  FQCN-ordered dispatch step for listeners that require guaranteed delivery. Each tagged
+  listener's `handle()` is invoked directly; an exception leaves logical dispatch unmarked
+  (exactly like the chargeback lane) and produces a retryable delivery. Collection is
+  container-tag-based (`payvia.strict_payment_event_listeners`); duplicate concrete classes
+  and non-contract tagged values fail service construction loudly.
+- **Owner-fenced logical dispatch leases** (`LogicalDispatchLeaseRepositoryInterface`) — an
+  additive capability for atomic, owner-fenced claim tokens on provider events. Acquisition
+  returns a fresh opaque token; completion and release require that exact token, preventing
+  a stale worker from interfering with a successor's active claim. Enables immediate retry
+  after strict-listener failure without waiting for the default 300-second stale-lease window.
+  `WebhookService::dispatch()` now releases its lease on any composed-dispatcher exception
+  (both strict and chargeback lanes) before rethrowing, so a concurrent delivery/retry can
+  reclaim immediately.
+
+### Migrations
+
+- **`009_AddProviderEventDispatchClaimToken`** — adds nullable `dispatch_claim_token
+  VARCHAR(64)` column to `provider_events`. Idempotent; safe to re-run if partially applied.
+  Run `php glueful migrate:run` after upgrading.
+
+### Changed
+
+- **Chargeback-lane delivery now releases owner-fenced leases on failure.** The existing
+  strict `ProviderChargebackEvent` dispatch (invoked last in the pipeline) now benefits from
+  the new immediate-retry behavior: on any listener exception, the lease is released before
+  rethrowing. Chargebacks remain the final composed step; nothing changes to their contract
+  or error handling — only the timing of failure-path re-execution improves.
+
+### Notes
+
+- **Ordinary `PaymentProviderEvent` listener semantics are byte-identical.** The fault-isolated
+  dispatch step (fault-isolated exceptions are logged and swallowed) remains the first
+  pipeline step, unchanged since 2.0.0.
+- **`ProviderEventRepositoryInterface` is unchanged.** The lease capability is a separate
+  additive interface; third-party `ProviderEventRepositoryInterface` implementations remain
+  source-compatible. When a custom repository does not implement `LogicalDispatchLeaseRepositoryInterface`,
+  `WebhookService` retains the original stale-window fallback for `dispatchOrFail()` failure recovery.
+- The strict lane is used by `glueful/subscriptions` (2.0.0 amendment) for subscription event
+  projection under the strict-delivery contract documented in its CHANGELOG and BYOP (Build-Your-Own-Provider)
+  guide, §6.
+
 ## [2.3.0] - 2026-08-01 — Hosted Initiation Metadata & Stripe Checkout
 
 The hosted-initiation seam becomes payable-type-agnostic and Stripe gains a hosted checkout flow.

@@ -16,9 +16,11 @@ use Glueful\Extensions\Contracts\Tenancy\TenantContextRunner;
 use Glueful\Extensions\Contracts\Tenancy\TenantTableRegistry;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\InvoiceRepositoryInterface;
+use Glueful\Extensions\Payvia\Contracts\LogicalDispatchLeaseRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
+use Glueful\Extensions\Payvia\Contracts\StrictPaymentEventListener;
 use Glueful\Extensions\Payvia\Controllers\BillingPlanController;
 use Glueful\Extensions\Payvia\Controllers\InvoiceController;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
@@ -330,9 +332,17 @@ final class PayviaServiceProvider extends ServiceProvider
      * `makeWebhookService()`'s composed callback, and out of `WebhookService::dispatch()`,
      * leaving the triggering `provider_events` row's logical dispatch unmarked. Because listener
      * delivery is therefore at-least-once, every listener wired to `ProviderChargebackEvent` MUST
-     * be idempotent. Ordinary local `PaymentProviderEvent` delivery in `makeWebhookService()`
-     * deliberately stays on the fault-isolated `dispatch()` path -- only the chargeback event
-     * goes strict.
+     * be idempotent.
+     *
+     * This chargeback lane is now the SECOND of two strict lanes `makeWebhookService()` composes:
+     * first the tagged {@see StrictPaymentEventListener} lane (also uncaught, also at-least-once,
+     * see that interface's docblock), then this chargeback dispatcher, always last. Both share
+     * the exact same release-on-failure semantics -- a throw from either one releases (or, absent
+     * the lease capability, leaves stuck for a later stale-claim sweep) the SAME in-flight
+     * logical-dispatch lease/claim `WebhookService::dispatch()` holds for the whole composed
+     * callable, not a lane-local one. Ordinary local `PaymentProviderEvent` delivery in
+     * `makeWebhookService()` deliberately stays on the fault-isolated `dispatch()` path -- only
+     * the tagged strict lane and the chargeback event go strict.
      */
     public static function makeProviderChargebackDispatcher(
         ContainerInterface $container
@@ -347,6 +357,41 @@ final class PayviaServiceProvider extends ServiceProvider
         );
     }
 
+    /**
+     * Validates and normalizes the raw iterable a container tag resolves into
+     * {@see StrictPaymentEventListener::CONTAINER_TAG} into the deterministic list
+     * `makeWebhookService()`'s composed dispatcher iterates. Every item MUST implement the
+     * contract -- a non-implementing tagged value is a wiring mistake, not something to silently
+     * skip, so it throws naming the offending value's type. Two tagged instances of the SAME
+     * concrete class are rejected the same way, naming the class, since that would either double-
+     * deliver or mask which instance actually ran. The FQCN sort makes lane order deterministic
+     * across requests/processes regardless of container resolution/tagging order.
+     *
+     * @param iterable<mixed> $tagged
+     * @return list<StrictPaymentEventListener>
+     */
+    public static function composeStrictLane(iterable $tagged): array
+    {
+        $byClass = [];
+        foreach ($tagged as $item) {
+            if (!$item instanceof StrictPaymentEventListener) {
+                throw new \LogicException(sprintf(
+                    'Tagged strict payment-event listener %s does not implement %s.',
+                    get_debug_type($item),
+                    StrictPaymentEventListener::class
+                ));
+            }
+            $class = get_class($item);
+            if (isset($byClass[$class])) {
+                throw new \LogicException("Duplicate strict payment-event listener class {$class}.");
+            }
+            $byClass[$class] = $item;
+        }
+        ksort($byClass, SORT_STRING);
+
+        return array_values($byClass);
+    }
+
     public static function makeWebhookService(ContainerInterface $container): WebhookService
     {
         $context = $container->get(ApplicationContext::class);
@@ -355,16 +400,43 @@ final class PayviaServiceProvider extends ServiceProvider
         $queueEnabled = (bool) config($context, 'payvia.webhooks.queue', false);
         $queueName = (string) config($context, 'payvia.webhooks.queue_name', 'default');
 
+        // Resolved ONCE and reused both as the durable `ProviderEventRepositoryInterface` and,
+        // when it also implements the additive lease capability, as WebhookService's optional
+        // final constructor argument. A custom legacy implementation that doesn't implement
+        // LogicalDispatchLeaseRepositoryInterface simply passes null here and WebhookService
+        // keeps its byte-identical claim/reclaim/mark fallback -- construction never fails.
+        $events = $container->get(ProviderEventRepositoryInterface::class);
+        $logicalDispatchLeases = $events instanceof LogicalDispatchLeaseRepositoryInterface ? $events : null;
+
+        // Composed ONCE per service construction (not per dispatch) from whatever is currently
+        // tagged under StrictPaymentEventListener::CONTAINER_TAG -- an absent tag, or a container
+        // that plainly can't resolve an iterable from it, behaves exactly like an empty lane.
+        $strict = self::composeStrictLane(
+            $container->has(StrictPaymentEventListener::CONTAINER_TAG)
+                && is_iterable($tagged = $container->get(StrictPaymentEventListener::CONTAINER_TAG))
+                ? $tagged
+                : []
+        );
+
         // FIRST preserve ordinary local delivery (unconditional, unaffected by dispute
-        // recognition), THEN delegate recognized dispute/chargeback types to the named
-        // dispatcher. Nothing here catches ProviderChargebackDispatcher::handle()'s exceptions
-        // (UnresolvedPaymentOwnershipException, or any failure from its injected $dispatch
-        // callable) -- they propagate straight out of this callback, so
+        // recognition, fault-isolated -- unchanged), THEN the opt-in tagged strict lane, THEN
+        // delegate recognized dispute/chargeback types to the named dispatcher, always last.
+        // Nothing here catches a strict listener's or ProviderChargebackDispatcher::handle()'s
+        // exceptions (UnresolvedPaymentOwnershipException, or any failure from its injected
+        // $dispatch callable) -- they propagate straight out of this callback, so
         // WebhookService::dispatch() never reaches markLogicalDispatched() and the durable
-        // provider_events row stays redispatchable via relayPending().
-        $dispatcher = static function (PaymentProviderEvent $event) use ($container, $chargebacks): void {
+        // provider_events row stays redispatchable via relayPending() (or, on the lease path,
+        // immediately via processStored()). An empty $strict lane makes this callback
+        // behaviorally identical to the pre-lane dispatcher.
+        $dispatcher = static function (PaymentProviderEvent $event) use ($container, $chargebacks, $strict): void {
             if ($container->has(EventService::class)) {
                 $container->get(EventService::class)->dispatch($event);
+            }
+
+            foreach ($strict as $listener) {
+                if ($listener->supports($event->event)) {
+                    $listener->handle($event->event);
+                }
             }
 
             $chargebacks->handle($event->event);
@@ -388,11 +460,12 @@ final class PayviaServiceProvider extends ServiceProvider
         return new WebhookService(
             $context,
             $container->get(GatewayManager::class),
-            $container->get(ProviderEventRepositoryInterface::class),
+            $events,
             $dispatcher,
             $applier,
             $queueEnabled,
-            $enqueue
+            $enqueue,
+            $logicalDispatchLeases
         );
     }
 

@@ -4,12 +4,15 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Repositories;
 
+use Glueful\Extensions\Payvia\Contracts\LogicalDispatchLeaseRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
 use Glueful\Extensions\Payvia\Repositories\Concerns\DetectsUniqueViolations;
 use Glueful\Helpers\Utils;
 use Glueful\Repository\BaseRepository;
 
-final class ProviderEventRepository extends BaseRepository implements ProviderEventRepositoryInterface
+final class ProviderEventRepository extends BaseRepository implements
+    ProviderEventRepositoryInterface,
+    LogicalDispatchLeaseRepositoryInterface
 {
     use DetectsUniqueViolations;
 
@@ -137,6 +140,75 @@ final class ProviderEventRepository extends BaseRepository implements ProviderEv
                 'dispatch_status' => 'dispatched',
                 'dispatched_at' => $this->now(),
             ]);
+    }
+
+    public function acquireLogicalDispatchLease(
+        string $gateway,
+        string $logicalEventKey,
+        int $staleSeconds = 300,
+    ): ?string {
+        $token = Utils::generateNanoID(12);
+        $now = $this->now();
+        $cutoff = $this->formatDateTime(new \DateTimeImmutable('-' . $staleSeconds . ' seconds'));
+
+        // Raw SQL, not the query-builder ->where()/->update() path: the query builder's
+        // UPDATE validator rejects OR/nested WHERE conditions ("Complex WHERE conditions
+        // (OR, NOT, nested/raw unsupported) are not yet supported for UPDATE/DELETE
+        // operations"), and matching either a pending row or a stale dispatching row in
+        // one atomic statement needs exactly that OR. Mirrors incrementAttempts()'s
+        // existing raw-SQL-via-executeModification() precedent in this same repository.
+        $affected = $this->db->table($this->getTableName())
+            ->executeModification(
+                'UPDATE provider_events '
+                    . 'SET dispatch_status = ?, dispatch_claimed_at = ?, dispatch_claim_token = ? '
+                    . 'WHERE gateway = ? AND logical_event_key = ? '
+                    . 'AND (dispatch_status = ? OR (dispatch_status = ? AND dispatch_claimed_at < ?))',
+                ['dispatching', $now, $token, $gateway, $logicalEventKey, 'pending', 'dispatching', $cutoff]
+            );
+
+        return $affected > 0 ? $token : null;
+    }
+
+    public function completeLogicalDispatch(
+        string $gateway,
+        string $logicalEventKey,
+        string $leaseToken,
+    ): bool {
+        $affected = $this->db->table($this->getTableName())
+            ->where([
+                'gateway' => $gateway,
+                'logical_event_key' => $logicalEventKey,
+                'dispatch_status' => 'dispatching',
+                'dispatch_claim_token' => $leaseToken,
+            ])
+            ->update([
+                'dispatch_status' => 'dispatched',
+                'dispatched_at' => $this->now(),
+                'dispatch_claim_token' => null,
+            ]);
+
+        return $affected > 0;
+    }
+
+    public function releaseLogicalDispatch(
+        string $gateway,
+        string $logicalEventKey,
+        string $leaseToken,
+    ): bool {
+        $affected = $this->db->table($this->getTableName())
+            ->where([
+                'gateway' => $gateway,
+                'logical_event_key' => $logicalEventKey,
+                'dispatch_status' => 'dispatching',
+                'dispatch_claim_token' => $leaseToken,
+            ])
+            ->update([
+                'dispatch_status' => 'pending',
+                'dispatch_claim_token' => null,
+                'dispatch_claimed_at' => null,
+            ]);
+
+        return $affected > 0;
     }
 
     public function markDispatched(string $uuid): void
