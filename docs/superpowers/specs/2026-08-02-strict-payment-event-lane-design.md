@@ -221,10 +221,15 @@ amendment; **no 2.0.1**):
 - **Exactly one lane** (no double invocation): when payvia ≥ 2.4 is
   installed (`interface_exists(StrictPaymentEventListener::class)`),
   `SubscriptionsServiceProvider::services()` conditionally defines the strict
-  adapter and `static tags()` publishes that adapter under
-  `StrictPaymentEventListener::CONTAINER_TAG`; `boot()` does NOT call
-  `EventService::addListener()`. With Payvia ≤2.3, `tags()` returns no strict
-  entry and `boot()` keeps the existing neutral bridge as the bus listener.
+  adapter and publishes that adapter under
+  `StrictPaymentEventListener::CONTAINER_TAG` via the `'tags'` key on the
+  service definition (framework consults `static tags()` ONLY for defs()-based
+  providers; services()/DSL providers like subscriptions publish tags via the
+  definition-level `'tags'` key, which is the operative mechanism); `boot()`
+  does NOT call `EventService::addListener()`. Subscriptions maintains a
+  `static tags()` method as documentation-of-intent but the registered tags
+  come from the service definition. With Payvia ≤2.3, the adapter definition
+  has no tags and `boot()` keeps the existing neutral bridge as the bus listener.
   With Payvia absent, neither lane registers. A small pure registration-mode
   decision (`strict|bus|none`) takes the two capability booleans so all three
   branches are testable without redefining runtime classes. The strict
