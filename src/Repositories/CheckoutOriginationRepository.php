@@ -6,6 +6,8 @@ namespace Glueful\Extensions\Payvia\Repositories;
 
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Database\Connection;
+use Glueful\Extensions\Payvia\Checkout\ProjectionAcknowledgementRefused;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionProjectionAcknowledger;
 use Glueful\Extensions\Payvia\Repositories\Concerns\DetectsUniqueViolations;
 use Glueful\Extensions\Payvia\Tenancy\PayviaTenantResolver;
 use Glueful\Extensions\Payvia\Tenancy\SentinelTenantResolver;
@@ -27,7 +29,7 @@ use Glueful\Repository\BaseRepository;
  * column. The lease token is provider-I/O mutual exclusion, NOT ownership: it never appears in
  * `TRANSITIONS` and never changes `status` itself except via {@see completeInitialization()}.
  */
-final class CheckoutOriginationRepository extends BaseRepository
+final class CheckoutOriginationRepository extends BaseRepository implements SubscriptionProjectionAcknowledger
 {
     use DetectsUniqueViolations;
 
@@ -64,6 +66,17 @@ final class CheckoutOriginationRepository extends BaseRepository
         'projection_rejected',
         'late_settlement_conflict',
     ];
+
+    /**
+     * `projection_reason` is `VARCHAR(255)` (see the migration). The spec calls it a "bounded
+     * reason" twice -- {@see boundedReason()} is that bound, enforced in {@see acknowledge()}
+     * rather than left to whatever the underlying DB driver does with an over-length value: a
+     * strict engine would hard-fail the UPDATE entirely, and since `acknowledge()`'s caller (the
+     * finalizer's strict listener) runs inside `WebhookService::dispatch()`'s lease scope, that
+     * failure would just release the lease and retry FOREVER with the identical over-length
+     * reason -- never actually recovering.
+     */
+    private const MAX_PROJECTION_REASON_LENGTH = 255;
 
     private readonly PayviaTenantResolver $resolver;
 
@@ -237,6 +250,182 @@ final class CheckoutOriginationRepository extends BaseRepository
     }
 
     /**
+     * The durable projection-acknowledgement CAS writer (design spec §3.6): the SOLE way a
+     * required projection consumer records its verdict for a correlated origination's
+     * `subscription.created` delivery. Implements {@see SubscriptionProjectionAcknowledger}
+     * verbatim -- Payvia owns this contract, and `PayviaServiceProvider` binds this class under
+     * it so a host (subscriptions 2.2's strict bridge) resolves it from the container.
+     *
+     * Priority order (deliberately checked in THIS sequence, matching the spec's own ordering):
+     *
+     * 1. **Repeat of the identical outcome for this exact `logicalEventKey`** -- a no-op,
+     *    REGARDLESS of the row's current `status` or `required_projection_consumer`. This is
+     *    what makes duplicate delivery safe even after the origination has already finalized
+     *    past `provider_observed` (e.g. a redelivered strict-listener call racing a sibling
+     *    delivery that already completed the whole pipeline) -- crucially, it is also what
+     *    makes the crash-after-projection-before-acknowledgement recovery path work: a consumer
+     *    that re-reads its own already-persisted receipt and re-calls this with the SAME outcome
+     *    it originally computed always succeeds, whether or not the first call's write actually
+     *    landed.
+     * 2. **Conflicting second outcome for the SAME `logicalEventKey`** -- throws. A `logicalEventKey`
+     *    can only ever have ONE durable verdict; a caller attempting to overwrite it with a
+     *    different outcome is a bug, not something to silently accept.
+     * 3. **Wrong consumer** -- the row's `required_projection_consumer` must match `$consumer`
+     *    exactly (including "no consumer required at all", i.e. `null`, which no `$consumer`
+     *    string can ever equal). Refused.
+     * 4. **Wrong state** -- only `provider_observed` accepts ordinary acknowledgements.
+     *    `late_settlement_conflict` is the SOLE exception: it accepts ONLY a matching `rejected`
+     *    acknowledgement (an `accepted` attempt against a conflict is refused loudly -- money
+     *    that already moved to a NEWER reservation can never be treated as this stale
+     *    origination's own success), records the outcome/reason, and deliberately does NOT
+     *    change `status` or touch the guard -- `late_settlement_conflict` has no further legal
+     *    transition (`TRANSITIONS['late_settlement_conflict']` is permanently empty). Every other
+     *    status is refused outright.
+     *
+     * The actual write is a genuine CAS: `uuid` + `status` + `required_projection_consumer` all
+     * must still match, AND `projection_event_key` must still be anything OTHER than
+     * `$logicalEventKey` (closing the race between two concurrent first-time acknowledgements for
+     * the SAME new key -- whichever commits first "wins" the key, and the second racer's write is
+     * refused by this same guard, re-reads, and is correctly classified as either an idempotent
+     * repeat or a genuine conflict by the exact same logic the synchronous pre-checks above use).
+     * A refused CAS re-reads once and re-classifies against the fresh row rather than assuming
+     * the worst.
+     */
+    public function acknowledge(
+        string $originationUuid,
+        string $consumer,
+        string $logicalEventKey,
+        string $outcome,
+        ?string $reason = null,
+    ): void {
+        if ($originationUuid === '' || $consumer === '' || $logicalEventKey === '') {
+            throw new \InvalidArgumentException(
+                'CheckoutOriginationRepository::acknowledge() requires a non-empty originationUuid, '
+                    . 'consumer, and logicalEventKey.'
+            );
+        }
+        if ($outcome !== 'accepted' && $outcome !== 'rejected') {
+            throw new \InvalidArgumentException(sprintf(
+                'CheckoutOriginationRepository::acknowledge() outcome must be "accepted" or "rejected", '
+                    . 'got "%s".',
+                $outcome
+            ));
+        }
+
+        $row = $this->findByUuid($originationUuid);
+        if ($row === null) {
+            throw ProjectionAcknowledgementRefused::unknownOrigination($originationUuid);
+        }
+
+        if (!$this->classifyAcknowledgement($row, $consumer, $logicalEventKey, $outcome)) {
+            // A matching repeat: already durably recorded, nothing left to write.
+            return;
+        }
+
+        $status = (string) $row['status'];
+        $affected = $this->db->table(self::TABLE)->executeModification(
+            'UPDATE ' . self::TABLE . ' '
+                . 'SET projection_event_key = ?, projection_outcome = ?, projection_reason = ?, updated_at = ? '
+                . 'WHERE uuid = ? AND status = ? AND required_projection_consumer = ? '
+                . 'AND (projection_event_key IS NULL OR projection_event_key != ?)',
+            [
+                $logicalEventKey,
+                $outcome,
+                $this->boundedReason($reason),
+                $this->now(),
+                $originationUuid,
+                $status,
+                $consumer,
+                $logicalEventKey,
+            ],
+        );
+
+        if ($affected > 0) {
+            return;
+        }
+
+        // Refused: the row moved under a concurrent write between our read and this CAS.
+        // Re-read once and re-classify against the fresh state -- a concurrent identical
+        // acknowledgement racing us to the SAME outcome is still a legitimate no-op.
+        $current = $this->findByUuid($originationUuid);
+        if ($current === null) {
+            throw ProjectionAcknowledgementRefused::unknownOrigination($originationUuid);
+        }
+
+        if (!$this->classifyAcknowledgement($current, $consumer, $logicalEventKey, $outcome)) {
+            // A concurrent identical acknowledgement raced us to the SAME outcome and won: this
+            // is still a legitimate no-op.
+            return;
+        }
+
+        // classifyAcknowledgement() said "this should have been a legitimate write" both times,
+        // yet the CAS still matched no row: something outside the documented CAS invariants moved
+        // the row between the two reads. Refuse rather than silently reporting success for a
+        // write that never actually landed.
+        throw ProjectionAcknowledgementRefused::wrongState($originationUuid, (string) $current['status']);
+    }
+
+    /**
+     * Shared classification logic {@see acknowledge()} runs BOTH before its first CAS attempt and
+     * again (against a fresh read) after a refused CAS -- see that method's docblock for the
+     * exact priority order. Returns `false` for a legitimate no-op (an exact repeat of the same
+     * outcome already durably recorded for the same logical event key -- nothing left to write);
+     * throws {@see ProjectionAcknowledgementRefused} for every genuine refusal; returns `true`
+     * only when this IS a new, legitimate acknowledgement the caller must still go write.
+     *
+     * @param array<string,mixed> $row
+     */
+    private function classifyAcknowledgement(
+        array $row,
+        string $consumer,
+        string $logicalEventKey,
+        string $outcome,
+    ): bool {
+        $originationUuid = (string) $row['uuid'];
+        $existingKey = $row['projection_event_key'] ?? null;
+
+        if ($existingKey !== null && (string) $existingKey === $logicalEventKey) {
+            $existingOutcome = $row['projection_outcome'] ?? null;
+            if ($existingOutcome === $outcome) {
+                return false; // repeat delivery of the identical outcome: no-op.
+            }
+
+            throw ProjectionAcknowledgementRefused::conflictingOutcome(
+                $originationUuid,
+                is_string($existingOutcome) ? $existingOutcome : 'none',
+                $outcome
+            );
+        }
+
+        $requiredConsumer = $row['required_projection_consumer'] ?? null;
+        if ($requiredConsumer !== $consumer) {
+            throw ProjectionAcknowledgementRefused::wrongConsumer(
+                $originationUuid,
+                is_string($requiredConsumer) ? $requiredConsumer : null,
+                $consumer
+            );
+        }
+
+        $status = (string) $row['status'];
+        if ($status === 'late_settlement_conflict') {
+            if ($outcome !== 'rejected') {
+                throw ProjectionAcknowledgementRefused::lateSettlementConflictRequiresRejected(
+                    $originationUuid,
+                    $outcome
+                );
+            }
+
+            return true;
+        }
+
+        if ($status !== 'provider_observed') {
+            throw ProjectionAcknowledgementRefused::wrongState($originationUuid, $status);
+        }
+
+        return true;
+    }
+
+    /**
      * Claim the initialization provider-I/O lease: matches a row that is `status = initializing`
      * AND whose lease is either empty or older than `$staleBefore`, then stamps it with `$token`.
      * Returns the (normalized) row on success, null when another owner currently holds a live
@@ -389,6 +578,19 @@ final class CheckoutOriginationRepository extends BaseRepository
         }
 
         return $row;
+    }
+
+    /**
+     * @see MAX_PROJECTION_REASON_LENGTH. `mb_substr()` truncates on character boundaries, never
+     * splitting a multi-byte character in half.
+     */
+    private function boundedReason(?string $reason): ?string
+    {
+        if ($reason === null) {
+            return null;
+        }
+
+        return mb_substr($reason, 0, self::MAX_PROJECTION_REASON_LENGTH);
     }
 
     private function now(): string

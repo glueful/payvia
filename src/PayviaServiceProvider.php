@@ -24,6 +24,7 @@ use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventPayloadUpdaterInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\StrictPaymentEventListener;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionProjectionAcknowledger;
 use Glueful\Extensions\Payvia\Controllers\BillingPlanController;
 use Glueful\Extensions\Payvia\Controllers\InvoiceController;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
@@ -153,6 +154,15 @@ final class PayviaServiceProvider extends ServiceProvider
             ],
             CheckoutSubjectGuardRepository::class => [
                 'factory' => [self::class, 'makeCheckoutSubjectGuardRepository'],
+                'shared' => true,
+            ],
+            // Design spec §3.6: Payvia OWNS this contract. The bound implementation is the SAME
+            // shared CheckoutOriginationRepository instance already bound above -- the CAS ack
+            // writer lives directly on that repository (see its `acknowledge()` docblock) -- so a
+            // host (subscriptions 2.2's strict bridge) resolving this id gets the real ledger
+            // writer, not a second, independently-constructed instance.
+            SubscriptionProjectionAcknowledger::class => [
+                'factory' => [self::class, 'makeSubscriptionProjectionAcknowledger'],
                 'shared' => true,
             ],
             SubscriptionCheckoutService::class => [
@@ -321,6 +331,18 @@ final class PayviaServiceProvider extends ServiceProvider
             context: $container->get(ApplicationContext::class),
             resolver: $container->get(PayviaTenantResolver::class),
         );
+    }
+
+    /**
+     * Resolves the SAME shared {@see CheckoutOriginationRepository} instance bound above under
+     * its own concrete-ish id, so the ack CAS writer a host resolves via the
+     * `SubscriptionProjectionAcknowledger` contract id is provably the exact same repository
+     * `WebhookService`'s finalizer reads from -- not a second, independently-constructed one.
+     */
+    public static function makeSubscriptionProjectionAcknowledger(
+        ContainerInterface $container
+    ): SubscriptionProjectionAcknowledger {
+        return $container->get(CheckoutOriginationRepository::class);
     }
 
     /** @see makeCheckoutOriginationRepository() for why `connection:` is passed explicitly. */
@@ -544,7 +566,13 @@ final class PayviaServiceProvider extends ServiceProvider
             $queueEnabled,
             $enqueue,
             $logicalDispatchLeases,
-            $payloadUpdater
+            $payloadUpdater,
+            // Design spec §3.6: wires the post-dispatch finalizer capability. Both are the SAME
+            // shared instances CheckoutOriginationRepository::class/CheckoutSubjectGuardRepository
+            // ::class are already bound to above, so the finalizer reads/writes through the exact
+            // same repositories the ack CAS writer and the origination-correlation applier use.
+            $container->get(CheckoutOriginationRepository::class),
+            $container->get(CheckoutSubjectGuardRepository::class),
         );
     }
 
