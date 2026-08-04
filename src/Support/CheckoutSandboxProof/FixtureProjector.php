@@ -62,6 +62,65 @@ final class FixtureProjector
     }
 
     /**
+     * Task 3 (Paystack negative proof, spec §3.1): projects a raw `POST /transaction/initialize`
+     * RESPONSE -- not a webhook `{event, data}` payload, so {@see project()} does not apply --
+     * into the closed shape allowed to reach a committed fixture.
+     *
+     * The without-`amount` call is rejected outright (`{status:false, message, meta, type,
+     * code}` -- no `data` object at all, so nothing PII-shaped can even be present). The
+     * with-`amount` call succeeds with `{status:true, message, data:{authorization_url,
+     * access_code, reference}}`; `authorization_url`/`access_code` are single-use secrets that
+     * let anyone complete that specific checkout, so this method reads ONLY `data.reference` out
+     * of a success body -- the same closed-allowlist discipline as {@see project()}: a field
+     * either has a named path read below, or it is structurally impossible to reach the return
+     * value, no matter what the raw response contains.
+     *
+     * Allowed output keys (all optional -- absent/non-scalar input drops the key entirely):
+     *  - `status`    <- top-level `status` (boolean)
+     *  - `message`   <- top-level `message`
+     *  - `type`      <- top-level `type` (validation error classification)
+     *  - `code`      <- top-level `code` (e.g. `invalid_amount`)
+     *  - `meta`      <- `{next_step: meta.nextStep}`, only when `meta.nextStep` is a scalar
+     *  - `reference` <- `data.reference` -- the ONLY field ever read out of a success `data`
+     *                   object; `data.authorization_url` and `data.access_code` are never named
+     *                   below and therefore never reachable.
+     *
+     * @param array<string,mixed> $rawResponse
+     * @return array<string,mixed>
+     */
+    public static function projectInitializeResponse(array $rawResponse): array
+    {
+        $data = is_array($rawResponse['data'] ?? null) ? $rawResponse['data'] : [];
+        $status = $rawResponse['status'] ?? null;
+
+        $fixture = [
+            'status' => is_bool($status) ? $status : null,
+            'message' => self::scalarString($rawResponse['message'] ?? null),
+            'type' => self::scalarString($rawResponse['type'] ?? null),
+            'code' => self::scalarString($rawResponse['code'] ?? null),
+            'meta' => self::projectInitializeMeta($rawResponse),
+            'reference' => self::scalarString($data['reference'] ?? null),
+        ];
+
+        return array_filter($fixture, static fn(mixed $value): bool => $value !== null);
+    }
+
+    /**
+     * Only `meta.nextStep` is ever consulted -- the validation-error hint text, never anything
+     * else a raw response's `meta` object might carry.
+     *
+     * @param array<string,mixed> $rawResponse
+     * @return array{next_step:string}|null
+     */
+    private static function projectInitializeMeta(array $rawResponse): ?array
+    {
+        $meta = is_array($rawResponse['meta'] ?? null) ? $rawResponse['meta'] : [];
+        $nextStep = self::scalarString($meta['nextStep'] ?? null);
+
+        return $nextStep !== null ? ['next_step' => $nextStep] : null;
+    }
+
+    /**
      * @param array<string,mixed> $data
      * @return array{origination_uuid:string}|null
      */

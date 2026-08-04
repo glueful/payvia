@@ -1,0 +1,13 @@
+{
+    "event": "charge.success",
+    "reference": "thallo-card-1785826131",
+    "status": "success",
+    "metadata": {
+        "origination_uuid": "card064851"
+    },
+    "plan_code": "PLN_fq4o4cjpec4bzpi",
+    "amount": {
+        "amount": 10000,
+        "currency": "GHS"
+    }
+}

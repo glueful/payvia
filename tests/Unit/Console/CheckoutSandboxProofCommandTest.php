@@ -237,6 +237,87 @@ final class CheckoutSandboxProofCommandTest extends TestCase
     }
 
     // -----------------------------------------------------------------------------------------
+    // FixtureProjector::projectInitializeResponse() -- closed allowlist, hostile payload
+    //
+    // Task 3 (Paystack negative proof) added this method for the two `transaction/initialize`
+    // RESPONSE shapes, which are not webhook `{event,data}` payloads and so never reach
+    // project() above. It gets the SAME always-run adversarial fence as project() itself: this
+    // is the method's advertised safety net, not just code inspection or the environment-
+    // conditional real-capture re-run in PaystackSubscriptionCheckoutUnavailableTest.
+    // -----------------------------------------------------------------------------------------
+
+    public function testProjectInitializeResponseExtractsOnlyAllowlistedFieldsFromASuccessBody(): void
+    {
+        $projected = FixtureProjector::projectInitializeResponse($this->hostileInitializeWithAmountPayload());
+
+        self::assertSame(
+            [
+                'status' => true,
+                'message' => 'Authorization URL created',
+                'meta' => ['next_step' => 'Legit hint text, not a secret.'],
+                'reference' => 'sbxproof_ref_legit',
+            ],
+            $projected
+        );
+    }
+
+    /**
+     * The hostile-payload proof for the with-amount success shape: stuff `authorization_url`,
+     * `access_code`, and every customer/authorization/secret field a real Paystack initialize
+     * response could plausibly carry alongside `reference`, and assert NONE of those literal
+     * values survive -- mirroring {@see testHostilePayloadLeaksNothingBeyondTheAllowlist} above.
+     */
+    public function testHostilePayloadLeaksNothingBeyondTheAllowlistForInitializeResponse(): void
+    {
+        $projected = FixtureProjector::projectInitializeResponse($this->hostileInitializeWithAmountPayload());
+        $encoded = (string) json_encode($projected);
+
+        foreach ($this->forbiddenInitializeNeedles() as $needle) {
+            self::assertStringNotContainsString($needle, $encoded, "Leaked forbidden value: {$needle}");
+        }
+
+        self::assertArrayNotHasKey('data', $projected);
+        self::assertArrayNotHasKey('customer', $projected);
+        self::assertArrayNotHasKey('authorization', $projected);
+        self::assertArrayNotHasKey('authorization_url', $projected);
+        self::assertArrayNotHasKey('access_code', $projected);
+        self::assertArrayNotHasKey('headers', $projected);
+        self::assertArrayNotHasKey('log', $projected);
+    }
+
+    public function testProjectInitializeResponseDropsNonScalarValuesSmuggledUnderAnAllowlistedKeyName(): void
+    {
+        $projected = FixtureProjector::projectInitializeResponse([
+            'status' => 'not-a-bool', // string, not bool -- must be treated as absent
+            'message' => ['nested' => 'not-a-string'],
+            'type' => ['nested' => 'evil'],
+            'code' => ['nested' => 'evil'],
+            'meta' => ['nextStep' => ['nested' => 'evil-should-not-leak']],
+            'data' => [
+                'reference' => ['nested' => 'not-a-string'],
+                // Siblings of `reference` under `data` -- never named by
+                // projectInitializeResponse(), so structurally unreachable regardless of shape.
+                'authorization_url' => 'https://checkout.paystack.com/should-not-leak',
+                'access_code' => 'should-not-leak',
+            ],
+        ]);
+
+        self::assertSame([], $projected);
+    }
+
+    public function testProjectInitializeResponseReturnsEmptyArrayWhenNothingAllowlistedIsPresent(): void
+    {
+        $projected = FixtureProjector::projectInitializeResponse([
+            'data' => [
+                'customer' => ['email' => 'someone@example.com'],
+                'authorization_url' => 'https://checkout.paystack.com/should-not-leak',
+            ],
+        ]);
+
+        self::assertSame([], $projected);
+    }
+
+    // -----------------------------------------------------------------------------------------
     // Fixtures
     // -----------------------------------------------------------------------------------------
 
@@ -323,6 +404,62 @@ final class CheckoutSandboxProofCommandTest extends TestCase
                     'phone' => '+10000000000',
                 ],
             ],
+        ];
+    }
+
+    /** @return array<string,mixed> */
+    private function hostileInitializeWithAmountPayload(): array
+    {
+        return [
+            'status' => true,
+            'message' => 'Authorization URL created',
+            'data' => [
+                'authorization_url' => 'https://checkout.paystack.com/do-not-leak-this-authorization-url',
+                'access_code' => 'do-not-leak-this-access-code',
+                'reference' => 'sbxproof_ref_legit',
+                'customer' => [
+                    'email' => 'victim2@example.com',
+                    'first_name' => 'Victim',
+                    'last_name' => 'Two',
+                    'phone' => '+20000000000',
+                    'customer_code' => 'CUS_do_not_leak_2',
+                ],
+                'authorization' => [
+                    'authorization_code' => 'AUTH_do_not_leak_2',
+                    'bin' => '509999',
+                    'last4' => '9999',
+                    'signature' => 'SIG_do_not_leak_2',
+                ],
+                'log' => ['history' => [['message' => 'do-not-leak-init-log-message']]],
+            ],
+            'meta' => [
+                'nextStep' => 'Legit hint text, not a secret.',
+                'evil_secret' => 'do-not-leak-this-init-secret',
+            ],
+            'headers' => [
+                'x-paystack-signature' => 'do-not-leak-this-init-header-signature',
+            ],
+        ];
+    }
+
+    /** @return list<string> */
+    private function forbiddenInitializeNeedles(): array
+    {
+        return [
+            'do-not-leak-this-authorization-url',
+            'do-not-leak-this-access-code',
+            'victim2@example.com',
+            'Victim',
+            'Two',
+            '+20000000000',
+            'CUS_do_not_leak_2',
+            'AUTH_do_not_leak_2',
+            '509999',
+            '9999',
+            'SIG_do_not_leak_2',
+            'do-not-leak-this-init-secret',
+            'do-not-leak-init-log-message',
+            'do-not-leak-this-init-header-signature',
         ];
     }
 
