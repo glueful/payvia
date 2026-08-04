@@ -23,6 +23,13 @@ use Glueful\Repository\BaseRepository;
  * "insert the first-ever row directly as live" paths, guarding the latter's concurrent-first-claim
  * race with a savepoint so a losing INSERT's failed statement can never poison an ambient
  * PostgreSQL transaction for the re-read that follows it.
+ *
+ * `tenantUuid` is a genuinely tolerated `''`: exactly like
+ * {@see CheckoutOriginationRepository}, `''` is the legitimate single-store sentinel tenant a
+ * `SentinelTenantResolver`-backed deployment resolves for every request, and the
+ * `(tenant_uuid, subject_key)` unique index guards correctly regardless of the value tenant_uuid
+ * happens to hold. Only `subjectKey`/`originationUuid` being empty is a genuine invalid-input
+ * refusal.
  */
 final class CheckoutSubjectGuardRepository extends BaseRepository
 {
@@ -47,7 +54,7 @@ final class CheckoutSubjectGuardRepository extends BaseRepository
         string $subjectKey,
         string $originationUuid,
     ): bool {
-        if ($tenantUuid === '' || $subjectKey === '' || $originationUuid === '') {
+        if ($subjectKey === '' || $originationUuid === '') {
             return false;
         }
 
@@ -119,7 +126,7 @@ final class CheckoutSubjectGuardRepository extends BaseRepository
         string $subjectKey,
         string $originationUuid,
     ): bool {
-        if ($tenantUuid === '' || $subjectKey === '' || $originationUuid === '') {
+        if ($subjectKey === '' || $originationUuid === '') {
             return false;
         }
 
@@ -157,7 +164,7 @@ final class CheckoutSubjectGuardRepository extends BaseRepository
         ?string $originationUuid,
         string $reason,
     ): bool {
-        if ($tenantUuid === '' || $subjectKey === '') {
+        if ($subjectKey === '') {
             return false;
         }
 
@@ -233,7 +240,7 @@ final class CheckoutSubjectGuardRepository extends BaseRepository
         string $subjectKey,
         string $originationUuid,
     ): bool {
-        if ($tenantUuid === '' || $subjectKey === '' || $originationUuid === '') {
+        if ($subjectKey === '' || $originationUuid === '') {
             return false;
         }
 

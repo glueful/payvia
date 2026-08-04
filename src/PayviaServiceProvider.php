@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia;
 
 use Glueful\Bootstrap\ApplicationContext;
+use Glueful\Database\Connection;
 use Glueful\Database\Migrations\MigrationPriority;
 use Glueful\Events\EventService;
 use Glueful\Extensions\Contracts\Payments\PaymentCollector;
@@ -14,6 +15,7 @@ use Glueful\Extensions\Contracts\Payments\ProviderChargebackEvent;
 use Glueful\Extensions\Contracts\Tenancy\CurrentTenantResolver;
 use Glueful\Extensions\Contracts\Tenancy\TenantContextRunner;
 use Glueful\Extensions\Contracts\Tenancy\TenantTableRegistry;
+use Glueful\Extensions\Payvia\Checkout\SubscriptionCheckoutService;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\InvoiceRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\LogicalDispatchLeaseRepositoryInterface;
@@ -31,6 +33,8 @@ use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 use Glueful\Extensions\Payvia\Gateways\StripeGateway;
 use Glueful\Extensions\Payvia\Jobs\ProcessWebhookJob;
 use Glueful\Extensions\Payvia\Repositories\BillingPlanRepository;
+use Glueful\Extensions\Payvia\Repositories\CheckoutOriginationRepository;
+use Glueful\Extensions\Payvia\Repositories\CheckoutSubjectGuardRepository;
 use Glueful\Extensions\Payvia\Repositories\InvoiceRepository;
 use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
 use Glueful\Extensions\Payvia\Repositories\PaymentRepository;
@@ -140,6 +144,18 @@ final class PayviaServiceProvider extends ServiceProvider
             ],
             PaymentIntentRepository::class => [
                 'factory' => [self::class, 'makePaymentIntentRepository'],
+                'shared' => true,
+            ],
+            CheckoutOriginationRepository::class => [
+                'factory' => [self::class, 'makeCheckoutOriginationRepository'],
+                'shared' => true,
+            ],
+            CheckoutSubjectGuardRepository::class => [
+                'factory' => [self::class, 'makeCheckoutSubjectGuardRepository'],
+                'shared' => true,
+            ],
+            SubscriptionCheckoutService::class => [
+                'factory' => [self::class, 'makeSubscriptionCheckoutService'],
                 'shared' => true,
             ],
             PaymentCollector::class => [
@@ -280,6 +296,57 @@ final class PayviaServiceProvider extends ServiceProvider
     {
         return new PayoutTransferRepository(
             context: $container->get(ApplicationContext::class),
+            resolver: $container->get(PayviaTenantResolver::class),
+        );
+    }
+
+    /**
+     * `connection:` is passed EXPLICITLY (not left to `BaseRepository::getSharedConnection()`'s
+     * implicit static-cache fallback) so this repository is PROVABLY bound to the exact same
+     * `Connection` instance the container resolves for `Connection::class` everywhere else --
+     * the same one {@see makeCheckoutSubjectGuardRepository()} binds and
+     * {@see SubscriptionCheckoutService::__construct()} asserts both repositories share.
+     * Relying on the implicit static cache instead would make that guarantee depend on
+     * construction ORDER and on nothing else in the process ever seeding the cache from a
+     * different connection first -- exactly the kind of silent cross-connection drift that
+     * would make `prepare()`'s one-transaction guarantee a no-op under pooling or a
+     * differently-ordered boot.
+     */
+    public static function makeCheckoutOriginationRepository(
+        ContainerInterface $container
+    ): CheckoutOriginationRepository {
+        return new CheckoutOriginationRepository(
+            connection: $container->get(Connection::class),
+            context: $container->get(ApplicationContext::class),
+            resolver: $container->get(PayviaTenantResolver::class),
+        );
+    }
+
+    /** @see makeCheckoutOriginationRepository() for why `connection:` is passed explicitly. */
+    public static function makeCheckoutSubjectGuardRepository(
+        ContainerInterface $container
+    ): CheckoutSubjectGuardRepository {
+        return new CheckoutSubjectGuardRepository(
+            connection: $container->get(Connection::class),
+            context: $container->get(ApplicationContext::class),
+        );
+    }
+
+    /**
+     * Shares the SAME `PayviaTenantResolver` instance the origination repository resolves
+     * `tenant_uuid` from internally, so the tenant this service resolves for the subject guard
+     * (which takes `tenantUuid` as an explicit parameter, never via its own resolver) always
+     * agrees with the row the origination repository itself just wrote or read. No `Connection`
+     * is passed here: the service derives its transaction manager from the origination
+     * repository's OWN connection (see its constructor), which is provably the same connection
+     * the guard repository uses too (both bound explicitly above).
+     */
+    public static function makeSubscriptionCheckoutService(ContainerInterface $container): SubscriptionCheckoutService
+    {
+        return new SubscriptionCheckoutService(
+            originations: $container->get(CheckoutOriginationRepository::class),
+            guards: $container->get(CheckoutSubjectGuardRepository::class),
+            gateways: $container->get(GatewayManager::class),
             resolver: $container->get(PayviaTenantResolver::class),
         );
     }
