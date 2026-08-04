@@ -7,6 +7,7 @@ namespace Glueful\Extensions\Payvia\Services;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\LogicalDispatchLeaseRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
+use Glueful\Extensions\Payvia\Contracts\ProviderEventPayloadUpdaterInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\PaymentProviderEvent;
@@ -46,7 +47,7 @@ final class WebhookService
      * three-step composition behaviorally identical to the original two-step one.
      *
      * @param null|callable(PaymentProviderEvent):void $dispatcher
-     * @param null|callable(PaymentProviderEventInterface):void $applier
+     * @param null|callable(PaymentProviderEventInterface):?PaymentProviderEventInterface $applier
      * @param null|callable(string):void $enqueue
      */
     public function __construct(
@@ -58,6 +59,7 @@ final class WebhookService
         private bool $queue = false,
         private $enqueue = null,
         private ?LogicalDispatchLeaseRepositoryInterface $logicalDispatchLeases = null,
+        private ?ProviderEventPayloadUpdaterInterface $payloadUpdater = null,
     ) {
     }
 
@@ -126,6 +128,25 @@ final class WebhookService
      * exactly once on success" guarantee. So a dispatch failure is left uncaught here: the row
      * stays `status='processed'`, only `dispatch_status` remains un-dispatched, and the
      * exception still propagates to the caller (e.g. `ingest()`).
+     *
+     * The applier may ALSO return a replacement `PaymentProviderEventInterface` -- built via
+     * `ProviderEvent::withNormalized()` -- carrying enrichment discovered only while applying
+     * the event (e.g. correlation data Task 7 resolves inside `GatewaySubscriptionService::
+     * applyProviderEvent()`). A `null` return, including every existing void-returning applier
+     * (which implicitly returns null), changes NOTHING: byte-identical to the pre-Task-6
+     * behavior. A non-null return whose `normalized()` actually differs from the applied event's
+     * is persisted via the additive `ProviderEventPayloadUpdaterInterface::
+     * replaceNormalizedPayload()` capability -- resolved off the SAME `$events` instance exactly
+     * like `$logicalDispatchLeases` is, so a custom `ProviderEventRepositoryInterface` that
+     * doesn't also implement the updater capability simply gets `$payloadUpdater === null` here
+     * -- BEFORE `markProcessed()`, so a crash between the write and the mark can never leave a
+     * `processed` row pointing at stale metadata. A missing updater binding and a persistence
+     * failure both fail exactly like an applier failure: `markFailed()` + rethrow, inside this
+     * SAME try/catch -- because dispatching stale metadata after the applier already claimed
+     * enrichment would be worse than simply retrying. Once persisted (or when the returned
+     * normalized payload happens to be unchanged), the REPLACEMENT object -- not the original --
+     * is what gets marked processed and dispatched on THIS same first delivery, so a strict
+     * listener observes the enrichment immediately rather than only on a later retry.
      */
     public function processStored(string $uuid): void
     {
@@ -142,8 +163,23 @@ final class WebhookService
         $event = $this->reconstruct($row);
 
         try {
-            if ($this->applier !== null) {
-                ($this->applier)($event);
+            $replacement = $this->applier !== null ? ($this->applier)($event) : null;
+
+            if ($replacement !== null) {
+                if ($replacement->normalized() !== $event->normalized()) {
+                    if ($this->payloadUpdater === null) {
+                        throw new \RuntimeException(sprintf(
+                            'Provider event %s: applier returned a replacement with a changed normalized'
+                                . ' payload, but no %s is bound to persist it.',
+                            $uuid,
+                            ProviderEventPayloadUpdaterInterface::class
+                        ));
+                    }
+
+                    $this->payloadUpdater->replaceNormalizedPayload($uuid, $replacement->normalized());
+                }
+
+                $event = $replacement;
             }
         } catch (\Throwable $e) {
             $this->events->markFailed($uuid, $e->getMessage());

@@ -21,6 +21,7 @@ use Glueful\Extensions\Payvia\Contracts\InvoiceRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\LogicalDispatchLeaseRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
+use Glueful\Extensions\Payvia\Contracts\ProviderEventPayloadUpdaterInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\StrictPaymentEventListener;
 use Glueful\Extensions\Payvia\Controllers\BillingPlanController;
@@ -467,13 +468,16 @@ final class PayviaServiceProvider extends ServiceProvider
         $queueEnabled = (bool) config($context, 'payvia.webhooks.queue', false);
         $queueName = (string) config($context, 'payvia.webhooks.queue_name', 'default');
 
-        // Resolved ONCE and reused both as the durable `ProviderEventRepositoryInterface` and,
-        // when it also implements the additive lease capability, as WebhookService's optional
-        // final constructor argument. A custom legacy implementation that doesn't implement
-        // LogicalDispatchLeaseRepositoryInterface simply passes null here and WebhookService
-        // keeps its byte-identical claim/reclaim/mark fallback -- construction never fails.
+        // Resolved ONCE and reused as the durable `ProviderEventRepositoryInterface` and, when
+        // it also implements either additive capability, as WebhookService's optional
+        // constructor arguments. A custom legacy implementation that doesn't implement
+        // LogicalDispatchLeaseRepositoryInterface and/or ProviderEventPayloadUpdaterInterface
+        // simply passes null for the missing one(s) -- construction never fails; the lease
+        // fallback stays byte-identical, and a replacement with a changed normalized payload
+        // fails closed inside WebhookService::processStored() instead of persisting nothing.
         $events = $container->get(ProviderEventRepositoryInterface::class);
         $logicalDispatchLeases = $events instanceof LogicalDispatchLeaseRepositoryInterface ? $events : null;
+        $payloadUpdater = $events instanceof ProviderEventPayloadUpdaterInterface ? $events : null;
 
         // Composed ONCE per service construction (not per dispatch) from whatever is currently
         // tagged under StrictPaymentEventListener::CONTAINER_TAG -- an absent tag, or a container
@@ -509,8 +513,15 @@ final class PayviaServiceProvider extends ServiceProvider
             $chargebacks->handle($event->event);
         };
 
-        $applier = static function (PaymentProviderEventInterface $event) use ($subscriptions): void {
+        // GatewaySubscriptionService::applyProviderEvent() itself still returns void -- no
+        // consumer of the Task 6 replacement plumbing exists yet, so this applier explicitly
+        // returns null (never a replacement), which WebhookService::processStored() treats as
+        // byte-identical to the pre-Task-6 behavior.
+        $applier = static function (
+            PaymentProviderEventInterface $event
+        ) use ($subscriptions): ?PaymentProviderEventInterface {
             $subscriptions->applyProviderEvent($event);
+            return null;
         };
 
         $enqueue = static function (string $uuid) use ($container, $queueName): void {
@@ -532,7 +543,8 @@ final class PayviaServiceProvider extends ServiceProvider
             $applier,
             $queueEnabled,
             $enqueue,
-            $logicalDispatchLeases
+            $logicalDispatchLeases,
+            $payloadUpdater
         );
     }
 

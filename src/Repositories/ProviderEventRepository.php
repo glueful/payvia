@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Glueful\Extensions\Payvia\Repositories;
 
 use Glueful\Extensions\Payvia\Contracts\LogicalDispatchLeaseRepositoryInterface;
+use Glueful\Extensions\Payvia\Contracts\ProviderEventPayloadUpdaterInterface;
 use Glueful\Extensions\Payvia\Contracts\ProviderEventRepositoryInterface;
 use Glueful\Extensions\Payvia\Repositories\Concerns\DetectsUniqueViolations;
 use Glueful\Helpers\Utils;
@@ -12,7 +13,8 @@ use Glueful\Repository\BaseRepository;
 
 final class ProviderEventRepository extends BaseRepository implements
     ProviderEventRepositoryInterface,
-    LogicalDispatchLeaseRepositoryInterface
+    LogicalDispatchLeaseRepositoryInterface,
+    ProviderEventPayloadUpdaterInterface
 {
     use DetectsUniqueViolations;
 
@@ -78,6 +80,21 @@ final class ProviderEventRepository extends BaseRepository implements
         $this->updateUuid($uuid, [
             'status' => 'failed',
             'error' => substr($error, 0, 255),
+        ]);
+    }
+
+    /**
+     * {@see ProviderEventPayloadUpdaterInterface}: persists an applier-produced replacement
+     * normalized payload, JSON-encoded exactly like `insertReceived()` encodes it on first
+     * write, so `reconstruct()`'s `decodeJson()` round-trips it identically on every subsequent
+     * read -- including a retry that never re-runs the applier.
+     *
+     * @param array<string,mixed> $normalized
+     */
+    public function replaceNormalizedPayload(string $uuid, array $normalized): void
+    {
+        $this->updateUuid($uuid, [
+            'normalized_payload' => json_encode($normalized, JSON_THROW_ON_ERROR),
         ]);
     }
 
