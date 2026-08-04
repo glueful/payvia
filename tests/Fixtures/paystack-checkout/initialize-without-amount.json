@@ -1,0 +1,9 @@
+{
+    "status": false,
+    "message": "Invalid Amount Sent",
+    "type": "validation_error",
+    "code": "invalid_amount",
+    "meta": {
+        "next_step": "Ensure that you're passing your amount correctly. It should be a number greater than zero, with no decimal places"
+    }
+}

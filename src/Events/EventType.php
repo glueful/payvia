@@ -19,6 +19,12 @@ final class EventType
     // these types) -- mirrored below into IMMUTABLE alongside the other one-shot types.
     public const CHARGEBACK_CREATED = 'chargeback.created';
     public const CHARGEBACK_REVERSED = 'chargeback.reversed';
+    // Workspace self-serve checkout (design spec §3.3): Stripe's `checkout.session.expired`
+    // webhook is a LEDGER LIFECYCLE event for a `subscription_checkout_originations` row, never
+    // a subscription projection event -- GatewaySubscriptionService::applyProviderEvent()
+    // recognizes it before the ordinary isSubscriptionEvent() gate and never writes a
+    // gateway_subscriptions row for it.
+    public const CHECKOUT_EXPIRED = 'checkout.expired';
     public const UNKNOWN = 'unknown';
 
     /** @var list<string> */
@@ -30,6 +36,9 @@ final class EventType
         self::SUBSCRIPTION_CANCELED,
         self::CHARGEBACK_CREATED,
         self::CHARGEBACK_REVERSED,
+        // A given checkout session expires at most once; redelivery must land on the SAME
+        // logical key so the ledger transition/guard release stays idempotent.
+        self::CHECKOUT_EXPIRED,
     ];
 
     /** @var list<string> */

@@ -31,7 +31,15 @@ final class DiagnosticsReportTest extends PayviaTestCase
 
         self::assertSame('sentinel', $report['tenancy']['resolver_mode']);
         self::assertSame(
-            ['payments', 'billing_plans', 'invoices', 'gateway_subscriptions', 'payment_intents'],
+            [
+                'payments',
+                'billing_plans',
+                'invoices',
+                'gateway_subscriptions',
+                'payment_intents',
+                'subscription_checkout_originations',
+                'subscription_checkout_subject_guards',
+            ],
             $report['tenancy']['registered_tables']
         );
         self::assertSame(1, $report['tenancy']['sentinel_rows']['invoices']);

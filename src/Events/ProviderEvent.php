@@ -135,4 +135,28 @@ final class ProviderEvent implements PaymentProviderEventInterface
     {
         return $this->raw;
     }
+
+    /**
+     * Immutable replacement of ONLY the normalized payload -- gateway/type/providerEventId/
+     * deliveryKey/logicalEventKey/occurredAt/raw are all carried over unchanged from `$this`.
+     * Preserving `logicalEventKey` (rather than re-deriving it via `deriveLogicalKey()`) is
+     * deliberate: enrichment discovered while applying an already-persisted event must never
+     * change WHICH logical dispatch slot that event occupies, only the payload a
+     * `ProviderEventPayloadUpdaterInterface` implementation persists against the SAME uuid.
+     *
+     * @param array<string,mixed> $normalized
+     */
+    public function withNormalized(array $normalized): static
+    {
+        return new self(
+            $this->gateway,
+            $this->type,
+            $this->providerEventId,
+            $this->deliveryKey,
+            $this->logicalEventKey,
+            $this->occurredAt,
+            $normalized,
+            $this->raw,
+        );
+    }
 }

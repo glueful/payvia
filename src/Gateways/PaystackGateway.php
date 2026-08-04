@@ -14,6 +14,7 @@ use Glueful\Extensions\Contracts\Payments\PayoutStatusResult;
 use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionCancellationModeProvider;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
@@ -25,11 +26,23 @@ use Glueful\Http\Client as HttpClient;
 use Glueful\Http\Exceptions\HttpClientException;
 use Glueful\Http\Response\Response as HttpResponse;
 
+/**
+ * Deliberately does NOT implement {@see \Glueful\Extensions\Payvia\Contracts\
+ * SubscriptionInitiationCapableGateway}. The 2026-08-04 sandbox proof
+ * (`tests/Fixtures/paystack-checkout/README.md`) established that Paystack exposes neither
+ * approved §3.1 correlation mode: `subscription.create` carries no transaction metadata and
+ * `charge.success` carries no subscription identifier. `GatewayManager::supports('paystack',
+ * 'subscription_checkout')` is therefore `false` and `SubscriptionCheckoutService::prepare()`
+ * targeting this gateway fails closed via `CheckoutUnavailableException` before any write — see
+ * `tests/Unit/Gateways/PaystackSubscriptionCheckoutUnavailableTest.php`. Existing webhook
+ * projection and operator-created subscription support (below) are unaffected.
+ */
 final class PaystackGateway implements
     PaymentGatewayInterface,
     InitiationCapableGateway,
     WebhookCapableGateway,
     SubscriptionCapableGateway,
+    SubscriptionCancellationModeProvider,
     TransferCapableGateway
 {
     private ApplicationContext $context;
@@ -276,6 +289,18 @@ final class PaystackGateway implements
         ]);
 
         return $response->toArray();
+    }
+
+    /**
+     * Paystack's subscription-disable API (behind the existing `cancelSubscription()`, driven
+     * by its `atPeriodEnd` flag) only ever stops future renewal -- there is no Paystack API to
+     * immediately revoke an in-progress billing period, so `immediate` is deliberately absent.
+     *
+     * @return list<'stop_renewal'|'immediate'>
+     */
+    public function cancellationModes(): array
+    {
+        return ['stop_renewal'];
     }
 
     /**

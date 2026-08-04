@@ -6,9 +6,12 @@ namespace Glueful\Extensions\Payvia\Tests\Integration;
 
 use Glueful\Extensions\Payvia\Database\Migrations\CreateBillingPlansTable;
 use Glueful\Extensions\Payvia\Database\Migrations\CreateGatewaySubscriptionsTable;
+use Glueful\Extensions\Payvia\Database\Migrations\CreateCheckoutOriginations;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
 use Glueful\Extensions\Payvia\GatewayManager;
+use Glueful\Extensions\Payvia\Repositories\CheckoutOriginationRepository;
+use Glueful\Extensions\Payvia\Repositories\CheckoutSubjectGuardRepository;
 use Glueful\Extensions\Payvia\Repositories\ProviderCorrelationRepository;
 use Glueful\Extensions\Payvia\Services\GatewaySubscriptionService;
 use Glueful\Extensions\Payvia\Tests\Support\FakeWebhookGateway;
@@ -17,6 +20,8 @@ use Glueful\Extensions\Payvia\Tests\Support\PayviaTestCase;
 final class GatewaySubscriptionServiceTest extends PayviaTestCase
 {
     private ProviderCorrelationRepository $repo;
+    private CheckoutOriginationRepository $originations;
+    private CheckoutSubjectGuardRepository $guards;
     private FakeWebhookGateway $gateway;
 
     protected function setUp(): void
@@ -24,7 +29,16 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         parent::setUp();
         $this->runMigration(new CreateGatewaySubscriptionsTable());
         $this->runMigration(new CreateBillingPlansTable());
+        $this->runMigration(new CreateCheckoutOriginations());
         $this->repo = new ProviderCorrelationRepository($this->connection);
+        // Deliberately NOT passing $this->context here: BaseRepository::getSharedDb()'s
+        // context-aware fallback swaps in an unrelated Connection::fromContext() instance
+        // whenever the passed connection reports hasContext() === false (true for the plain
+        // `new Connection([...])` this harness builds) -- see OriginationCorrelationTest's
+        // identical note; GatewaySubscriptionService's constructor now asserts both repositories
+        // share one connection, so this bug would otherwise fail loudly here.
+        $this->originations = new CheckoutOriginationRepository($this->connection);
+        $this->guards = new CheckoutSubjectGuardRepository($this->connection);
         $this->gateway = new FakeWebhookGateway();
         $this->bind(FakeWebhookGateway::class, $this->gateway);
     }
@@ -466,7 +480,13 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         $manager = new GatewayManager($this->context->getContainer(), $this->context);
         $manager->registerDriver('fake', FakeWebhookGateway::class);
 
-        return new GatewaySubscriptionService($this->context, $this->repo, $manager);
+        return new GatewaySubscriptionService(
+            $this->context,
+            $this->repo,
+            $manager,
+            $this->originations,
+            $this->guards,
+        );
     }
 
     private function stripeService(): GatewaySubscriptionService
@@ -477,6 +497,12 @@ final class GatewaySubscriptionServiceTest extends PayviaTestCase
         $manager = new GatewayManager($this->context->getContainer(), $this->context);
         $manager->registerDriver('stripe', FakeWebhookGateway::class);
 
-        return new GatewaySubscriptionService($this->context, $this->repo, $manager);
+        return new GatewaySubscriptionService(
+            $this->context,
+            $this->repo,
+            $manager,
+            $this->originations,
+            $this->guards,
+        );
     }
 }

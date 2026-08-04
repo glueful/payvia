@@ -277,6 +277,87 @@ Payvia persists gateway-owned subscription state in `gateway_subscriptions` and 
 
 The stored `status` is **normalized** and **fails closed**: provider statuses are mapped to one of `active`, `past_due`, `canceled`, `incomplete`, `paused`, or `unknown`. Only the explicitly active provider statuses (`active`, `trialing`) become `active`; any unrecognized, future, or missing provider status is recorded as `unknown` (never silently treated as live). Consumers deciding entitlement should treat anything other than `active` as not entitled.
 
+## Subscription Checkout
+
+Payvia can start a provider-hosted checkout for a brand-new subscription — as opposed to `GatewaySubscriptionService`'s existing management of an already-existing one — through `SubscriptionCheckoutService`, backed by its own origination ledger. This is a separate, additive surface: nothing above (payments, webhooks, `gateway_subscriptions` projection) changes shape or behavior.
+
+### Capability probing
+
+A gateway opts in by implementing `SubscriptionInitiationCapableGateway` (required), and optionally `SubscriptionCheckoutLifecycleCapableGateway` (on-demand status/abandonment) and `SubscriptionCancellationModeProvider` (self-serve cancellation modes). Probe before use — never assume:
+
+```php
+$manager->supports('stripe', 'subscription_checkout');  // true
+$manager->supports('stripe', 'cancellation_modes');     // true
+```
+
+### The `prepare()` / `initializeClaim()` seam
+
+`SubscriptionCheckoutService` deliberately splits origination into two calls so that provider I/O never happens inside a database transaction:
+
+- **`prepare(ApplicationContext $context, SubscriptionCheckoutRequest $request, callable $bindLocalReservation)`** owns exactly one transaction. It validates the gateway/plan identifier before any write, then claims (or — for a repeated `idempotencyKey` with a matching request fingerprint — idempotently *replays*) an origination row, claims the caller's subject guard only for a genuinely new claim, invokes `$bindLocalReservation` (your own local reservation, e.g. a pending host-side subscription record) inside the same transaction, and advances the row `preparing -> initializing`. A repeated `idempotencyKey` whose request shape has changed is a hard conflict (`IdempotencyConflictException`), never a silent overwrite. Everything after the claim rolls back together on any exception.
+- **`initializeClaim(ApplicationContext $context, string $originationUuid)`** is a later, separate call. It acquires a narrow 120-second initialization lease (reclaimable if stale), calls the gateway driver *outside* of any transaction, and persists the outcome with a single atomic compare-and-swap. A concurrent second caller for the same origination never touches the provider at all — it either waits out the lease or observes the already-persisted result.
+
+A **definitive** provider rejection (`DefinitiveSubscriptionCheckoutRejection`) marks the origination `failed` and releases the subject guard immediately, so the subject may originate another attempt. Any other failure is treated as **unknown**: only the execution lease is released — status, idempotency key, and the guard are left untouched so a retry can safely call the provider again with the same idempotency semantics.
+
+### Ledger semantics
+
+`subscription_checkout_originations` is the permanent correlation identity for a checkout attempt — its opaque `uuid` is stamped into provider metadata (Stripe: `subscription_data.metadata.origination_uuid`) so a webhook arriving after any terminal state still correlates back to it. `subscription_checkout_subject_guards` is a separate, narrower authority answering one question only — "may this subject originate another checkout right now?" — and is never inferred from the ledger or any client-side TTL, because a hosted checkout may complete well after a client would expect it to have expired.
+
+`customer_email`, stored only for initialization-crash recovery, is force-cleared the instant an origination reaches a definitive (terminal) outcome.
+
+Ownership is resolved from the ledger, never invented by a webhook: when a provider event carries a resolvable `origination_uuid`, the origination row's own `tenant_uuid` is adopted by the `gateway_subscriptions` projection (never a bare metadata hint). A webhook that lands after a *newer* origination already owns the subject is recorded as `late_settlement_conflict` — a permanently terminal, operator-visible state — rather than silently re-activating a superseded attempt.
+
+### Acknowledgement contract for consumers
+
+If your host requires its own durable confirmation before an origination is considered complete (e.g. a subscriptions package that must record entitlement before Payvia calls the flow finished), set `requiredProjectionConsumer` on the `SubscriptionCheckoutRequest`. Payvia then withholds the origination's `dispatched` status until your consumer calls back through the `SubscriptionProjectionAcknowledger` contract:
+
+```php
+$acknowledger->acknowledge(
+    originationUuid: $originationUuid,
+    consumer: 'subscriptions',
+    logicalEventKey: $event->logicalEventKey(),
+    outcome: 'accepted',   // or 'rejected'
+    reason: null,          // required context when rejecting
+);
+```
+
+- Call this **after** your projection has durably committed its own side of the subscription, in response to the correlated `subscription.created` delivery — never speculatively.
+- A duplicate delivery must re-compute and re-call with the **same** outcome; Payvia treats a repeat of the identical `(originationUuid, consumer, logicalEventKey, outcome)` tuple as an idempotent no-op, not a failure. This is what makes crash recovery between "projection committed" and "acknowledgement sent" safe to simply retry.
+- A **conflicting** second outcome for the same `logicalEventKey` throws — Payvia never silently overwrites a committed verdict.
+- `accepted` lets Payvia's post-dispatch finalizer advance the origination `provider_observed -> dispatched` and release the subject guard, atomically. `rejected` moves the origination to operator-visible `projection_rejected` and leaves the guard held for reconciliation — the underlying provider event still finishes dispatching either way.
+- If your consumer never acknowledges a delivery that required one, Payvia raises `RequiredProjectionAcknowledgementMissing` and the delivery is retried — there is no silent timeout to `dispatched`.
+
+### Operator reconciliation
+
+A checkout stuck at `pending` (no webhook ever arrived) or resolved to `projection_rejected` / `late_settlement_conflict` is not a dead end. `CheckoutReconciliationService::resolve()` exposes exactly two explicit outcomes — there is no generic "ignore":
+
+- `provider_confirmed_dead` — the operator has verified externally that no payment or subscription was ever created. Only legal from `pending`; advances the origination to `abandoned` and reopens the subject guard.
+- `provider_canceled_or_refunded` — the operator has already canceled/refunded on the provider side. Only legal from `projection_rejected` or `late_settlement_conflict` (both keep their own status — this only updates the audit trail) and reopens the subject guard.
+
+Both write a bounded audit note into dedicated `reconciliation_resolution`/`reconciliation_note`/`reconciled_at` columns, never into the projection consumer's own committed `projection_reason` receipt.
+
+### Cancellation modes
+
+Probe `SubscriptionCancellationModeProvider::cancellationModes()` (or `GatewayManager::supports($gateway, 'cancellation_modes')`) before offering a self-serve cancel option — do not assume every gateway honors both modes over its existing `cancelSubscription()`:
+
+- Stripe: `stop_renewal` and `immediate`.
+- Paystack: `stop_renewal` only.
+
+### Paystack: subscription checkout is unavailable
+
+**Paystack does not support hosted subscription checkout in Payvia**, and this is a deliberate, sandbox-proven limitation rather than a gap. A 2026-08-04 sandbox run established that Paystack's API gives no non-ambiguous way to join a checkout attempt to the subscription it produces: `subscription.create` carries no transaction metadata or reference at all, and `charge.success` carries no subscription identifier. There is no field pair either event exposes that correlates the two without guessing.
+
+Consequences:
+
+- `PaystackGateway` does not implement `SubscriptionInitiationCapableGateway`.
+- `GatewayManager::supports('paystack', 'subscription_checkout')` is `false`.
+- `SubscriptionCheckoutService::prepare()` targeting `paystack` throws `CheckoutUnavailableException` before any ledger or subject-guard row is written — **there is no fallback to a one-time payment.**
+- Paystack's existing webhook projection (`gateway_subscriptions`) and operator-created subscription support are completely unaffected — only *hosted checkout origination* is unavailable.
+
+The negative proof is committed permanently as fixtures under `tests/Fixtures/paystack-checkout/` (produced by the `payvia:checkout:sandbox-proof` console command) and pinned by a regression suite.
+
+**Revisit trigger:** this will be reconsidered only if Paystack starts propagating transaction metadata onto `subscription.create`, or starts including a subscription identifier (e.g. `subscription_code`) in `charge.success`. Until then, a consuming application must offer subscription checkout through another gateway (e.g. Stripe) for tenants on Paystack.
+
 ## Billing Plans and Entitlements
 
 `billing_plans` is the priced-plan side of Payvia. It includes provider linkage fields:

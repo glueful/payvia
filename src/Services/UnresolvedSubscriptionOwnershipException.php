@@ -11,8 +11,16 @@ namespace Glueful\Extensions\Payvia\Services;
  * `billing_plan_uuid` correlates to a known `billing_plans` row, or an explicit metadata
  * `tenant_uuid` hint disagrees with that plan's own owner.
  *
+ * A third scenario (design spec §3.4) also rides this same exception:
+ * {@see originationOwnerMismatch()} fires when an event DOES carry a resolvable origination-
+ * ledger token AND an existing projection already exists, but the two disagree on tenant owner.
+ * Unlike a bare metadata `tenant_uuid` hint (diagnosed and ignored -- the existing projection is
+ * always authoritative), an origination-ledger correlation is a much stronger signal Payvia
+ * itself wrote, so a disagreement there is refused rather than silently ignored.
+ *
  * This is a fail-closed rejection: no sentinel `gateway_subscriptions` row is ever written for
- * the triggering event. `WebhookService`'s generic `\Throwable` handling in `processStored()`
+ * the triggering event, and for `originationOwnerMismatch()` the origination ledger row is left
+ * completely untouched. `WebhookService`'s generic `\Throwable` handling in `processStored()`
  * already marks the owning `provider_events` row failed/retryable and rethrows -- this
  * exception rides that existing mechanism rather than requiring a special case there.
  */
@@ -54,6 +62,25 @@ final class UnresolvedSubscriptionOwnershipException extends \RuntimeException
             self::MARKER,
             $metadataTenantUuid,
             $planOwnerTenantUuid,
+            $gateway,
+            $gatewaySubscriptionId
+        ));
+    }
+
+    public static function originationOwnerMismatch(
+        string $gateway,
+        string $gatewaySubscriptionId,
+        string $originationUuid,
+        string $originationOwnerTenantUuid,
+        string $projectionOwnerTenantUuid,
+    ): self {
+        return new self(sprintf(
+            '%s: origination %s resolves to tenant "%s", which disagrees with the existing projection '
+                . 'owner "%s" for %s subscription %s',
+            self::MARKER,
+            $originationUuid,
+            $originationOwnerTenantUuid,
+            $projectionOwnerTenantUuid,
             $gateway,
             $gatewaySubscriptionId
         ));

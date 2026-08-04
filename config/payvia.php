@@ -15,6 +15,12 @@ return [
             'driver' => 'paystack',
             'secret_key' => env('PAYVIA_PAYSTACK_SECRET_KEY', env('PAYSTACK_SECRET_KEY', null)),
             'webhook_secret' => env('PAYVIA_PAYSTACK_WEBHOOK_SECRET', env('PAYVIA_PAYSTACK_SECRET_KEY', env('PAYSTACK_SECRET_KEY', null))),
+            // The maintainer's own declaration of what is configured, right now, on the
+            // Paystack dashboard as this app's webhook URL. Paystack exposes no read API for
+            // it, so `payvia:checkout:sandbox-proof` treats this as ground truth and fails
+            // closed unless its path is exactly /payvia/webhooks/paystack -- see
+            // src/Support/CheckoutSandboxProof/SandboxProofPreflight.php.
+            'webhook_url' => env('PAYVIA_PAYSTACK_WEBHOOK_URL', null),
             'base_url' => env('PAYVIA_PAYSTACK_BASE_URL', 'https://api.paystack.co'),
             'timeout' => (int) env('PAYVIA_PAYSTACK_TIMEOUT', 15),
         ],

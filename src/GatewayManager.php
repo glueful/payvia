@@ -7,7 +7,9 @@ namespace Glueful\Extensions\Payvia;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Support\PayviaSettings;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionCancellationModeProvider;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionInitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
@@ -80,6 +82,8 @@ final class GatewayManager
         return match ($capability) {
             'webhook' => $driver instanceof WebhookCapableGateway,
             'subscription' => $driver instanceof SubscriptionCapableGateway,
+            'subscription_checkout' => $driver instanceof SubscriptionInitiationCapableGateway,
+            'cancellation_modes' => $driver instanceof SubscriptionCancellationModeProvider,
             'payout' => $driver instanceof TransferCapableGateway,
             default => false,
         };

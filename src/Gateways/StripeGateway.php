@@ -11,10 +11,15 @@ use Glueful\Extensions\Contracts\Payments\PayoutDestination;
 use Glueful\Extensions\Contracts\Payments\PayoutRequest;
 use Glueful\Extensions\Contracts\Payments\PayoutResult;
 use Glueful\Extensions\Contracts\Payments\PayoutStatusResult;
+use Glueful\Extensions\Payvia\Checkout\DefinitiveSubscriptionCheckoutRejection;
+use Glueful\Extensions\Payvia\Checkout\SubscriptionCheckoutRequest;
 use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionCancellationModeProvider;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionCheckoutLifecycleCapableGateway;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionInitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Events\EventType;
@@ -29,6 +34,9 @@ final class StripeGateway implements
     InitiationCapableGateway,
     WebhookCapableGateway,
     SubscriptionCapableGateway,
+    SubscriptionInitiationCapableGateway,
+    SubscriptionCheckoutLifecycleCapableGateway,
+    SubscriptionCancellationModeProvider,
     TransferCapableGateway
 {
     private ApplicationContext $context;
@@ -270,6 +278,222 @@ final class StripeGateway implements
         }
 
         return $response->toArray();
+    }
+
+    /**
+     * Start a hosted Stripe Checkout Session for a NEW subscription (workspace checkout
+     * program). Mirrors `initialize()`'s request/validation/error style, but creates a
+     * `mode=subscription` session against an existing Price id rather than a one-time
+     * `price_data` line item -- this method never delegates to `initialize()`.
+     *
+     * `client_reference_id` and top-level `metadata.origination_uuid` are set for
+     * diagnostics/correlation on the SESSION object, but Stripe does not propagate session
+     * metadata onto the subscription it creates -- `subscription_data.metadata` is the
+     * documented mechanism that does, so `origination_uuid` is set there too (this is the one
+     * value later correlation actually reads off the resulting subscription/webhook).
+     *
+     * The success URL is REQUIRED (Stripe rejects a session without one) and throws before any
+     * request; `cancel_url` falls back to it, exactly like `initialize()`. The Idempotency-Key
+     * is derived deterministically from `originationUuid` alone -- NOT the caller's own
+     * `idempotencyKey` -- so a replayed initiation of the SAME origination can never mint two
+     * sessions.
+     *
+     * A validated, well-formed provider error body throws the typed {@see
+     * DefinitiveSubscriptionCheckoutRejection} (a KNOWN, definitive rejection); anything else
+     * -- transport failures, a present-but-unusable `error` body, or a malformed/invalid
+     * session response -- is an UNKNOWN outcome and throws a plain exception instead, exactly
+     * like `initialize()`'s existing malformed-response handling.
+     */
+    public function initializeSubscription(SubscriptionCheckoutRequest $request): array
+    {
+        $secret = $this->secretKey();
+        if ($secret === '') {
+            throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        $successUrl = trim($request->returnUrl);
+        if ($successUrl === '') {
+            throw new \RuntimeException(
+                'Stripe subscription checkout requires a success URL (returnUrl) in the request'
+            );
+        }
+        $cancelOption = trim($request->cancelUrl);
+        $cancel = $cancelOption !== '' ? $cancelOption : $successUrl;
+
+        $form = [
+            'mode' => 'subscription',
+            'client_reference_id' => $request->originationUuid,
+            'success_url' => $successUrl,
+            'cancel_url' => $cancel,
+            'line_items' => [[
+                'quantity' => 1,
+                'price' => $request->providerPlanIdentifier,
+            ]],
+            'metadata' => [
+                'origination_uuid' => $request->originationUuid,
+            ],
+            'subscription_data' => [
+                'metadata' => [
+                    'origination_uuid' => $request->originationUuid,
+                ],
+            ],
+        ];
+        if ($request->customerEmail !== '') {
+            $form['customer_email'] = $request->customerEmail;
+        }
+
+        $requestOptions = $this->requestOptions();
+        $requestOptions['headers']['Idempotency-Key'] = 'payvia-subinit-' . $request->originationUuid;
+        $requestOptions['form_params'] = $form;
+
+        $response = $this->httpClient->post($this->baseUrl() . '/v1/checkout/sessions', $requestOptions);
+        [, $decoded] = $this->decodeJsonResponse($response, 'Stripe subscription checkout session');
+
+        if (isset($decoded['error']) && is_array($decoded['error'])) {
+            $message = $decoded['error']['message'] ?? null;
+            if (is_string($message) && $message !== '') {
+                throw DefinitiveSubscriptionCheckoutRejection::forStripeError($decoded['error'], $decoded);
+            }
+
+            // Present but unusable ("looks like an error but carries no message") -- the
+            // outcome is unknown, never a validated definitive rejection.
+            throw new \RuntimeException(
+                'Stripe subscription checkout session returned an unparseable error body'
+            );
+        }
+
+        $sessionId = $decoded['id'] ?? '';
+        if (!is_string($sessionId) || !str_starts_with($sessionId, 'cs_')) {
+            throw new \RuntimeException('Stripe subscription checkout session returned no usable session id');
+        }
+        $url = $decoded['url'] ?? '';
+        $parts = is_string($url) ? parse_url($url) : false;
+        if (
+            !is_string($url)
+            || !is_array($parts)
+            || ($parts['scheme'] ?? '') !== 'https'
+            || ($parts['host'] ?? '') === ''
+        ) {
+            throw new \RuntimeException('Stripe subscription checkout session returned no usable HTTPS checkout URL');
+        }
+
+        return [
+            'reference' => $sessionId,
+            'checkout_url' => $url,
+            'expires_at' => $this->timestamp($decoded['expires_at'] ?? null),
+            'raw' => $decoded,
+        ];
+    }
+
+    /**
+     * On-demand reconciliation of a subscription checkout session already created by {@see
+     * initializeSubscription()}, without waiting for a webhook. Maps the session's own
+     * `status` (open/complete/expired) onto the shared 5-value enum; an unrecognized or
+     * unparseable response is `'unknown'` rather than a fabricated outcome.
+     *
+     * @return 'pending'|'completed'|'expired'|'canceled'|'unknown'
+     */
+    public function subscriptionCheckoutStatus(string $reference): string
+    {
+        $secret = $this->secretKey();
+        if ($secret === '') {
+            throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        $response = $this->httpClient->get(
+            $this->baseUrl() . '/v1/checkout/sessions/' . rawurlencode($reference),
+            $this->requestOptions()
+        );
+        [, $decoded] = $this->decodeJsonResponse($response, 'Stripe subscription checkout status');
+
+        return $this->mapCheckoutStatus($decoded);
+    }
+
+    /**
+     * Attempt to definitively kill a presumed-abandoned checkout session: expire it, then
+     * re-fetch -- the re-fetch is the single source of truth for the final classification, so
+     * expire's OWN response (which Stripe errors on for an already-completed/expired session)
+     * is intentionally never inspected. `'confirmed_dead'` fires ONLY when the re-fetched
+     * session is genuinely `expired`/`canceled`; a still-open or already-completed session is
+     * `'still_live'` (never free a guard under it); an unparseable re-fetch is `'unknown'`.
+     *
+     * @return 'confirmed_dead'|'still_live'|'unsupported'|'unknown'
+     */
+    public function abandonSubscriptionCheckout(string $reference): string
+    {
+        $secret = $this->secretKey();
+        if ($secret === '') {
+            throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        $expireResponse = $this->httpClient->post(
+            $this->baseUrl() . '/v1/checkout/sessions/' . rawurlencode($reference) . '/expire',
+            $this->requestOptions()
+        );
+        // Deliberately ignored beyond decoding (guards against a 5xx transport failure) --
+        // Stripe rejects expiring an already-terminal session, which is not itself meaningful.
+        $this->decodeJsonResponse($expireResponse, 'Stripe subscription checkout expire');
+
+        $statusResponse = $this->httpClient->get(
+            $this->baseUrl() . '/v1/checkout/sessions/' . rawurlencode($reference),
+            $this->requestOptions()
+        );
+        [, $decoded] = $this->decodeJsonResponse($statusResponse, 'Stripe subscription checkout status');
+
+        return match ($this->mapCheckoutStatus($decoded)) {
+            'expired', 'canceled' => 'confirmed_dead',
+            'pending', 'completed' => 'still_live',
+            default => 'unknown',
+        };
+    }
+
+    /**
+     * Stripe supports both self-serve cancellation modes over the existing
+     * `cancelSubscription()` -- `stop_renewal` (`atPeriodEnd = true`) and `immediate`
+     * (`atPeriodEnd = false`).
+     *
+     * @return list<'stop_renewal'|'immediate'>
+     */
+    public function cancellationModes(): array
+    {
+        return ['stop_renewal', 'immediate'];
+    }
+
+    /**
+     * A Checkout Session can reach `status=complete` while `payment_status` stays `unpaid` --
+     * Stripe's own fulfillment guidance is explicit that async payment methods (e.g. bank
+     * debits) complete the SESSION immediately but settle the PAYMENT later, surfaced via the
+     * separate `checkout.session.async_payment_succeeded` / `.async_payment_failed` events.
+     * Fulfillment/activation decisions must key off `payment_status`, never `status` alone, so
+     * `complete` only maps to `'completed'` when `payment_status` confirms it (`paid` or
+     * `no_payment_required`, e.g. a trial with no payment due); `complete` with `unpaid` (or any
+     * other/missing payment_status) stays `'pending'` -- the checkout is still awaiting a
+     * definitive payment outcome.
+     *
+     * @param array<string,mixed> $decoded
+     * @return 'pending'|'completed'|'expired'|'canceled'|'unknown'
+     */
+    private function mapCheckoutStatus(array $decoded): string
+    {
+        if (isset($decoded['error'])) {
+            return 'unknown';
+        }
+
+        $status = (string) ($decoded['status'] ?? '');
+        $paymentStatus = (string) ($decoded['payment_status'] ?? '');
+
+        return match (true) {
+            $status === 'complete' && in_array($paymentStatus, ['paid', 'no_payment_required'], true) => 'completed',
+            $status === 'complete' => 'pending',
+            $status === 'open' => 'pending',
+            $status === 'expired' => 'expired',
+            // Stripe's currently-documented Checkout Session `status` enum is only
+            // open|complete|expired -- `canceled` never appears in practice. Mapped anyway
+            // (dead code against the real API today) purely so this driver satisfies the full
+            // shared 5-value contract if a test double or a future API version ever emits it.
+            $status === 'canceled' => 'canceled',
+            default => 'unknown',
+        };
     }
 
     /**
@@ -553,6 +777,9 @@ final class StripeGateway implements
         return match ($providerType) {
             'payment_intent.succeeded', 'checkout.session.completed' => EventType::PAYMENT_SUCCEEDED,
             'payment_intent.payment_failed' => EventType::PAYMENT_FAILED,
+            // Workspace self-serve checkout (design spec §3.3): a ledger lifecycle event, not a
+            // subscription projection event -- see EventType::CHECKOUT_EXPIRED's docblock.
+            'checkout.session.expired' => EventType::CHECKOUT_EXPIRED,
             'invoice.paid' => EventType::INVOICE_PAID,
             'invoice.payment_failed' => EventType::INVOICE_PAYMENT_FAILED,
             'customer.subscription.created' => EventType::SUBSCRIPTION_CREATED,
@@ -593,6 +820,13 @@ final class StripeGateway implements
                 : null,
             'gateway_price_id' => $this->priceId($object),
             'billing_plan_uuid' => $this->metadataString($object, 'billing_plan_uuid'),
+            // Workspace self-serve checkout (design spec §3.4): promoted to a top-level key --
+            // mirroring billing_plan_uuid above -- so GatewaySubscriptionService::
+            // applyProviderEvent() has a single canonical field to read for origination-ledger
+            // correlation, whether the object is a Stripe subscription (subscription_data.
+            // metadata.origination_uuid) or a checkout session (top-level metadata.
+            // origination_uuid, read by the checkout.session.expired lifecycle handler).
+            'origination_uuid' => $this->metadataString($object, 'origination_uuid'),
             'amount' => $amount,
             // Forward-compat marker for any future consumer/re-normalizer; only set
             // when a numeric amount is actually present.
