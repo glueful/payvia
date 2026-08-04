@@ -15,6 +15,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-08-04 — Subscription Checkout Origination
+
+Payvia gains a hosted, provider-agnostic subscription checkout capability with its own
+origination ledger, ownership correlation, durable projection acknowledgement, and operator
+reconciliation -- the workspace self-serve checkout program's Phase A. Everything is additive:
+existing payment/webhook/subscription-projection flows are byte-identical. Two new migrations
+(010, 011) create the ledger/guard tables and add reconciliation audit columns; nothing existing
+is altered.
+
+### Added
+
+- **Subscription checkout capability** -- three new, purely additive gateway interfaces, none of
+  which touch the existing `SubscriptionCapableGateway`:
+  - `SubscriptionInitiationCapableGateway::initializeSubscription()` starts a provider-hosted
+    checkout for a NEW subscription (as opposed to managing an already-existing one).
+  - `SubscriptionCheckoutLifecycleCapableGateway` reconciles an in-flight checkout on demand
+    (`subscriptionCheckoutStatus()`) and attempts to definitively kill a presumed-abandoned one
+    (`abandonSubscriptionCheckout()`), without waiting for a webhook.
+  - `SubscriptionCancellationModeProvider::cancellationModes()` declares which self-serve
+    cancellation modes (`stop_renewal` | `immediate`) a gateway's existing `cancelSubscription()`
+    actually honors.
+
+  `GatewayManager::supports()` gains two capability keys: `subscription_checkout` and
+  `cancellation_modes`.
+
+- **Stripe implements all three.** `StripeGateway::initializeSubscription()` creates a
+  `mode=subscription` Checkout Session against an existing Price id, stamping `origination_uuid`
+  into both the session's own metadata (diagnostics) and `subscription_data.metadata` (the field
+  Stripe actually propagates onto the subscription it creates, and the one later correlation
+  reads). `subscriptionCheckoutStatus()`/`abandonSubscriptionCheckout()` map the session's
+  `status` gated by `payment_status`: a session can reach `status=complete` while an async
+  payment method is still settling, so `complete` only maps to `completed` when `payment_status`
+  confirms it (`paid` or `no_payment_required`) -- never on `status` alone. Abandonment expires
+  the session, then re-fetches and classifies off that re-fetch alone (the expire call's own
+  response is never trusted for a session already terminal). `cancellationModes()` reports both
+  `stop_renewal` and `immediate` over the existing `cancelSubscription()`.
+
+- **Paystack: subscription checkout is explicitly unavailable.** A 2026-08-04 sandbox proof
+  (`tests/Fixtures/paystack-checkout/`) established that Paystack exposes neither correlation
+  mode a hosted subscription checkout needs: `subscription.create` carries no transaction
+  metadata or reference, and `charge.success` carries no subscription identifier -- there is no
+  non-ambiguous way to join a checkout attempt to the subscription it produces. `PaystackGateway`
+  deliberately does not implement `SubscriptionInitiationCapableGateway`;
+  `GatewayManager::supports('paystack', 'subscription_checkout')` is `false`; and
+  `SubscriptionCheckoutService::prepare()` targeting Paystack fails closed with
+  `CheckoutUnavailableException` before any ledger or guard row is written -- there is no
+  one-time-payment fallback. The four committed negative-proof fixtures and a regression suite
+  (`PaystackSubscriptionCheckoutUnavailableTest`) pin this shape permanently, including a
+  byte-for-byte reproduction of the fixtures through the same projector used to capture them.
+  Paystack's existing webhook projection and operator-created subscription support are
+  unaffected; Paystack additionally now declares cancellation mode `stop_renewal`.
+  **Revisit trigger:** only when Paystack starts propagating transaction metadata onto
+  `subscription.create`, or starts including a subscription identifier in `charge.success`.
+
+- **Origination ledger + subject guard** (migration 010): `subscription_checkout_originations`
+  is the permanent correlation identity for a hosted subscription checkout attempt -- its opaque
+  `uuid` is stamped into provider metadata so a webhook arriving after any terminal state still
+  correlates. `subscription_checkout_subject_guards` is a separate, narrower authority ("may this
+  subject originate another checkout right now?") that is never inferred from origination rows or
+  any local TTL. `SubscriptionCheckoutService::prepare()` owns exactly one transaction: it
+  validates before any write, claims (or idempotently replays) the origination row by a
+  per-attempt idempotency key with a request fingerprint (a mismatched fingerprint against an
+  existing key is a genuine conflict), claims the subject guard only for a genuinely new claim,
+  and advances `preparing -> initializing`. `initializeClaim()` is a separate, later call: it
+  acquires a narrow 120-second initialization lease (stale-reclaimable), calls the provider
+  driver entirely outside of any database transaction, and persists the outcome via a single
+  atomic compare-and-swap -- a concurrent loser never touches the provider at all. Checkout URLs
+  are stored verbatim for crash recovery, and `customer_email` is force-cleared the moment an
+  origination reaches a definitive (terminal) outcome.
+
+- **Ownership correlation.** `GatewaySubscriptionService::applyProviderEvent()` resolves the
+  `origination_uuid` token Stripe's normalizer promotes into normalized metadata: found with no
+  existing `gateway_subscriptions` projection, the ledger row's own `tenant_uuid` is adopted as
+  the projection's owner (never a provider-supplied metadata hint alone); the ledger transitions
+  to `provider_observed` and its `consumer_metadata` correlation fields are merged into the
+  event's normalized metadata via a new immutable-replacement seam,
+  `ProviderEvent::withNormalized()`, persisted by the new additive
+  `ProviderEventPayloadUpdaterInterface` (a repository MAY implement it; when it doesn't, the
+  enrichment is discarded and the row fails closed exactly as if the applier itself had thrown).
+  A late webhook for a historical, already-terminal attempt whose subject guard is now held by a
+  newer origination is recorded as `late_settlement_conflict` instead of silently re-observing
+  money against a superseded attempt -- both the guard block and the ledger transition commit
+  atomically, and the conflict is permanently terminal (operator-visible, never auto-resolved,
+  never silently overwriting a newer owner). Stripe's `checkout.session.expired` webhook is
+  recognized as a ledger lifecycle event (never a subscription projection) and closes the
+  matching guard pre-dispatch by transitioning `pending -> expired`.
+
+- **Durable projection acknowledgement + post-dispatch finalizer.** `CheckoutOriginationRepository`
+  implements the new `SubscriptionProjectionAcknowledger` contract: the sole way a required
+  projection consumer (e.g. `glueful/subscriptions`) records its durable `accepted`/`rejected`
+  verdict for a given delivery, via a compare-and-swap over the origination's current state.
+  A duplicate delivery re-reads the existing receipt and treats a repeat of the identical
+  outcome as an idempotent no-op; a conflicting second outcome for the same logical event key
+  throws rather than silently overwriting the first verdict. `WebhookService`'s new post-dispatch
+  finalizer runs immediately after `subscription.created` dispatches without throwing: `accepted`
+  advances the origination `provider_observed -> dispatched` and releases the subject guard
+  atomically; `rejected` moves it to operator-visible `projection_rejected` and leaves the guard
+  held; a missing acknowledgement where one was required is retryable (throws, exactly like a
+  dispatcher failure).
+
+- **Operator reconciliation** (`CheckoutReconciliationService`, migration 011 audit columns).
+  Exactly two explicit resolutions exist for a stuck or rejected origination -- there is no third
+  "ignore" option: `provider_confirmed_dead` (allowed only when this ledger row never observed
+  provider money/subscription state; the only reconcilable status that qualifies is a stuck
+  `pending` row, advanced to `abandoned`) and `provider_canceled_or_refunded` (allowed only when
+  money WAS observed; `projection_rejected` and `late_settlement_conflict` stay at their own
+  status -- a legal, vacuous self-transition that writes only the audit trail). Every other
+  status, including the already-successful `dispatched`, is refused outright. The audit note
+  lands in new, dedicated `reconciliation_resolution`/`reconciliation_note`/`reconciled_at`
+  columns rather than the projection consumer's own committed `projection_reason` receipt, which
+  this service never rewrites. Resolution runs in the same one-transaction discipline as
+  `prepare()`: the origination write, the subject guard's compare-and-swap reopen, and the host's
+  local-only continuation all commit or roll back together. Both
+  `subscription_checkout_originations` and `subscription_checkout_subject_guards` are now part of
+  the tenant purge/adopt/diagnostics table inventory.
+
+- **Console:** `payvia:checkout:sandbox-proof` -- a maintainer-run (never CI) harness that drives
+  a real Paystack sandbox checkout end to end and projects the resulting webhook/API payloads
+  through a closed, PII-free allowlist into committed fixtures. This is what produced the
+  Paystack negative-proof fixtures above.
+
+### Migrations
+
+- **`010_CreateCheckoutOriginations`** -- creates `subscription_checkout_originations` and
+  `subscription_checkout_subject_guards`.
+- **`011_AddCheckoutOriginationReconciliationColumns`** -- adds nullable
+  `reconciliation_resolution`/`reconciliation_note`/`reconciled_at` to
+  `subscription_checkout_originations`.
+
+  Run `php glueful migrate:run` after upgrading.
+
 ## [2.4.0] - 2026-08-03 — Opt-in Strict Payment-Event Lane
 
 Payvia gains an opt-in strict-delivery lane for payment provider events, allowing consumers
