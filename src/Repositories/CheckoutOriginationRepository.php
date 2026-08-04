@@ -324,6 +324,18 @@ final class CheckoutOriginationRepository extends BaseRepository
     }
 
     /**
+     * Exposes {@see TERMINAL} as a query rather than a duplicated list -- e.g. so
+     * `GatewaySubscriptionService`'s late-settlement-conflict detection (design spec §3.3/§3.4)
+     * can decide whether a correlated origination is eligible for the terminal-status regression
+     * (re-bind to `provider_observed`, or advance to `late_settlement_conflict`) without
+     * hardcoding this repository's own terminal-status list a second time.
+     */
+    public static function isTerminalStatus(string $status): bool
+    {
+        return in_array($status, self::TERMINAL, true);
+    }
+
+    /**
      * `$from === $to` is only vacuously legal for a KNOWN status (every real status is a key of
      * {@see TRANSITIONS}, including `late_settlement_conflict`'s empty list) -- an unrecognized
      * status string must never be treated as legal merely because it happens to match itself.

@@ -219,6 +219,51 @@ final class CheckoutSubjectGuardRepository extends BaseRepository
     }
 
     /**
+     * The CAS counterpart to {@see block()}, for callers that must NOT force a hold onto a guard
+     * that has already moved out from under them: matches ONLY a `live` guard currently bound to
+     * the exact `$expectedBoundOrigination` -- a mismatched binding, a non-`live` state, or no
+     * row at all changes nothing and returns `false`.
+     *
+     * Design spec §3.3's late-settlement-conflict path uses this instead of `block()` precisely
+     * to close the TOCTOU window between reading the guard's current owner and blocking it: if
+     * the newer origination's own finalizer released the guard in between (e.g. its checkout
+     * completed cleanly), a caller must re-read and re-evaluate rather than force-overwrite a
+     * guard that is no longer the conflict it appeared to be a moment ago. `block()` itself keeps
+     * its unconditional force-write semantics unchanged for its other callers (e.g. an explicit
+     * operator hold).
+     */
+    public function blockIfBoundTo(
+        ApplicationContext $context,
+        string $tenantUuid,
+        string $subjectKey,
+        string $expectedBoundOrigination,
+        ?string $bindOrigination,
+        string $reason,
+    ): bool {
+        if ($subjectKey === '' || $expectedBoundOrigination === '') {
+            return false;
+        }
+
+        $affected = $this->db->table(self::TABLE)->executeModification(
+            'UPDATE ' . self::TABLE . ' '
+                . 'SET state = ?, origination_uuid = ?, blocked_reason = ?, revision = revision + 1, '
+                . 'updated_at = ? WHERE tenant_uuid = ? AND subject_key = ? AND state = ? AND origination_uuid = ?',
+            [
+                'blocked',
+                $bindOrigination,
+                $reason,
+                $this->now(),
+                $tenantUuid,
+                $subjectKey,
+                'live',
+                $expectedBoundOrigination,
+            ],
+        );
+
+        return $affected > 0;
+    }
+
+    /**
      * Task 9's operator-reconciliation CAS path (design spec §3.8): re-open a `blocked` (or
      * still-`live`) guard back to `open`, but ONLY against the exact `$originationUuid` it is
      * currently bound to -- a wrong origination, or a guard already `open`, changes nothing.
@@ -253,6 +298,24 @@ final class CheckoutSubjectGuardRepository extends BaseRepository
         );
 
         return $affected > 0;
+    }
+
+    /**
+     * Read-only lookup of the current guard row for (tenant, subject). Design spec §3.3/§3.4's
+     * late-settlement-conflict detection needs to know whether a DIFFERENT origination currently
+     * holds `live` for this subject before deciding how to treat a late-arriving correlated
+     * webhook -- unlike every other method here, this is a plain read with no CAS semantics.
+     * Returns null when no guard row exists yet for this subject at all.
+     *
+     * @return array<string,mixed>|null
+     */
+    public function findBySubject(ApplicationContext $context, string $tenantUuid, string $subjectKey): ?array
+    {
+        if ($subjectKey === '') {
+            return null;
+        }
+
+        return $this->findGuard($tenantUuid, $subjectKey);
     }
 
     /** @return array<string,mixed>|null */

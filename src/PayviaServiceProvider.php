@@ -513,15 +513,15 @@ final class PayviaServiceProvider extends ServiceProvider
             $chargebacks->handle($event->event);
         };
 
-        // GatewaySubscriptionService::applyProviderEvent() itself still returns void -- no
-        // consumer of the Task 6 replacement plumbing exists yet, so this applier explicitly
-        // returns null (never a replacement), which WebhookService::processStored() treats as
-        // byte-identical to the pre-Task-6 behavior.
+        // GatewaySubscriptionService::applyProviderEvent() now returns the Task 6 replacement
+        // directly (design spec §3.4: origination-ledger correlation + enrichment) -- a null
+        // return (every non-correlating event) stays byte-identical to the pre-Task-7 behavior,
+        // and WebhookService::processStored() persists + dispatches a non-null replacement on
+        // this same first delivery.
         $applier = static function (
             PaymentProviderEventInterface $event
         ) use ($subscriptions): ?PaymentProviderEventInterface {
-            $subscriptions->applyProviderEvent($event);
-            return null;
+            return $subscriptions->applyProviderEvent($event);
         };
 
         $enqueue = static function (string $uuid) use ($container, $queueName): void {

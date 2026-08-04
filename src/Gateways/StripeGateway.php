@@ -777,6 +777,9 @@ final class StripeGateway implements
         return match ($providerType) {
             'payment_intent.succeeded', 'checkout.session.completed' => EventType::PAYMENT_SUCCEEDED,
             'payment_intent.payment_failed' => EventType::PAYMENT_FAILED,
+            // Workspace self-serve checkout (design spec §3.3): a ledger lifecycle event, not a
+            // subscription projection event -- see EventType::CHECKOUT_EXPIRED's docblock.
+            'checkout.session.expired' => EventType::CHECKOUT_EXPIRED,
             'invoice.paid' => EventType::INVOICE_PAID,
             'invoice.payment_failed' => EventType::INVOICE_PAYMENT_FAILED,
             'customer.subscription.created' => EventType::SUBSCRIPTION_CREATED,
@@ -817,6 +820,13 @@ final class StripeGateway implements
                 : null,
             'gateway_price_id' => $this->priceId($object),
             'billing_plan_uuid' => $this->metadataString($object, 'billing_plan_uuid'),
+            // Workspace self-serve checkout (design spec §3.4): promoted to a top-level key --
+            // mirroring billing_plan_uuid above -- so GatewaySubscriptionService::
+            // applyProviderEvent() has a single canonical field to read for origination-ledger
+            // correlation, whether the object is a Stripe subscription (subscription_data.
+            // metadata.origination_uuid) or a checkout session (top-level metadata.
+            // origination_uuid, read by the checkout.session.expired lifecycle handler).
+            'origination_uuid' => $this->metadataString($object, 'origination_uuid'),
             'amount' => $amount,
             // Forward-compat marker for any future consumer/re-normalizer; only set
             // when a numeric amount is actually present.
