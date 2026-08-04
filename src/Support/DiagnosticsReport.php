@@ -133,13 +133,30 @@ final class DiagnosticsReport
     }
 
     /**
-     * The five tenant-scoped domain tables. `provider_events` is deliberately excluded --
-     * it is the global transport/inbox table and carries no `tenant_uuid` column.
+     * The tenant-scoped domain tables. `provider_events` is deliberately excluded -- it is the
+     * global transport/inbox table and carries no `tenant_uuid` column.
+     *
+     * Task 9 (design spec §3.8) adds both checkout tables to what was originally a fixed
+     * five-table list. Order matters beyond mere enumeration: this list also drives
+     * {@see \Glueful\Extensions\Payvia\Tenancy\TenantAdopter}'s per-table processing order and
+     * mirrors 010's own migration `down()` drop order, so `subscription_checkout_originations`
+     * (the CHILD -- it references a guard only by opaque uuid, no DB-level foreign key, but
+     * logically depends on the guard row existing) is listed BEFORE
+     * `subscription_checkout_subject_guards` (the parent), keeping any FK-sensitive
+     * purge/adoption tooling safe without needing a second hardcoded order elsewhere.
      *
      * @return list<string>
      */
     public static function tenantTables(): array
     {
-        return ['payments', 'billing_plans', 'invoices', 'gateway_subscriptions', 'payment_intents'];
+        return [
+            'payments',
+            'billing_plans',
+            'invoices',
+            'gateway_subscriptions',
+            'payment_intents',
+            'subscription_checkout_originations',
+            'subscription_checkout_subject_guards',
+        ];
     }
 }

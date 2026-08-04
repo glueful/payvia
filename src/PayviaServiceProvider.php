@@ -15,6 +15,7 @@ use Glueful\Extensions\Contracts\Payments\ProviderChargebackEvent;
 use Glueful\Extensions\Contracts\Tenancy\CurrentTenantResolver;
 use Glueful\Extensions\Contracts\Tenancy\TenantContextRunner;
 use Glueful\Extensions\Contracts\Tenancy\TenantTableRegistry;
+use Glueful\Extensions\Payvia\Checkout\CheckoutReconciliationService;
 use Glueful\Extensions\Payvia\Checkout\SubscriptionCheckoutService;
 use Glueful\Extensions\Payvia\Contracts\BillingPlanRepositoryInterface;
 use Glueful\Extensions\Payvia\Contracts\InvoiceRepositoryInterface;
@@ -167,6 +168,10 @@ final class PayviaServiceProvider extends ServiceProvider
             ],
             SubscriptionCheckoutService::class => [
                 'factory' => [self::class, 'makeSubscriptionCheckoutService'],
+                'shared' => true,
+            ],
+            CheckoutReconciliationService::class => [
+                'factory' => [self::class, 'makeCheckoutReconciliationService'],
                 'shared' => true,
             ],
             PaymentCollector::class => [
@@ -371,6 +376,20 @@ final class PayviaServiceProvider extends ServiceProvider
             guards: $container->get(CheckoutSubjectGuardRepository::class),
             gateways: $container->get(GatewayManager::class),
             resolver: $container->get(PayviaTenantResolver::class),
+        );
+    }
+
+    /**
+     * Resolves the SAME shared origination/guard repositories bound above, so
+     * {@see CheckoutReconciliationService}'s one-connection constructor assertion is provably
+     * satisfied in production the same way {@see makeSubscriptionCheckoutService()}'s is.
+     */
+    public static function makeCheckoutReconciliationService(
+        ContainerInterface $container
+    ): CheckoutReconciliationService {
+        return new CheckoutReconciliationService(
+            originations: $container->get(CheckoutOriginationRepository::class),
+            guards: $container->get(CheckoutSubjectGuardRepository::class),
         );
     }
 
