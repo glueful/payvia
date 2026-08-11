@@ -15,6 +15,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-08-11 — Ensure-Live Hosted Sessions
+
+Payvia's hosted-session lifecycle becomes reference-addressable end to end: every session
+attempt is provable, renewable, and independently webhook-settleable, closing the gap where a
+stale or replayed checkout session could be silently trusted, misattributed, or fabricated as a
+success with nothing persisted. `PayviaPaymentCollector::initiate()` now asks the provider
+whether a payable's open session is genuinely still live before ever handing it back, and only
+supersedes it for a NEW session when the provider proves it dead. One new migration (012) adds
+a duplicate-safe composite unique index over `(tenant_uuid, gateway, reference)`. Existing
+single-attempt-per-payable flows on a freshly initiated payable are unaffected; a *repeat*
+`initiate()` on an already-open payable is the one call shape that behaves differently — see
+Changed.
+
+### Added
+
+- **Reference-addressable session attempts** (migration 012): `payment_intents` gains a
+  service-enforced attempt lifecycle (`initializing -> open -> {superseded|closed|failed}`) atop
+  its existing `uuid`, plus a portable `UNIQUE(tenant_uuid, gateway, reference)` index —
+  proven on both SQLite and PostgreSQL to admit unlimited `reference IS NULL` rows while
+  rejecting a genuine non-NULL duplicate. `PaymentIntentRepository` gains
+  `claimAttempt()`/`markOpen()`/`supersede()`/`fail()`/`findActive()`/`findByUuid()` as durable
+  idempotency ports around each attempt; a race on the active-port key recovers the existing
+  attempt instead of minting a second one. A collision against a different, already-retired
+  attempt's reference (e.g. a provider replaying a fixed idempotency key onto a closed payable)
+  now throws a typed `DuplicateReferenceException` instead of the collector fabricating a fake
+  `ok` initiation with nothing persisted.
+- **Ensure-live hosted sessions in `PayviaPaymentCollector::initiate()`**: a call against a
+  payable with no open intent claims an attempt and creates a session as before. A call against
+  an already-open intent now asks the provider to prove liveness first: **confirmed live**
+  (or completed — settlement is the webhook's business) returns the exact same checkout URL with
+  no new session minted; **confirmed dead** supersedes the retired attempt (its reference stays
+  webhook-addressable — see below) and claims a fresh one; **unknown** (an unreadable provider
+  answer, a probe exception, or an ambiguous abandon result) fails closed with a typed
+  `ProviderSessionStateUnknownException` rather than guessing. A gateway that isn't
+  state-capable, a payable whose intent belongs to a different gateway, or an intent with no
+  reference yet is "nothing provable" and returns the open intent unchanged.
+- **Stripe per-attempt idempotency keys + provider-proven renewal**: `Idempotency-Key` is now
+  `payvia-init-{attemptUuid}` (previously a fixed per-payable key), so a transport-timeout retry
+  replays the identical attempt into the identical session while a genuine new attempt always
+  gets a fresh key. `hostedSessionState()` reads Checkout Session `status`/`payment_status`
+  (`complete`+unsettled is still **live** — async payment methods settle later);
+  `abandonHostedSession()` expires the session and re-fetches, trusting only the re-fetch's
+  `expired`/`canceled` as proof of death.
+- **Paystack verify-first recovery** (`ResumableHostedSessionGateway`): `/transaction/initialize`
+  is not idempotent (a repeated reference is a permanent "Duplicate Transaction Reference"
+  error), so a RESUMED attempt (the collector distinguishes a fresh claim from a resumed one by
+  comparing the attempt uuid it minted against the one `claimAttempt()` actually returned) now
+  calls `/transaction/verify` — which is idempotent — before ever calling initialize again:
+  reference absent ⇒ safe to re-initialize under the same attempt; a paid transaction ⇒ adopt it
+  (record the reference, never re-create); an unpaid or reversed transaction ⇒ fail the retired
+  attempt and claim a new one. Paystack's non-terminal transaction states
+  (`abandoned`/`ongoing`/`pending`/`processing`/`queued`), including `failed`, are now treated as
+  **live** for the purpose of reusing the existing checkout URL — a repeat visit to the same page
+  or another payment option should not be treated as dead; only `reversed` is dead. Paystack
+  deliberately does **not** implement session renewal (`HostedSessionRenewalCapableGateway`) — it
+  has no provider-side proof of death to renew against — so a genuinely dead Paystack session
+  surfaces `SessionRenewalUnavailableException` instead of being silently replaced.
+- **Checkout URL trust boundary** (`Support\HostedCheckoutUrl` + `gateways.{stripe,paystack}.checkout_hosts`):
+  every hosted checkout URL a driver returns (Stripe Checkout, Stripe subscription Checkout,
+  Paystack `authorization_url` — previously unchecked) is now validated against a per-gateway
+  host allowlist before it can reach an intent payload: absolute HTTPS, case-normalized exact
+  host match, no userinfo/credentials, no explicit port, no trailing dot, no sub/superdomain
+  lookalikes, no whitespace/control characters. Rejection throws inside the gateway; nothing
+  untrusted is ever persisted. A missing or malformed `checkout_hosts` config falls back to the
+  driver's own shipped default host, so a pre-2.6.0 `config/payvia.php` keeps working unchanged.
+- **Per-intent liveness cooldown**: `payvia.session_liveness_cooldown_seconds` (default `30`, `0`
+  disables) suppresses a repeat provider liveness probe for that long after the last
+  **confirmed-live** answer, stamped into the intent's own payload
+  (`PaymentIntentRepository::recordLivenessConfirmation()`). Only a confirmed-live probe stamps
+  it; dead/unknown answers and a brand-new attempt are never suppressed; a future-dated stamp
+  (clock skew) is ignored.
+- **Reference-addressable webhook confirmation**: new `PaymentIntentRepository::findByReference()`
+  (exact lookup on the new composite unique index, any status) and `::settle()` (CAS to `closed`
+  from `open`, `superseded`, or `failed`; an already-`closed` row is excluded, so a redelivered
+  webhook is a harmless no-op). `ConfirmationDispatcher::dispatch()` now resolves the row to close
+  by the confirmation's own `(gateway, reference)` instead of "whichever attempt is open for this
+  payable" — so a webhook confirming a *superseded* attempt's reference settles that exact
+  retired row and never touches a newer open attempt for the same payable.
+
+### Changed
+
+- **`initiate()` is fallible on every call, not just the first.** In 2.5.0, a repeat `initiate()`
+  against an already-open intent unconditionally returned `ok` with the cached checkout URL and
+  never touched the provider. In 2.6.0 it performs provider I/O to prove liveness first and can
+  return a typed failure (`ProviderSessionStateUnknownException`,
+  `SessionRenewalUnavailableException`, or a propagated `DuplicateReferenceException`). Callers
+  must treat every `initiate()` call as fallible, not just the first one for a payable.
+- **`ConfirmationDispatcher::dispatch()` gains a required 4th parameter, `string $gateway`.** Its
+  only in-repo caller (`PaymentService::confirmAndRecord()`) already had the gateway key in
+  scope; a third-party caller must be updated to pass it.
+
+### Migrations
+
+- **`012_AddPaymentIntentAttemptLifecycle`** — adds the attempt lifecycle columns/constants and
+  the composite `UNIQUE(tenant_uuid, gateway, reference)` index. Runs a duplicate-reference
+  dedup preflight first: for every existing group of rows sharing a non-NULL
+  `(tenant_uuid, gateway, reference)`, keeps the newest row's reference and nulls the reference
+  on the older rows in that group (no row is deleted; nothing else is touched) — so the
+  constraint can be added safely even on a database that already has replay-produced duplicates.
+  Idempotent both ways; runs inside one transaction (dedup, constraint, and — on SQLite, which
+  cannot add a composite UNIQUE via `ALTER TABLE` — the full table rebuild) so a failure anywhere
+  in the sequence rolls back to the untouched original table. Run `php glueful migrate:run` after
+  upgrading.
+
+### Notes
+
+- **Stripe custom Checkout domains:** a merchant serving Stripe Checkout on their own domain must
+  extend `gateways.stripe.checkout_hosts` in file config. This key is deliberately **not**
+  overridable via `PayviaSettings` — the checkout-URL trust boundary is platform-owned, not
+  runtime-editable.
+- **Paystack operational requirement:** the Paystack integration setting
+  `payment_session_timeout` must remain `0` (infinite). A non-zero value silently dead-ends a
+  resumed checkout page while `/transaction/verify` still reports it `abandoned` — indistinguishable
+  from live from payvia's side.
+- **Paystack has no session renewal.** There is no provider-side proof of death to renew
+  against, so a genuinely dead Paystack session surfaces `SessionRenewalUnavailableException`
+  rather than being silently replaced with a new one.
+
 ## [2.5.0] - 2026-08-04 — Subscription Checkout Origination
 
 Payvia gains a hosted, provider-agnostic subscription checkout capability with its own
