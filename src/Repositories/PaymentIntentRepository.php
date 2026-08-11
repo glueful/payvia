@@ -18,18 +18,32 @@ final class PaymentIntentRepository extends BaseRepository
     use DetectsUniqueViolations;
     use NormalizesAmountColumn;
 
+    public const STATUS_INITIALIZING = 'initializing';
+    public const STATUS_OPEN = 'open';
+    public const STATUS_SUPERSEDED = 'superseded';
+    public const STATUS_CLOSED = 'closed';
+    public const STATUS_FAILED = 'failed';
+
     /**
      * Service-enforced closed status set (payment-links Task 1). No DB enum -- matches every
-     * other status column in this schema. `initializing` and `open` are the two statuses that
-     * hold the payable's active idempotency port (see {@see activePortKey()}); the other three
-     * are terminal/superseded outcomes, re-keyed by attempt uuid to free that port.
+     * other status column in this schema. Enforcement is real, not just documentation:
+     * {@see retire()} rejects any `$toStatus` outside this set before writing anything.
+     * `initializing` and `open` are the two statuses that hold the payable's active idempotency
+     * port (see {@see activePortKey()}); the other three are terminal/superseded outcomes,
+     * re-keyed by attempt uuid to free that port.
      *
      * @var list<string>
      */
-    public const STATUSES = ['initializing', 'open', 'superseded', 'closed', 'failed'];
+    public const STATUSES = [
+        self::STATUS_INITIALIZING,
+        self::STATUS_OPEN,
+        self::STATUS_SUPERSEDED,
+        self::STATUS_CLOSED,
+        self::STATUS_FAILED,
+    ];
 
     /** @var list<string> */
-    private const ACTIVE_STATUSES = ['initializing', 'open'];
+    private const ACTIVE_STATUSES = [self::STATUS_INITIALIZING, self::STATUS_OPEN];
 
     private readonly PayviaTenantResolver $resolver;
 
@@ -59,7 +73,7 @@ final class PaymentIntentRepository extends BaseRepository
                 'tenant_uuid' => $this->resolver->tenantUuid($context),
                 'payable_type' => $payableType,
                 'payable_id' => $payableId,
-                'status' => 'open',
+                'status' => self::STATUS_OPEN,
             ])
             ->limit(1)
             ->get();
@@ -112,7 +126,20 @@ final class PaymentIntentRepository extends BaseRepository
         return is_array($row) ? $this->normalizeRow($row) : null;
     }
 
-    /** @param array<string,mixed> $row */
+    /**
+     * @param array<string,mixed> $row
+     * @throws DuplicateReferenceException when the insert collides with
+     *         `UNIQUE(tenant_uuid, gateway, reference)` against a DIFFERENT, already-retired
+     *         attempt -- e.g. a gateway with a fixed, time-boxed idempotency key (Stripe replays
+     *         the same checkout session id for ~24h) handing back an identical reference for a
+     *         retried attempt on a payable whose earlier attempt already closed under it. This is
+     *         NOT the same as the active port being taken (that case still returns `false`, as
+     *         always -- recover via {@see findOpen()}): there, a LIVE row for this exact payable
+     *         exists to recover from. Here, the colliding row belongs to a different, terminal
+     *         attempt -- there is nothing live to hand back, so silently returning `false` would
+     *         let the caller believe this was an ordinary race and go on to fabricate an
+     *         unpersisted "success" from the gateway result it already has in hand.
+     */
     public function createOpen(ApplicationContext $context, array $row): bool
     {
         $payableType = (string) ($row['payable_type'] ?? '');
@@ -121,11 +148,14 @@ final class PaymentIntentRepository extends BaseRepository
             throw new \InvalidArgumentException('Payment intents require payable_type and payable_id.');
         }
 
+        $gateway = (string) ($row['gateway'] ?? '');
+        $reference = $row['reference'] ?? null;
+
         $payload = array_merge($row, [
             'uuid' => (string) ($row['uuid'] ?? Utils::generateNanoID()),
             'tenant_uuid' => $this->resolver->tenantUuid($context),
             'idempotency_key' => $this->activePortKey($payableType, $payableId),
-            'status' => 'open',
+            'status' => self::STATUS_OPEN,
             'payload' => $this->encodePayload($row['payload'] ?? null),
             'created_at' => $this->db->getDriver()->formatDateTime(),
         ]);
@@ -134,11 +164,26 @@ final class PaymentIntentRepository extends BaseRepository
             $this->db->table($this->getTableName())->insert($payload);
             return true;
         } catch (\Throwable $e) {
-            if ($this->isUniqueViolation($e)) {
+            if (!$this->isUniqueViolation($e)) {
+                throw $e;
+            }
+
+            if ($this->findActive($context, $payableType, $payableId) !== null) {
+                // The active port (idempotency_key) is taken by a LIVE row (initializing or
+                // open) for THIS payable -- the ordinary, recoverable race. Unchanged from
+                // before this migration.
                 return false;
             }
 
-            throw $e;
+            // No live row claims this payable's port, yet the insert still collided: it can
+            // only be the new UNIQUE(tenant_uuid, gateway, reference), against a different,
+            // already-retired attempt. Nothing to recover -- surface it.
+            throw new DuplicateReferenceException(
+                $payableType,
+                $payableId,
+                $gateway,
+                is_string($reference) ? $reference : null
+            );
         }
     }
 
@@ -155,6 +200,13 @@ final class PaymentIntentRepository extends BaseRepository
      * insert-or-recover shape as {@see createOpen()} and `CheckoutOriginationRepository::
      * claimPreparing()`. If recovery finds nothing (the winning row was already retired between
      * the failed insert and the recovery read), the original exception propagates.
+     *
+     * IMPORTANT: the recovered row is fetched via {@see findActive()}, so it may come back with
+     * `status === self::STATUS_OPEN` rather than `self::STATUS_INITIALIZING` -- e.g. a caller
+     * that re-enters after the FIRST attempt already completed its provider round trip and called
+     * {@see markOpen()}. Callers MUST branch on the returned row's `status` rather than assume
+     * `initializing`: an `open` row already has a real `reference` and needs no further provider
+     * I/O at all, while an `initializing` one still does.
      *
      * @param array<string,mixed> $row
      * @return array<string,mixed>
@@ -179,7 +231,7 @@ final class PaymentIntentRepository extends BaseRepository
             'gateway' => $gateway,
             'idempotency_key' => $this->activePortKey($payableType, $payableId),
             'reference' => null,
-            'status' => 'initializing',
+            'status' => self::STATUS_INITIALIZING,
             'payload' => $this->encodePayload($row['payload'] ?? null),
             'created_at' => $this->db->getDriver()->formatDateTime(),
         ]);
@@ -217,7 +269,17 @@ final class PaymentIntentRepository extends BaseRepository
      * uuid is unknown, belongs to another tenant, or has already left `initializing` --
      * indistinguishable to the caller by design, mirroring {@see close()}'s non-revealing shape.
      *
+     * `$payload === null` SKIPS the `payload` column entirely rather than overwriting it with
+     * NULL: {@see claimAttempt()} may already have written a claim-time payload, and a caller
+     * that omits `$payload` here (e.g. a bare reference confirmation with no fresh provider data)
+     * must not destroy it -- a later {@see findOpen()} reader depends on it (e.g. `checkout_url`).
+     *
      * @param array<string,mixed>|null $payload
+     * @throws DuplicateReferenceException when `$reference` collides with
+     *         `UNIQUE(tenant_uuid, gateway, reference)` against a DIFFERENT, already-retired
+     *         attempt -- see {@see createOpen()}'s docblock for the same reachable scenario. Only
+     *         this constraint is reachable from this method's UPDATE (it never touches
+     *         `idempotency_key`), so any unique violation caught here is unambiguously this case.
      */
     public function markOpen(ApplicationContext $context, string $uuid, string $reference, ?array $payload = null): bool
     {
@@ -225,18 +287,37 @@ final class PaymentIntentRepository extends BaseRepository
             return false;
         }
 
-        $affected = $this->db->table($this->getTableName())
-            ->where([
-                'uuid' => $uuid,
-                'tenant_uuid' => $this->resolver->tenantUuid($context),
-                'status' => 'initializing',
-            ])
-            ->update([
-                'reference' => $reference,
-                'status' => 'open',
-                'payload' => $this->encodePayload($payload),
-                'updated_at' => $this->db->getDriver()->formatDateTime(),
-            ]);
+        $tenant = $this->resolver->tenantUuid($context);
+        $row = $this->findByUuid($context, $uuid);
+        if ($row === null || (string) $row['status'] !== self::STATUS_INITIALIZING) {
+            return false;
+        }
+
+        $fields = [
+            'status' => self::STATUS_OPEN,
+            'reference' => $reference,
+            'updated_at' => $this->db->getDriver()->formatDateTime(),
+        ];
+        if ($payload !== null) {
+            $fields['payload'] = $this->encodePayload($payload);
+        }
+
+        try {
+            $affected = $this->db->table($this->getTableName())
+                ->where(['uuid' => $uuid, 'tenant_uuid' => $tenant, 'status' => self::STATUS_INITIALIZING])
+                ->update($fields);
+        } catch (\Throwable $e) {
+            if (!$this->isUniqueViolation($e)) {
+                throw $e;
+            }
+
+            throw new DuplicateReferenceException(
+                (string) $row['payable_type'],
+                (string) $row['payable_id'],
+                (string) $row['gateway'],
+                $reference
+            );
+        }
 
         return $affected > 0;
     }
@@ -248,7 +329,7 @@ final class PaymentIntentRepository extends BaseRepository
      */
     public function supersede(ApplicationContext $context, string $uuid): bool
     {
-        return $this->retire($context, $uuid, self::ACTIVE_STATUSES, 'superseded');
+        return $this->retire($context, $uuid, self::ACTIVE_STATUSES, self::STATUS_SUPERSEDED);
     }
 
     /**
@@ -257,12 +338,15 @@ final class PaymentIntentRepository extends BaseRepository
      * \ConfirmationDispatcher} included -- but `$reference` is no longer needed to compute the
      * re-keyed idempotency_key (see {@see retire()}): the row's own attempt uuid is used instead,
      * which -- unlike a reference -- is always present even for a row that never reached `open`.
-     * Accepted only for call-site compatibility.
+     *
+     * @param string $reference Vestigial, kept only for call-site compatibility -- never read.
+     * @deprecated $reference is unused; safe to drop once every caller (Task 2's collector
+     *             rewrite) stops passing it. The method itself is NOT deprecated.
      */
     public function close(ApplicationContext $context, string $uuid, string $reference = ''): void
     {
         unset($reference);
-        $this->retire($context, $uuid, ['open'], 'closed');
+        $this->retire($context, $uuid, [self::STATUS_OPEN], self::STATUS_CLOSED);
     }
 
     /**
@@ -274,20 +358,21 @@ final class PaymentIntentRepository extends BaseRepository
      */
     public function fail(ApplicationContext $context, string $uuid): bool
     {
-        return $this->retire($context, $uuid, ['initializing'], 'failed');
+        return $this->retire($context, $uuid, [self::STATUS_INITIALIZING], self::STATUS_FAILED);
     }
 
     /**
      * Shared terminal/superseded transition: reads the row (tenant-scoped), refuses if it is
      * missing or not currently in one of `$fromStatuses`, otherwise CASes to `$toStatus` and
      * re-keys `idempotency_key` to {@see retiredKey()} -- freeing the active port the instant the
-     * row leaves `initializing`/`open`.
+     * row leaves `initializing`/`open`. `$toStatus` is validated against {@see STATUSES} --
+     * the service-enforced closed set is a real runtime guard here, not just documentation.
      *
      * @param list<string> $fromStatuses
      */
     private function retire(ApplicationContext $context, string $uuid, array $fromStatuses, string $toStatus): bool
     {
-        if ($uuid === '') {
+        if ($uuid === '' || !in_array($toStatus, self::STATUSES, true)) {
             return false;
         }
 

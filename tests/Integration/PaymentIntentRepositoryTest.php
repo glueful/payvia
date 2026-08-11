@@ -6,6 +6,7 @@ namespace Glueful\Extensions\Payvia\Tests\Integration;
 
 use Glueful\Extensions\Payvia\Database\Migrations\AddPaymentIntentAttemptLifecycle;
 use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentIntentsTable;
+use Glueful\Extensions\Payvia\Repositories\DuplicateReferenceException;
 use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
 use Glueful\Extensions\Payvia\Tests\Support\PayviaTestCase;
 
@@ -173,6 +174,56 @@ final class PaymentIntentRepositoryTest extends PayviaTestCase
         self::assertNull($repo->findOpen($this->context, 'commerce_order', 'ord20'));
         $retry = $repo->claimAttempt($this->context, $this->attemptRow('commerce_order', 'ord20'));
         self::assertNotSame($claimed['uuid'], $retry['uuid']);
+    }
+
+    public function testMarkOpenWithoutAPayloadPreservesTheClaimTimePayload(): void
+    {
+        $repo = new PaymentIntentRepository($this->connection);
+        $row = $this->attemptRow('commerce_order', 'ord21');
+        $row['payload'] = ['checkout_url' => 'https://checkout.test/claim-time'];
+        $claimed = $repo->claimAttempt($this->context, $row);
+        self::assertSame(['checkout_url' => 'https://checkout.test/claim-time'], $claimed['payload']);
+
+        // No $payload argument: the claim-time payload must survive, not be nulled out.
+        self::assertTrue($repo->markOpen($this->context, (string) $claimed['uuid'], 'ref-open'));
+
+        $open = $repo->findOpen($this->context, 'commerce_order', 'ord21');
+        self::assertSame(['checkout_url' => 'https://checkout.test/claim-time'], $open['payload']);
+    }
+
+    public function testMarkOpenThrowsOnDuplicateReferenceAgainstADifferentRetiredAttempt(): void
+    {
+        $repo = new PaymentIntentRepository($this->connection);
+
+        // Attempt A claims, opens, and closes under "cs_test_fixed" -- e.g. Stripe's own
+        // ~24h fixed-idempotency-key replay behavior for a retried checkout.
+        $a = $repo->claimAttempt($this->context, $this->attemptRow('commerce_order', 'ord22'));
+        $repo->markOpen($this->context, (string) $a['uuid'], 'cs_test_fixed');
+        $repo->close($this->context, (string) $a['uuid'], 'cs_test_fixed');
+
+        // Attempt B is a DIFFERENT payable whose gateway also hands back "cs_test_fixed".
+        $b = $repo->claimAttempt($this->context, $this->attemptRow('commerce_order', 'ord23'));
+
+        $this->expectException(DuplicateReferenceException::class);
+        $repo->markOpen($this->context, (string) $b['uuid'], 'cs_test_fixed');
+    }
+
+    public function testCreateOpenThrowsOnDuplicateReferenceAgainstADifferentRetiredAttempt(): void
+    {
+        $repo = new PaymentIntentRepository($this->connection);
+
+        self::assertTrue(
+            $repo->createOpen($this->context, $this->intentRow('commerce_order', 'ord24', 'cs_test_fixed'))
+        );
+        $open = $repo->findOpen($this->context, 'commerce_order', 'ord24');
+        $repo->close($this->context, (string) $open['uuid'], 'cs_test_fixed');
+
+        // A DIFFERENT payable's gateway replays the SAME reference. No live row claims this
+        // payable's port, so this is NOT the ordinary "already taken" race -- there is nothing
+        // to recover via findOpen(), and silently returning false would let the caller believe
+        // it was and go fabricate an unpersisted "success".
+        $this->expectException(DuplicateReferenceException::class);
+        $repo->createOpen($this->context, $this->intentRow('commerce_order', 'ord25', 'cs_test_fixed'));
     }
 
     /** @return array<string,mixed> */

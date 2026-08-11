@@ -134,6 +134,65 @@ final class PaymentIntentAttemptLifecycleMigrationTest extends PayviaTestCase
         self::assertSame(2, $this->rowCount($this->connection));
     }
 
+    /**
+     * The CRITICAL pre-flight case: 007 never rejected a duplicate `(tenant, gateway, reference)`
+     * -- a real database may already contain one (e.g. Stripe's ~24h fixed-idempotency-key replay
+     * handing the same reference to a retried attempt on an already-retired payable). The
+     * migration must resolve this itself rather than hard-fail partway through.
+     */
+    public function testDuplicateGroupIsResolvedKeepingTheNewestRowsReference(): void
+    {
+        $this->insert($this->connection, [
+            'uuid' => 'dupuuid00001',
+            'payable_id' => 'ord-dup-1',
+            'idempotency_key' => 'commerce_order:ord-dup-1',
+            'gateway' => 'stripe',
+            'reference' => 'cs_test_dup',
+            'status' => 'closed',
+            'created_at' => '2026-01-01 00:00:00',
+        ]);
+        $this->insert($this->connection, [
+            'uuid' => 'dupuuid00002',
+            'payable_id' => 'ord-dup-1',
+            'idempotency_key' => 'commerce_order:ord-dup-1:dupuuid00002',
+            'gateway' => 'stripe',
+            'reference' => 'cs_test_dup',
+            'status' => 'closed',
+            'created_at' => '2026-01-02 00:00:00',
+        ]);
+        $this->insert($this->connection, [
+            'uuid' => 'dupuuid00003',
+            'payable_id' => 'ord-dup-1',
+            'idempotency_key' => 'commerce_order:ord-dup-1:dupuuid00003',
+            'gateway' => 'stripe',
+            'reference' => 'cs_test_dup',
+            'status' => 'open',
+            'created_at' => '2026-01-03 00:00:00',
+        ]);
+
+        $this->runMigration(new AddPaymentIntentAttemptLifecycle());
+
+        self::assertSame(3, $this->rowCount($this->connection), 'no row may be lost during dedup');
+
+        $newest = $this->connection->table('payment_intents')->where(['uuid' => 'dupuuid00003'])->first();
+        $middle = $this->connection->table('payment_intents')->where(['uuid' => 'dupuuid00002'])->first();
+        $oldest = $this->connection->table('payment_intents')->where(['uuid' => 'dupuuid00001'])->first();
+
+        self::assertSame('cs_test_dup', $newest['reference'], 'the newest row keeps the reference');
+        self::assertNull($middle['reference'], 'older duplicates are nulled out');
+        self::assertNull($oldest['reference'], 'older duplicates are nulled out');
+
+        // The constraint is genuinely live afterward: a brand-new duplicate is rejected.
+        $this->expectException(\PDOException::class);
+        $this->insert($this->connection, [
+            'uuid' => 'dupuuid00004',
+            'payable_id' => 'ord-dup-2',
+            'idempotency_key' => 'commerce_order:ord-dup-2',
+            'gateway' => 'stripe',
+            'reference' => 'cs_test_dup',
+        ]);
+    }
+
     public function testMigrationIsIdempotent(): void
     {
         $migration = new AddPaymentIntentAttemptLifecycle();
@@ -223,6 +282,55 @@ final class PaymentIntentAttemptLifecycleMigrationTest extends PayviaTestCase
             'idempotency_key' => $this->pgKey('pg-2'),
             'reference' => $ref,
         ]);
+    }
+
+    public function testDuplicateGroupIsResolvedKeepingTheNewestRowsReferenceOnPostgres(): void
+    {
+        $pg = $this->pgsqlLegacyConnection();
+        $ref = $this->pgKey('dupgroup');
+        $oldestUuid = $this->pgUuid('old');
+        $middleUuid = $this->pgUuid('mid');
+        $newestUuid = $this->pgUuid('new');
+
+        $this->insert($pg, [
+            'uuid' => $oldestUuid,
+            'payable_id' => 'pg-dup-1',
+            'idempotency_key' => $this->pgKey('pg-dup-1'),
+            'gateway' => 'stripe',
+            'reference' => $ref,
+            'status' => 'closed',
+            'created_at' => '2026-01-01 00:00:00',
+        ]);
+        $this->insert($pg, [
+            'uuid' => $middleUuid,
+            'payable_id' => 'pg-dup-1',
+            'idempotency_key' => $this->pgKey('pg-dup-1'),
+            'gateway' => 'stripe',
+            'reference' => $ref,
+            'status' => 'closed',
+            'created_at' => '2026-01-02 00:00:00',
+        ]);
+        $this->insert($pg, [
+            'uuid' => $newestUuid,
+            'payable_id' => 'pg-dup-1',
+            'idempotency_key' => $this->pgKey('pg-dup-1'),
+            'gateway' => 'stripe',
+            'reference' => $ref,
+            'status' => 'open',
+            'created_at' => '2026-01-03 00:00:00',
+        ]);
+
+        (new AddPaymentIntentAttemptLifecycle())->up($pg->getSchemaBuilder());
+
+        self::assertSame(3, $this->rowCount($pg), 'no row may be lost during dedup');
+
+        $newest = $pg->table('payment_intents')->where(['uuid' => $newestUuid])->first();
+        $middle = $pg->table('payment_intents')->where(['uuid' => $middleUuid])->first();
+        $oldest = $pg->table('payment_intents')->where(['uuid' => $oldestUuid])->first();
+
+        self::assertSame($ref, $newest['reference'], 'the newest row keeps the reference');
+        self::assertNull($middle['reference'], 'older duplicates are nulled out');
+        self::assertNull($oldest['reference'], 'older duplicates are nulled out');
     }
 
     public function testRealUpgradePreservesExistingRowsOnPostgres(): void

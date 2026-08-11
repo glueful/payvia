@@ -9,9 +9,11 @@ use Glueful\Extensions\Contracts\Payments\PaymentCollector;
 use Glueful\Extensions\Contracts\Payments\PaymentInitiation;
 use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
+use Glueful\Extensions\Payvia\Database\Migrations\AddPaymentIntentAttemptLifecycle;
 use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentIntentsTable;
 use Glueful\Extensions\Payvia\GatewayManager;
 use Glueful\Extensions\Payvia\PayviaServiceProvider;
+use Glueful\Extensions\Payvia\Repositories\DuplicateReferenceException;
 use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
 use Glueful\Extensions\Payvia\Services\PayviaPaymentCollector;
 use Glueful\Extensions\Payvia\Tests\Support\FakeWebhookGateway;
@@ -24,6 +26,7 @@ final class PayviaPaymentCollectorTest extends PayviaTestCase
         parent::setUp();
 
         $this->runMigration(new CreatePaymentIntentsTable());
+        $this->runMigration(new AddPaymentIntentAttemptLifecycle());
     }
 
     public function testTwoInitiatesYieldOneGatewayReference(): void
@@ -188,6 +191,48 @@ final class PayviaPaymentCollectorTest extends PayviaTestCase
         self::assertSame(0, $gateway->initializeCalls);
     }
 
+    /**
+     * IMPORTANT 3 (payment-links Task 1 fix review): a gateway with a fixed, time-boxed
+     * idempotency key -- Stripe replays the identical checkout session id/reference for ~24h for
+     * a retried request -- can hand back the SAME reference for a retried `initiate()` on a
+     * payable whose earlier attempt already closed under it. Before the fix, `createOpen()`
+     * returning `false` for ANY unique violation made the collector assume the ordinary
+     * "already open" race, find nothing via `findOpen()` (the earlier intent is CLOSED, not
+     * open), and fall through to fabricate a "success" `PaymentInitiation` with nothing
+     * persisted -- silently losing the payment record. `createOpen()` now throws
+     * `DuplicateReferenceException` for exactly this case, and the collector has -- by design,
+     * see `testGatewayInitializationExceptionsPropagate()` above -- no catch of its own, so it
+     * must propagate all the way out rather than ever reach that fabricated-success line.
+     */
+    public function testReplayedGatewayReferenceAfterCloseSurfacesATypedFailureInsteadOfAFakeOk(): void
+    {
+        $gateway = new FixedReferenceInitiationGateway('cs_test_fixed');
+        $this->bind(FixedReferenceInitiationGateway::class, $gateway);
+
+        $manager = new GatewayManager($this->context->getContainer(), $this->context);
+        $manager->registerDriver('fake', FixedReferenceInitiationGateway::class);
+        $this->useGateway('fake');
+
+        $intents = new PaymentIntentRepository($this->connection);
+        $collector = new PayviaPaymentCollector($manager, $intents);
+        $payable = new PayableReference('commerce_order', 'ord-replay', 4999, 'GHS');
+
+        $first = $collector->initiate($this->context, $payable);
+        self::assertSame('cs_test_fixed', $first->payload['reference']);
+
+        // The order's payment settles and the intent is closed -- exactly what
+        // ConfirmationDispatcher does in production.
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-replay');
+        self::assertIsArray($open);
+        $intents->close($this->context, (string) $open['uuid'], 'cs_test_fixed');
+
+        // A retried checkout for the SAME payable: findOpen() sees nothing (the intent is
+        // closed), so the collector calls the gateway again -- which hands back the IDENTICAL
+        // reference, colliding with the now-retired row.
+        $this->expectException(DuplicateReferenceException::class);
+        $collector->initiate($this->context, $payable);
+    }
+
     private function useGateway(string $gateway): void
     {
         $config = require __DIR__ . '/../../config/payvia.php';
@@ -234,5 +279,30 @@ final class ThrowingInitiationGateway implements PaymentGatewayInterface, Initia
     public function initialize(PayableReference $payable, array $options = []): array
     {
         throw new \RuntimeException('gateway exploded');
+    }
+}
+
+/**
+ * Mirrors a gateway with a fixed, time-boxed idempotency key -- e.g. Stripe, which replays the
+ * identical checkout session id/reference for ~24h for an equivalent retried request -- by always
+ * handing back the SAME reference regardless of how many times `initialize()` is called.
+ */
+final class FixedReferenceInitiationGateway implements PaymentGatewayInterface, InitiationCapableGateway
+{
+    public function __construct(private string $reference)
+    {
+    }
+
+    public function verify(string $reference, array $options = []): array
+    {
+        return ['status' => 'success', 'reference' => $reference];
+    }
+
+    public function initialize(PayableReference $payable, array $options = []): array
+    {
+        return [
+            'reference' => $this->reference,
+            'checkout_url' => 'https://checkout.test/' . $this->reference,
+        ];
     }
 }
