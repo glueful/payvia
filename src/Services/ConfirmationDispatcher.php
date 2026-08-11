@@ -23,10 +23,21 @@ final class ConfirmationDispatcher
         $this->handlers = array_values(is_array($handlers) ? $handlers : iterator_to_array($handlers));
     }
 
+    /**
+     * `$gateway` (payment-links Task 3) makes the intent lookup reference-addressable:
+     * `(tenant_uuid, gateway, reference)` is the composite unique key Task 1's migration
+     * added, so it resolves to the EXACT attempt row a webhook's reference belongs to --
+     * never "whichever attempt happens to be open" for the payable. With supersession, a
+     * payable can carry a retired attempt alongside its current open one, each under its
+     * own reference; a webhook confirming an OLD reference must settle THAT row, leaving
+     * the open attempt untouched. A reference matching no row at all (unmatched webhook)
+     * is a no-op here, exactly as before this fix.
+     */
     public function dispatch(
         ApplicationContext $context,
         PayableReference $payable,
-        PaymentConfirmation $confirmation
+        PaymentConfirmation $confirmation,
+        string $gateway
     ): void {
         foreach ($this->handlers as $handler) {
             if ($handler->supports($payable->type)) {
@@ -34,9 +45,9 @@ final class ConfirmationDispatcher
             }
         }
 
-        $open = $this->intents->findOpen($context, $payable->type, $payable->id);
-        if ($open !== null) {
-            $this->intents->close($context, (string) $open['uuid'], $confirmation->reference);
+        $row = $this->intents->findByReference($context, $gateway, $confirmation->reference);
+        if ($row !== null) {
+            $this->intents->settle($context, (string) $row['uuid']);
         }
     }
 }

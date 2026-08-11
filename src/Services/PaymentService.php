@@ -172,7 +172,8 @@ final class PaymentService
                     $amount,
                     $currency,
                     $verification
-                )
+                ),
+                $gatewayKey
             );
         }
 

@@ -115,6 +115,38 @@ final class PaymentIntentRepository extends BaseRepository
         return is_array($row) ? $this->normalizeRow($row) : null;
     }
 
+    /**
+     * Reference-addressable lookup (payment-links Task 3): the composite
+     * `UNIQUE(tenant_uuid, gateway, reference)` added by 012 makes this exact and
+     * unambiguous -- unlike {@see findOpen()}/{@see findActive()} (both scoped by payable
+     * and status), this finds the ONE row a webhook's own reference belongs to, whatever
+     * its current status. A superseded/closed/failed attempt carries its OWN reference,
+     * distinct from the payable's current open attempt's -- a webhook confirming an OLD
+     * reference must resolve to THAT row, never "whichever attempt is open" for the
+     * payable.
+     *
+     * @return array<string,mixed>|null
+     */
+    public function findByReference(ApplicationContext $context, string $gateway, string $reference): ?array
+    {
+        if ($gateway === '' || $reference === '') {
+            return null;
+        }
+
+        $rows = $this->db->table($this->getTableName())
+            ->select(['*'])
+            ->where([
+                'tenant_uuid' => $this->resolver->tenantUuid($context),
+                'gateway' => $gateway,
+                'reference' => $reference,
+            ])
+            ->limit(1)
+            ->get();
+
+        $row = $rows[0] ?? null;
+        return is_array($row) ? $this->normalizeRow($row) : null;
+    }
+
     /** @return array<string,mixed>|null */
     public function findByUuid(ApplicationContext $context, string $uuid): ?array
     {
@@ -394,6 +426,27 @@ final class PaymentIntentRepository extends BaseRepository
     {
         unset($reference);
         $this->retire($context, $uuid, [self::STATUS_OPEN], self::STATUS_CLOSED);
+    }
+
+    /**
+     * Settle a reference-addressed intent row on webhook confirmation (payment-links
+     * Task 3): CASes to `closed` from `open` (the ordinary case) OR from an already-retired
+     * `superseded`/`failed` row -- a late confirmation arriving under an OLD attempt's own
+     * reference. `closed` is deliberately excluded from `$fromStatuses`: a re-delivered
+     * webhook for an already-settled row is a harmless no-op, not a transition to repeat.
+     *
+     * Never resurrects a retired row back to `open` -- the honest write is a transition to
+     * `closed` FROM whatever status the row was actually in, recording that a confirmation
+     * was received without ever making a superseded/failed attempt look live again.
+     */
+    public function settle(ApplicationContext $context, string $uuid): bool
+    {
+        return $this->retire(
+            $context,
+            $uuid,
+            [self::STATUS_OPEN, self::STATUS_SUPERSEDED, self::STATUS_FAILED],
+            self::STATUS_CLOSED
+        );
     }
 
     /**
