@@ -13,6 +13,8 @@ use Glueful\Extensions\Contracts\Payments\PayoutResult;
 use Glueful\Extensions\Contracts\Payments\PayoutStatusResult;
 use Glueful\Extensions\Payvia\Checkout\DefinitiveSubscriptionCheckoutRejection;
 use Glueful\Extensions\Payvia\Checkout\SubscriptionCheckoutRequest;
+use Glueful\Extensions\Payvia\Contracts\HostedSessionRenewalCapableGateway;
+use Glueful\Extensions\Payvia\Contracts\HostedSessionStateCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
@@ -24,6 +26,7 @@ use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
+use Glueful\Extensions\Payvia\Support\HostedCheckoutUrl;
 use Glueful\Extensions\Payvia\Support\PayviaSettings;
 use Glueful\Http\Client as HttpClient;
 use Glueful\Http\Exceptions\HttpClientException;
@@ -32,6 +35,8 @@ use Glueful\Http\Response\Response as HttpResponse;
 final class StripeGateway implements
     PaymentGatewayInterface,
     InitiationCapableGateway,
+    HostedSessionStateCapableGateway,
+    HostedSessionRenewalCapableGateway,
     WebhookCapableGateway,
     SubscriptionCapableGateway,
     SubscriptionInitiationCapableGateway,
@@ -39,6 +44,14 @@ final class StripeGateway implements
     SubscriptionCancellationModeProvider,
     TransferCapableGateway
 {
+    /**
+     * The driver's own shipped checkout-host allow-list, used when `gateways.stripe
+     * .checkout_hosts` is absent or malformed. See {@see HostedCheckoutUrl::configuredHosts()}.
+     *
+     * @var list<string>
+     */
+    private const CHECKOUT_HOSTS = ['checkout.stripe.com'];
+
     private ApplicationContext $context;
 
     public function __construct(
@@ -89,11 +102,21 @@ final class StripeGateway implements
      * provider reference — exactly what {@see verify()}'s checkout-session branch resolves.
      *
      * `callback_url` (the success URL) is REQUIRED — Stripe rejects a session without one, so a
-     * missing value throws here, before any request; `cancel_url` falls back to it. The
-     * Idempotency-Key is deterministic per payable, so concurrent initiations of the SAME payable
-     * cannot mint two hosted sessions. The response is validated (non-empty `cs_` id, absolute
-     * HTTPS checkout URL) BEFORE returning, so a caller can never persist an intent for a
-     * malformed session.
+     * missing value throws here, before any request; `cancel_url` falls back to it.
+     *
+     * `attempt_uuid` is REQUIRED too (payment-links Task 2): the Idempotency-Key is derived from
+     * the caller's claimed ATTEMPT, not from the payable. The old fixed `payvia-init-{type}-{id}`
+     * key made two very different situations indistinguishable to Stripe — a retry of one attempt
+     * (must de-dupe onto the same session) and a later, provider-proven renewal (must mint a new
+     * one) — and Stripe replays a session id for ~24h under a repeated key, so a renewal could
+     * hand back the retired attempt's reference and collide with the row that already closed
+     * under it. Deriving from the attempt uuid makes that collision structurally impossible for
+     * new attempts, and there is deliberately NO fallback: a caller with no attempt identity has
+     * no idempotency story at all, so it is refused before any provider I/O.
+     *
+     * The response is validated (non-empty `cs_` id, absolute HTTPS checkout URL on a trusted
+     * provider host) BEFORE returning, so a caller can never persist an intent for a malformed
+     * session or hand a customer a redirect Stripe did not actually issue.
      *
      * @param array<string,mixed> $options
      * @return array<string,mixed>
@@ -103,6 +126,16 @@ final class StripeGateway implements
         $secret = $this->secretKey();
         if ($secret === '') {
             throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        $attemptUuid = isset($options['attempt_uuid']) && is_string($options['attempt_uuid'])
+            ? trim($options['attempt_uuid'])
+            : '';
+        if ($attemptUuid === '') {
+            throw new \RuntimeException(
+                'Stripe Checkout requires an attempt_uuid in the initiation options; the '
+                . 'Idempotency-Key is derived from it, never from the payable.'
+            );
         }
 
         $callback = isset($options['callback_url']) && is_string($options['callback_url'])
@@ -146,7 +179,7 @@ final class StripeGateway implements
         }
 
         $requestOptions = $this->requestOptions();
-        $requestOptions['headers']['Idempotency-Key'] = 'payvia-init-' . $payable->type . '-' . $payable->id;
+        $requestOptions['headers']['Idempotency-Key'] = 'payvia-init-' . $attemptUuid;
         $requestOptions['form_params'] = $form;
 
         $response = $this->httpClient->post($this->baseUrl() . '/v1/checkout/sessions', $requestOptions);
@@ -162,22 +195,34 @@ final class StripeGateway implements
         if (!is_string($sessionId) || !str_starts_with($sessionId, 'cs_')) {
             throw new \RuntimeException('Stripe checkout session returned no usable session id');
         }
-        $url = $decoded['url'] ?? '';
-        $parts = is_string($url) ? parse_url($url) : false;
-        if (
-            !is_string($url)
-            || !is_array($parts)
-            || ($parts['scheme'] ?? '') !== 'https'
-            || ($parts['host'] ?? '') === ''
-        ) {
-            throw new \RuntimeException('Stripe checkout session returned no usable HTTPS checkout URL');
-        }
 
         return [
             'reference' => $sessionId,
-            'checkout_url' => $url,
+            'checkout_url' => $this->trustedCheckoutUrl($decoded['url'] ?? null, 'Stripe checkout session'),
             'raw' => $decoded,
         ];
+    }
+
+    /**
+     * The hosted-redirect trust boundary for this driver: an absolute HTTPS url on a host that
+     * exactly matches the configured `checkout_hosts` set (default `checkout.stripe.com`).
+     * Anything else throws HERE, so an untrusted url can never reach an intent payload -- and
+     * therefore never reach a browser as a redirect. See {@see HostedCheckoutUrl}.
+     */
+    private function trustedCheckoutUrl(mixed $url, string $context): string
+    {
+        $trusted = HostedCheckoutUrl::trusted(
+            $url,
+            HostedCheckoutUrl::configuredHosts($this->config(), self::CHECKOUT_HOSTS),
+        );
+
+        if ($trusted === null) {
+            throw new \RuntimeException(
+                $context . ' returned no usable HTTPS checkout URL on a trusted Stripe checkout host'
+            );
+        }
+
+        return $trusted;
     }
 
     public function verifyWebhookSignature(string $rawBody, array $headers): bool
@@ -366,20 +411,15 @@ final class StripeGateway implements
         if (!is_string($sessionId) || !str_starts_with($sessionId, 'cs_')) {
             throw new \RuntimeException('Stripe subscription checkout session returned no usable session id');
         }
-        $url = $decoded['url'] ?? '';
-        $parts = is_string($url) ? parse_url($url) : false;
-        if (
-            !is_string($url)
-            || !is_array($parts)
-            || ($parts['scheme'] ?? '') !== 'https'
-            || ($parts['host'] ?? '') === ''
-        ) {
-            throw new \RuntimeException('Stripe subscription checkout session returned no usable HTTPS checkout URL');
-        }
 
         return [
             'reference' => $sessionId,
-            'checkout_url' => $url,
+            // Same trust boundary as initialize(): a subscription checkout url is redirected to
+            // by a browser exactly like a one-time one, so it gets the identical host check.
+            'checkout_url' => $this->trustedCheckoutUrl(
+                $decoded['url'] ?? null,
+                'Stripe subscription checkout session'
+            ),
             'expires_at' => $this->timestamp($decoded['expires_at'] ?? null),
             'raw' => $decoded,
         ];
@@ -426,19 +466,90 @@ final class StripeGateway implements
             throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
         }
 
+        return $this->expireAndReclassify($reference, 'Stripe subscription checkout');
+    }
+
+    /**
+     * Read-only liveness for a hosted PAYMENT session (payment-links Task 2): is the session the
+     * collector already persisted still worth redirecting a customer to? Mutates nothing --
+     * ensure-live's overwhelmingly common answer is "yes, reuse this url", and that answer must
+     * not cost the session its life.
+     *
+     * `complete` + a payment_status that is not yet settled maps to LIVE, not COMPLETED: an async
+     * payment method (bank debit and friends) completes the SESSION immediately and settles
+     * later, so the payment outcome is still outstanding. Either way it is never DEAD.
+     *
+     * @return 'live'|'completed'|'dead'|'unknown'
+     */
+    public function hostedSessionState(string $reference): string
+    {
+        if (trim($reference) === '') {
+            return self::STATE_UNKNOWN;
+        }
+
+        $secret = $this->secretKey();
+        if ($secret === '') {
+            throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        $response = $this->httpClient->get(
+            $this->baseUrl() . '/v1/checkout/sessions/' . rawurlencode($reference),
+            $this->requestOptions()
+        );
+        [, $decoded] = $this->decodeJsonResponse($response, 'Stripe checkout session status');
+
+        return match ($this->mapCheckoutStatus($decoded)) {
+            'pending' => self::STATE_LIVE,
+            'completed' => self::STATE_COMPLETED,
+            'expired', 'canceled' => self::STATE_DEAD,
+            default => self::STATE_UNKNOWN,
+        };
+    }
+
+    /**
+     * PROVE a hosted payment session dead: status -> expire -> re-fetch, with the re-fetch as the
+     * single authority. Only `confirmed_dead` ever licenses superseding the intent that owns this
+     * reference; a completed session, a still-open one, and an unparseable answer all keep it.
+     * A transport failure THROWS rather than degrading to a verdict.
+     *
+     * @return 'confirmed_dead'|'still_live'|'unknown'
+     */
+    public function abandonHostedSession(string $reference): string
+    {
+        if (trim($reference) === '') {
+            return self::RENEWAL_UNKNOWN;
+        }
+
+        $secret = $this->secretKey();
+        if ($secret === '') {
+            throw new \RuntimeException('Missing Stripe secret key (PAYVIA_STRIPE_SECRET_KEY)');
+        }
+
+        return $this->expireAndReclassify($reference, 'Stripe checkout session');
+    }
+
+    /**
+     * The shared expire-then-re-fetch round trip behind {@see abandonSubscriptionCheckout()} and
+     * {@see abandonHostedSession()} -- the same two Stripe calls against the same object type,
+     * differing only in the label their transport errors carry.
+     *
+     * @return 'confirmed_dead'|'still_live'|'unknown'
+     */
+    private function expireAndReclassify(string $reference, string $label): string
+    {
         $expireResponse = $this->httpClient->post(
             $this->baseUrl() . '/v1/checkout/sessions/' . rawurlencode($reference) . '/expire',
             $this->requestOptions()
         );
         // Deliberately ignored beyond decoding (guards against a 5xx transport failure) --
         // Stripe rejects expiring an already-terminal session, which is not itself meaningful.
-        $this->decodeJsonResponse($expireResponse, 'Stripe subscription checkout expire');
+        $this->decodeJsonResponse($expireResponse, $label . ' expire');
 
         $statusResponse = $this->httpClient->get(
             $this->baseUrl() . '/v1/checkout/sessions/' . rawurlencode($reference),
             $this->requestOptions()
         );
-        [, $decoded] = $this->decodeJsonResponse($statusResponse, 'Stripe subscription checkout status');
+        [, $decoded] = $this->decodeJsonResponse($statusResponse, $label . ' status');
 
         return match ($this->mapCheckoutStatus($decoded)) {
             'expired', 'canceled' => 'confirmed_dead',

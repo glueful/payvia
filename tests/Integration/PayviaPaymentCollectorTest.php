@@ -63,7 +63,8 @@ final class PayviaPaymentCollectorTest extends PayviaTestCase
         $manager->registerDriver('fake', FakeInitiationGateway::class);
         $this->useGateway('fake');
 
-        $collector = new PayviaPaymentCollector($manager, new PaymentIntentRepository($this->connection));
+        $intents = new PaymentIntentRepository($this->connection);
+        $collector = new PayviaPaymentCollector($manager, $intents);
         $collector->initiate($this->context, new PayableReference(
             'commerce_order',
             'ordmeta1',
@@ -78,10 +79,16 @@ final class PayviaPaymentCollectorTest extends PayviaTestCase
             ],
         ));
 
+        // Plus the ONE non-metadata option the collector owns (payment-links Task 2): the attempt
+        // uuid it claimed before this call, from which the driver derives its per-attempt provider
+        // idempotency key/reference.
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ordmeta1');
+        self::assertIsArray($open);
         self::assertSame([
             'email' => 'buyer@example.test',
             'callback_url' => 'https://shop.test/checkout/return/THL-1',
             'cancel_url' => 'https://shop.test/checkout/cancel/THL-1',
+            'attempt_uuid' => $open['uuid'],
         ], $gateway->lastOptions);
     }
 
@@ -94,10 +101,13 @@ final class PayviaPaymentCollectorTest extends PayviaTestCase
         $manager->registerDriver('fake', FakeInitiationGateway::class);
         $this->useGateway('fake');
 
-        $collector = new PayviaPaymentCollector($manager, new PaymentIntentRepository($this->connection));
+        $intents = new PaymentIntentRepository($this->connection);
+        $collector = new PayviaPaymentCollector($manager, $intents);
         $collector->initiate($this->context, new PayableReference('commerce_order', 'ordmeta2', 4999, 'GHS'));
 
-        self::assertSame([], $gateway->lastOptions);
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ordmeta2');
+        self::assertIsArray($open);
+        self::assertSame(['attempt_uuid' => $open['uuid']], $gateway->lastOptions);
     }
 
     public function testGatewayInitializationExceptionsPropagate(): void

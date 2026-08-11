@@ -129,7 +129,7 @@ final class PaystackWebhookSignatureTest extends TestCase
             'status' => true,
             'data' => [
                 'reference' => 'REF_INIT',
-                'authorization_url' => 'https://checkout.paystack.test/REF_INIT',
+                'authorization_url' => 'https://checkout.paystack.com/REF_INIT',
             ],
         ]);
 
@@ -164,10 +164,13 @@ final class PaystackWebhookSignatureTest extends TestCase
         $gateway = new PaystackGateway($http, $context);
         self::assertInstanceOf(InitiationCapableGateway::class, $gateway);
 
-        $result = $gateway->initialize(new PayableReference('commerce_order', 'ord1', 4999, 'GHS'));
+        $result = $gateway->initialize(
+            new PayableReference('commerce_order', 'ord1', 4999, 'GHS'),
+            ['attempt_uuid' => 'atmpt0000042'],
+        );
 
         self::assertSame('REF_INIT', $result['reference']);
-        self::assertSame('https://checkout.paystack.test/REF_INIT', $result['checkout_url']);
+        self::assertSame('https://checkout.paystack.com/REF_INIT', $result['checkout_url']);
     }
 
     public function testCancelSubscriptionPostsCodeAndEmailToken(): void

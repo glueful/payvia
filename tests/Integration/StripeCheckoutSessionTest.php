@@ -22,22 +22,24 @@ use Symfony\Contracts\HttpClient\ResponseInterface as SymfonyResponse;
  */
 final class StripeCheckoutSessionTest extends TestCase
 {
-    private function gateway(Client $http, ?string $secret = 'sk_test_123'): StripeGateway
+    /** @param array<string,mixed> $overrides */
+    private function gateway(Client $http, ?string $secret = 'sk_test_123', array $overrides = []): StripeGateway
     {
-        return new StripeGateway($http, $this->context($secret));
+        return new StripeGateway($http, $this->context($secret, $overrides));
     }
 
-    private function context(?string $secret): ApplicationContext
+    /** @param array<string,mixed> $overrides */
+    private function context(?string $secret, array $overrides = []): ApplicationContext
     {
         $base = sys_get_temp_dir() . '/payvia-stripe-session-' . uniqid('', true);
         @mkdir($base . '/config', 0777, true);
         file_put_contents($base . '/config/payvia.php', "<?php\nreturn " . var_export([
             'gateways' => [
-                'stripe' => [
+                'stripe' => array_merge([
                     'secret_key' => $secret,
                     'base_url' => 'https://api.stripe.com',
                     'timeout' => 15,
-                ],
+                ], $overrides),
             ],
         ], true) . ";\n");
         $context = new ApplicationContext($base, 'testing');
@@ -104,11 +106,12 @@ final class StripeCheckoutSessionTest extends TestCase
         self::assertInstanceOf(InitiationCapableGateway::class, $gateway);
     }
 
-    public function testCreatesASessionWithTheRightFieldsAndDeterministicIdempotencyKey(): void
+    public function testCreatesASessionWithTheRightFieldsAndAPerAttemptIdempotencyKey(): void
     {
         [$http, $captured] = $this->capturingClient($this->responseOf(200, $this->goodSession()));
 
         $result = $this->gateway($http)->initialize($this->payable(), [
+            'attempt_uuid' => 'atmpt0000001',
             'email' => 'buyer@example.test',
             'callback_url' => 'https://shop.test/checkout/return/THL-42',
             'cancel_url' => 'https://shop.test/checkout/cancel/THL-42',
@@ -127,14 +130,43 @@ final class StripeCheckoutSessionTest extends TestCase
         self::assertSame(1, $form['line_items'][0]['quantity']);
         self::assertSame('commerce_order', $form['metadata']['payable_type']);
         self::assertSame('ord42', $form['metadata']['payable_id']);
-        // Deterministic per payable: concurrent initiations cannot mint two sessions.
+        // Per ATTEMPT, not per payable (payment-links Task 2): the collector claims an attempt
+        // uuid before any provider I/O and replays it verbatim on a retry, so a timed-out attempt
+        // de-dupes onto the SAME session -- while a later, provider-proven renewal claims a NEW
+        // attempt uuid and can therefore never collide with the retired one's session id.
         self::assertSame(
-            'payvia-init-commerce_order-ord42',
+            'payvia-init-atmpt0000001',
             $captured['options']['headers']['Idempotency-Key'],
         );
 
         self::assertSame('cs_test_abc123', $result['reference']);
         self::assertSame('https://checkout.stripe.com/c/pay/cs_test_abc123', $result['checkout_url']);
+    }
+
+    public function testADifferentAttemptUuidYieldsADifferentIdempotencyKey(): void
+    {
+        [$first, $firstCaptured] = $this->capturingClient($this->responseOf(200, $this->goodSession()));
+        [$second, $secondCaptured] = $this->capturingClient($this->responseOf(200, $this->goodSession()));
+
+        $options = ['callback_url' => 'https://shop.test/r'];
+        $this->gateway($first)->initialize($this->payable(), $options + ['attempt_uuid' => 'atmpt0000001']);
+        $this->gateway($second)->initialize($this->payable(), $options + ['attempt_uuid' => 'atmpt0000002']);
+
+        self::assertNotSame(
+            $firstCaptured['options']['headers']['Idempotency-Key'],
+            $secondCaptured['options']['headers']['Idempotency-Key'],
+        );
+    }
+
+    public function testMissingAttemptUuidThrowsBeforeAnyRequest(): void
+    {
+        // Structural: there is no code path left that can send a fixed per-payable key.
+        $http = $this->createMock(Client::class);
+        $http->expects(self::never())->method('post');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('attempt_uuid');
+        $this->gateway($http)->initialize($this->payable(), ['callback_url' => 'https://shop.test/r']);
     }
 
     public function testCancelUrlFallsBackToCallbackAndDescriptionDefaultsToPayment(): void
@@ -143,6 +175,7 @@ final class StripeCheckoutSessionTest extends TestCase
         $payable = new PayableReference('invoice', 'inv7', 100, 'USD');
 
         $this->gateway($http)->initialize($payable, [
+            'attempt_uuid' => 'atmpt0000003',
             'callback_url' => 'https://shop.test/pay/return',
         ]);
 
@@ -161,6 +194,7 @@ final class StripeCheckoutSessionTest extends TestCase
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('Missing Stripe secret key');
         $this->gateway($http, null)->initialize($this->payable(), [
+            'attempt_uuid' => 'atmpt0000004',
             'callback_url' => 'https://shop.test/return',
         ]);
     }
@@ -172,7 +206,7 @@ final class StripeCheckoutSessionTest extends TestCase
 
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('callback_url');
-        $this->gateway($http)->initialize($this->payable(), []);
+        $this->gateway($http)->initialize($this->payable(), ['attempt_uuid' => 'atmpt0000005']);
     }
 
     public function testAStripeErrorBodyThrows(): void
@@ -183,7 +217,7 @@ final class StripeCheckoutSessionTest extends TestCase
 
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('No such price');
-        $this->gateway($http)->initialize($this->payable(), ['callback_url' => 'https://shop.test/r']);
+        $this->gateway($http)->initialize($this->payable(), $this->options());
     }
 
     /** @dataProvider malformedSessions */
@@ -193,7 +227,7 @@ final class StripeCheckoutSessionTest extends TestCase
 
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage($needle);
-        $this->gateway($http)->initialize($this->payable(), ['callback_url' => 'https://shop.test/r']);
+        $this->gateway($http)->initialize($this->payable(), $this->options());
     }
 
     /** @return array<string, array{array<string,mixed>, string}> */
@@ -213,13 +247,94 @@ final class StripeCheckoutSessionTest extends TestCase
         ];
     }
 
+    // ==================================================================
+    // The provider-host trust boundary (payment-links Task 2, spec §2.1)
+    // ==================================================================
+
+    public function testATrustedCheckoutHostIsAcceptedCaseInsensitively(): void
+    {
+        [$http] = $this->capturingClient($this->responseOf(200, [
+            'id' => 'cs_test_1',
+            'url' => 'https://CHECKOUT.Stripe.COM/c/pay/cs_test_1',
+        ]));
+
+        $result = $this->gateway($http)->initialize($this->payable(), $this->options());
+
+        self::assertSame('https://CHECKOUT.Stripe.COM/c/pay/cs_test_1', $result['checkout_url']);
+    }
+
+    /** @dataProvider hostileUrls */
+    public function testAnUntrustedCheckoutUrlNeverLeavesTheGateway(mixed $url): void
+    {
+        $session = ['id' => 'cs_test_1'];
+        if ($url !== null) {
+            $session['url'] = $url;
+        }
+        [$http] = $this->capturingClient($this->responseOf(200, $session));
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('checkout URL');
+        $this->gateway($http)->initialize($this->payable(), $this->options());
+    }
+
+    /** @return array<string, array{mixed}> */
+    public static function hostileUrls(): array
+    {
+        return [
+            'missing' => [null],
+            'empty' => [''],
+            'malformed' => ['https://'],
+            'not a url at all' => ['checkout.stripe.com/c/x'],
+            'http' => ['http://checkout.stripe.com/c/x'],
+            'userinfo' => ['https://checkout.stripe.com@evil.test/c/x'],
+            'credentials' => ['https://user:pass@checkout.stripe.com/c/x'],
+            'explicit port' => ['https://checkout.stripe.com:443/c/x'],
+            'trailing dot' => ['https://checkout.stripe.com./c/x'],
+            'subdomain lookalike' => ['https://checkout.stripe.com.evil.test/c/x'],
+            'prefix lookalike' => ['https://xcheckout.stripe.com/c/x'],
+            'subdomain of the trusted host' => ['https://a.checkout.stripe.com/c/x'],
+            'untrusted host' => ['https://evil.test/c/x'],
+            'leading whitespace' => [' https://checkout.stripe.com/c/x'],
+            'not a string' => [['https://checkout.stripe.com/c/x']],
+        ];
+    }
+
+    public function testConfiguredCheckoutHostsAreTheAuthority(): void
+    {
+        [$http] = $this->capturingClient($this->responseOf(200, [
+            'id' => 'cs_test_1',
+            'url' => 'https://pay.sandbox.test/c/pay/cs_test_1',
+        ]));
+
+        $result = $this->gateway($http, 'sk_test_123', ['checkout_hosts' => ['pay.sandbox.test']])
+            ->initialize($this->payable(), $this->options());
+
+        self::assertSame('https://pay.sandbox.test/c/pay/cs_test_1', $result['checkout_url']);
+    }
+
+    public function testTheShippedDefaultHostIsRejectedOnceConfigNarrowsTheSet(): void
+    {
+        [$http] = $this->capturingClient($this->responseOf(200, $this->goodSession()));
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('checkout URL');
+        $this->gateway($http, 'sk_test_123', ['checkout_hosts' => ['pay.sandbox.test']])
+            ->initialize($this->payable(), $this->options());
+    }
+
+    /** @return array<string,mixed> */
+    private function options(): array
+    {
+        return ['attempt_uuid' => 'atmpt0000009', 'callback_url' => 'https://shop.test/r'];
+    }
+
     public function testTheReturnedReferenceRoundTripsIntoVerifysSessionBranch(): void
     {
         // Creation → verification, end to end: the reference initialize() returns is exactly what
         // the existing verify() checkout-session branch resolves and normalizes.
         [$createHttp] = $this->capturingClient($this->responseOf(200, $this->goodSession()));
         $reference = $this->gateway($createHttp)
-            ->initialize($this->payable(), ['callback_url' => 'https://shop.test/r'])['reference'];
+            ->initialize($this->payable(), $this->options())['reference'];
 
         $verifyHttp = $this->createMock(Client::class);
         $verifyHttp->expects(self::once())->method('get')

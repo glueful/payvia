@@ -23,6 +23,12 @@ return [
             'webhook_url' => env('PAYVIA_PAYSTACK_WEBHOOK_URL', null),
             'base_url' => env('PAYVIA_PAYSTACK_BASE_URL', 'https://api.paystack.co'),
             'timeout' => (int) env('PAYVIA_PAYSTACK_TIMEOUT', 15),
+            // Hosted-redirect trust boundary: the ONLY hosts a returned `authorization_url` may
+            // live on. Matching is case-normalized but otherwise exact -- no subdomains, no
+            // ports, no userinfo, HTTPS only (see Support\HostedCheckoutUrl). Narrow this (or
+            // point it at a sandbox host) only if you know why; an empty array trusts nothing
+            // and refuses every checkout URL.
+            'checkout_hosts' => ['checkout.paystack.com'],
         ],
 
         'stripe' => [
@@ -33,6 +39,9 @@ return [
             'webhook_tolerance' => (int) env('PAYVIA_STRIPE_WEBHOOK_TOLERANCE', 300),
             'base_url' => env('PAYVIA_STRIPE_BASE_URL', 'https://api.stripe.com'),
             'timeout' => (int) env('PAYVIA_STRIPE_TIMEOUT', 15),
+            // See the paystack note above -- same trust boundary, applied to the Checkout
+            // Session `url` for both one-time and subscription sessions.
+            'checkout_hosts' => ['checkout.stripe.com'],
         ],
     ],
 
