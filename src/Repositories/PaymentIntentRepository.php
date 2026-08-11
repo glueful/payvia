@@ -42,6 +42,12 @@ final class PaymentIntentRepository extends BaseRepository
         self::STATUS_FAILED,
     ];
 
+    /**
+     * Payload key holding the unix timestamp of the last PROVIDER-CONFIRMED liveness observation
+     * for an open attempt. See {@see recordLivenessConfirmation()}.
+     */
+    public const LIVENESS_CONFIRMED_AT = 'liveness_confirmed_at';
+
     /** @var list<string> */
     private const ACTIVE_STATUSES = [self::STATUS_INITIALIZING, self::STATUS_OPEN];
 
@@ -318,6 +324,47 @@ final class PaymentIntentRepository extends BaseRepository
                 $reference
             );
         }
+
+        return $affected > 0;
+    }
+
+    /**
+     * Stamp a provider-CONFIRMED liveness observation onto an open attempt (payment-links Task 2,
+     * fix round 1). The collector reads it to skip re-probing the provider on every repeat
+     * `initiate()` inside a short cooldown window -- otherwise a shopper hammering "pay" (or an
+     * abusive client) turns one hosted checkout into an unbounded stream of provider round trips,
+     * and a provider rate-limit answer becomes a fail-closed unknown for everyone.
+     *
+     * Deliberately narrow:
+     *  - legal only from `open` (a claimed-but-unopened attempt has nothing to confirm);
+     *  - written only for a CONFIRMED-LIVE probe, so a dead/unknown answer can never buy itself
+     *    a quiet period;
+     *  - a read-modify-write of the JSON payload, which is acceptable because the value is a
+     *    cache hint: two racing writers can at worst lose one timestamp, costing one extra probe.
+     *
+     * @param int $observedAt unix seconds
+     */
+    public function recordLivenessConfirmation(ApplicationContext $context, string $uuid, int $observedAt): bool
+    {
+        if ($uuid === '') {
+            return false;
+        }
+
+        $tenant = $this->resolver->tenantUuid($context);
+        $row = $this->findByUuid($context, $uuid);
+        if ($row === null || (string) $row['status'] !== self::STATUS_OPEN) {
+            return false;
+        }
+
+        $payload = is_array($row['payload'] ?? null) ? $row['payload'] : [];
+        $payload[self::LIVENESS_CONFIRMED_AT] = $observedAt;
+
+        $affected = $this->db->table($this->getTableName())
+            ->where(['uuid' => $uuid, 'tenant_uuid' => $tenant, 'status' => self::STATUS_OPEN])
+            ->update([
+                'payload' => $this->encodePayload($payload),
+                'updated_at' => $this->db->getDriver()->formatDateTime(),
+            ]);
 
         return $affected > 0;
     }

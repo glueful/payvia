@@ -11,9 +11,11 @@ use Glueful\Extensions\Payvia\Contracts\HostedSessionRenewalCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\HostedSessionStateCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
+use Glueful\Extensions\Payvia\Contracts\ResumableHostedSessionGateway;
 use Glueful\Extensions\Payvia\Database\Migrations\AddPaymentIntentAttemptLifecycle;
 use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentIntentsTable;
 use Glueful\Extensions\Payvia\GatewayManager;
+use Glueful\Extensions\Payvia\Repositories\DuplicateReferenceException;
 use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
 use Glueful\Extensions\Payvia\Services\PayviaPaymentCollector;
 use Glueful\Extensions\Payvia\Services\ProviderSessionStateUnknownException;
@@ -389,6 +391,336 @@ final class PayviaPaymentCollectorEnsureLiveTest extends PayviaTestCase
     }
 
     // ==================================================================
+    // Resuming an interrupted attempt on a non-repeatable-create driver
+    // (fix round 1, Critical 1)
+    // ==================================================================
+
+    public function testALostCreateResponseIsRecoveredByVerifyingBeforeReInitializing(): void
+    {
+        // The wedge this exists to prevent, end to end: Paystack's `reference` is a permanent
+        // uniqueness constraint, so blindly re-POSTing a claimed attempt's reference returns
+        // HTTP 400 "Duplicate Transaction Reference" FOREVER and the payable can never be paid.
+        $gateway = new ResumableFakeGateway();
+        [$collector, $intents] = $this->collector($gateway, ResumableFakeGateway::class);
+        $payable = $this->payable('ord-lost-response');
+
+        // Attempt 1: the create reaches the provider, the RESPONSE is lost.
+        $gateway->throwOnInitialize = true;
+        try {
+            $collector->initiate($this->context, $payable);
+            self::fail('the lost response must propagate');
+        } catch (\RuntimeException) {
+        }
+        $gateway->throwOnInitialize = false;
+        $firstAttempt = $gateway->attemptUuids[0];
+
+        // The provider really does hold that reference now, so re-POSTing it would 400 forever.
+        $gateway->resumeOutcome = ResumableHostedSessionGateway::RESUME_REPLACE;
+
+        $result = $collector->initiate($this->context, $payable);
+
+        self::assertSame(1, $gateway->resumeCalls, 'the resumed attempt must be VERIFIED first');
+        self::assertNotSame(
+            $firstAttempt,
+            $gateway->attemptUuids[count($gateway->attemptUuids) - 1],
+            'a reference the provider already holds is never re-POSTed; a new attempt is claimed'
+        );
+        self::assertSame('ok', $result->status);
+        self::assertNotSame('', (string) $result->payload['checkout_url']);
+
+        // The stranded attempt is retired (its port freed) and exactly one attempt is open.
+        $rows = array_column($this->rows('ord-lost-response'), null, 'uuid');
+        self::assertSame('failed', $rows[$firstAttempt]['status']);
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-lost-response');
+        self::assertIsArray($open);
+        self::assertSame($result->payload['reference'], $open['reference']);
+    }
+
+    public function testAnAbsentProviderSideTransactionReInitializesTheSameAttempt(): void
+    {
+        // The create never landed, so the derived reference is still free: true timeout recovery
+        // keeps the SAME attempt, and therefore the same reference.
+        $gateway = new ResumableFakeGateway();
+        [$collector] = $this->collector($gateway, ResumableFakeGateway::class);
+        $payable = $this->payable('ord-absent');
+
+        $gateway->throwOnInitialize = true;
+        try {
+            $collector->initiate($this->context, $payable);
+        } catch (\RuntimeException) {
+        }
+        $gateway->throwOnInitialize = false;
+        $gateway->resumeOutcome = ResumableHostedSessionGateway::RESUME_ABSENT;
+
+        $result = $collector->initiate($this->context, $payable);
+
+        self::assertSame(1, $gateway->resumeCalls);
+        self::assertSame($gateway->attemptUuids[0], $gateway->attemptUuids[1]);
+        self::assertSame('psref_' . $gateway->attemptUuids[0], $result->payload['reference']);
+        self::assertCount(1, $this->rows('ord-absent'));
+    }
+
+    public function testAnAlreadyPaidTransactionIsAdoptedInsteadOfRecreated(): void
+    {
+        $gateway = new ResumableFakeGateway();
+        [$collector, $intents] = $this->collector($gateway, ResumableFakeGateway::class);
+        $payable = $this->payable('ord-adopt');
+
+        $gateway->throwOnInitialize = true;
+        try {
+            $collector->initiate($this->context, $payable);
+        } catch (\RuntimeException) {
+        }
+        $gateway->throwOnInitialize = false;
+        $attempt = $gateway->attemptUuids[0];
+        $gateway->resumeOutcome = ResumableHostedSessionGateway::RESUME_ADOPT;
+
+        $result = $collector->initiate($this->context, $payable);
+
+        self::assertSame(1, $gateway->initializeCalls, 'a paid transaction must never be recreated');
+        self::assertSame('psref_' . $attempt, $result->payload['reference']);
+
+        // Adopted means RECORDED: the intent is reference-addressable for settlement even though
+        // no checkout url exists (Paystack's verify response cannot return one).
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-adopt');
+        self::assertIsArray($open);
+        self::assertSame($attempt, $open['uuid']);
+        self::assertSame('psref_' . $attempt, $open['reference']);
+        self::assertNull($result->payload['checkout_url']);
+    }
+
+    public function testAnIndeterminateResumeLeavesTheAttemptIntactForALaterRetry(): void
+    {
+        $gateway = new ResumableFakeGateway();
+        [$collector] = $this->collector($gateway, ResumableFakeGateway::class);
+        $payable = $this->payable('ord-resume-unknown');
+
+        $gateway->throwOnInitialize = true;
+        try {
+            $collector->initiate($this->context, $payable);
+        } catch (\RuntimeException) {
+        }
+        $gateway->throwOnInitialize = false;
+        $gateway->throwOnResume = true;
+
+        try {
+            $collector->initiate($this->context, $payable);
+            self::fail('an indeterminate resume must fail closed');
+        } catch (ProviderSessionStateUnknownException) {
+        }
+
+        self::assertSame(1, $gateway->initializeCalls, 'nothing may be created while the state is unknown');
+        $rows = $this->rows('ord-resume-unknown');
+        self::assertCount(1, $rows);
+        self::assertSame('initializing', $rows[0]['status'], 'the attempt stays resumable');
+    }
+
+    public function testAnUnrecognizedResumeOutcomeFailsClosedInsteadOfReCreating(): void
+    {
+        // A third-party driver is not a type checker, and the fall-through direction here is the
+        // dangerous one: creating under a reference the provider may already hold.
+        $gateway = new ResumableFakeGateway();
+        [$collector] = $this->collector($gateway, ResumableFakeGateway::class);
+        $payable = $this->payable('ord-resume-garbage');
+
+        $gateway->throwOnInitialize = true;
+        try {
+            $collector->initiate($this->context, $payable);
+        } catch (\RuntimeException) {
+        }
+        $gateway->throwOnInitialize = false;
+        $gateway->resumeOutcome = 'something-else-entirely';
+
+        $this->expectException(ProviderSessionStateUnknownException::class);
+
+        try {
+            $collector->initiate($this->context, $payable);
+        } finally {
+            self::assertSame(1, $gateway->initializeCalls);
+        }
+    }
+
+    public function testAFreshAttemptIsNeverSentThroughTheResumePath(): void
+    {
+        $gateway = new ResumableFakeGateway();
+        [$collector] = $this->collector($gateway, ResumableFakeGateway::class);
+
+        $collector->initiate($this->context, $this->payable('ord-fresh'));
+
+        self::assertSame(0, $gateway->resumeCalls, 'nothing was interrupted; there is nothing to resume');
+        self::assertSame(1, $gateway->initializeCalls);
+    }
+
+    // ==================================================================
+    // Liveness cooldown (fix round 1, Important 4)
+    // ==================================================================
+
+    public function testRepeatInitiationsInsideTheCooldownDoNotTouchTheProvider(): void
+    {
+        $gateway = new EnsureLiveGateway();
+        [$collector] = $this->collector($gateway);
+        $payable = $this->payable('ord-cooldown');
+
+        $first = $collector->initiate($this->context, $payable);
+        $second = $collector->initiate($this->context, $payable);
+        $third = $collector->initiate($this->context, $payable);
+
+        self::assertSame(1, $gateway->stateCalls, 'only the first repeat call probes; the rest ride the cooldown');
+        self::assertSame($first->payload['checkout_url'], $second->payload['checkout_url']);
+        self::assertSame($first->payload['checkout_url'], $third->payload['checkout_url']);
+    }
+
+    public function testTheProviderIsProbedAgainOnceTheCooldownHasElapsed(): void
+    {
+        $gateway = new EnsureLiveGateway();
+        [$collector, $intents] = $this->collector($gateway);
+        $payable = $this->payable('ord-cooldown-expiry');
+
+        $collector->initiate($this->context, $payable);
+        $collector->initiate($this->context, $payable);
+        self::assertSame(1, $gateway->stateCalls);
+
+        // Deterministic: rewind the stored confirmation past the window rather than sleeping.
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-cooldown-expiry');
+        self::assertIsArray($open);
+        $this->shiftLivenessStamp((string) $open['uuid'], -120);
+
+        $collector->initiate($this->context, $payable);
+        self::assertSame(2, $gateway->stateCalls);
+    }
+
+    public function testOnlyAConfirmedLiveAnswerEarnsACooldown(): void
+    {
+        // A dead/unknown answer must never buy itself a quiet period -- a session in trouble
+        // would then be probed LESS often than a healthy one.
+        $gateway = new LivenessOnlyGateway();
+        [$collector] = $this->collector($gateway, LivenessOnlyGateway::class);
+        $payable = $this->payable('ord-cooldown-dead');
+
+        $collector->initiate($this->context, $payable);
+        $gateway->state = HostedSessionStateCapableGateway::STATE_DEAD;
+
+        foreach ([1, 2] as $ignored) {
+            try {
+                $collector->initiate($this->context, $payable);
+                self::fail('a dead session on a renewal-incapable gateway must fail closed');
+            } catch (SessionRenewalUnavailableException) {
+            }
+        }
+
+        self::assertSame(2, $gateway->stateCalls, 'every call re-probes while the answer is not confirmed-live');
+    }
+
+    public function testACooldownOfZeroProbesEveryTime(): void
+    {
+        $gateway = new EnsureLiveGateway();
+        [$collector] = $this->collector($gateway);
+        $this->context->mergeConfigDefaults('payvia', ['session_liveness_cooldown_seconds' => 0]);
+        $payable = $this->payable('ord-cooldown-off');
+
+        $collector->initiate($this->context, $payable);
+        $collector->initiate($this->context, $payable);
+        $collector->initiate($this->context, $payable);
+
+        self::assertSame(2, $gateway->stateCalls);
+    }
+
+    public function testAFutureDatedStampIsNotEvidenceOfLiveness(): void
+    {
+        // Clock skew between app servers must not be able to silence the probe.
+        $gateway = new EnsureLiveGateway();
+        [$collector, $intents] = $this->collector($gateway);
+        $payable = $this->payable('ord-cooldown-skew');
+
+        $collector->initiate($this->context, $payable);
+        $collector->initiate($this->context, $payable);
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-cooldown-skew');
+        self::assertIsArray($open);
+        $this->shiftLivenessStamp((string) $open['uuid'], 3600);
+
+        $collector->initiate($this->context, $payable);
+
+        self::assertSame(2, $gateway->stateCalls);
+    }
+
+    // ==================================================================
+    // "Nothing provable" guards + the duplicate-reference port release
+    // ==================================================================
+
+    public function testAnIntentOpenedUnderADifferentGatewayIsNeverProbedOrReplaced(): void
+    {
+        $gateway = new EnsureLiveGateway();
+        [$collector, $intents] = $this->collector($gateway);
+        $payable = $this->payable('ord-other-gateway');
+
+        $first = $collector->initiate($this->context, $payable);
+        $this->connection->table('payment_intents')
+            ->where(['payable_id' => 'ord-other-gateway'])
+            ->update(['gateway' => 'some_retired_driver']);
+
+        $second = $collector->initiate($this->context, $payable);
+
+        self::assertSame(0, $gateway->stateCalls);
+        self::assertSame(1, $gateway->initializeCalls);
+        self::assertSame($first->payload['reference'], $second->payload['reference']);
+        self::assertSame('some_retired_driver', $second->payload['gateway']);
+        self::assertIsArray($intents->findOpen($this->context, 'commerce_order', 'ord-other-gateway'));
+    }
+
+    public function testAnOpenIntentWithNoReferenceIsNeverProbedOrReplaced(): void
+    {
+        $gateway = new EnsureLiveGateway();
+        [$collector] = $this->collector($gateway);
+        $payable = $this->payable('ord-no-reference');
+
+        $collector->initiate($this->context, $payable);
+        // A legacy/hand-repaired row: open, but with nothing to ask the provider about.
+        $this->connection->table('payment_intents')
+            ->where(['payable_id' => 'ord-no-reference'])
+            ->update(['reference' => null]);
+
+        $second = $collector->initiate($this->context, $payable);
+
+        self::assertSame(0, $gateway->stateCalls);
+        self::assertSame(1, $gateway->initializeCalls);
+        self::assertSame('', $second->payload['reference']);
+    }
+
+    public function testADuplicateReferenceRejectionFreesTheActivePortForAFreshAttempt(): void
+    {
+        // A CLASSIFIED deterministic rejection: retrying this attempt would collide identically
+        // forever, so the port must be freed rather than left wedged by an initializing row.
+        $gateway = new FixedReferenceGateway();
+        [$collector, $intents] = $this->collector($gateway, FixedReferenceGateway::class);
+        $payable = $this->payable('ord-dup-ref');
+
+        $first = $collector->initiate($this->context, $payable);
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-dup-ref');
+        self::assertIsArray($open);
+        $intents->close($this->context, (string) $open['uuid']);
+
+        try {
+            $collector->initiate($this->context, $payable);
+            self::fail('the duplicate reference must surface');
+        } catch (DuplicateReferenceException) {
+        }
+
+        $rows = array_column($this->rows('ord-dup-ref'), null, 'uuid');
+        $wedged = array_values(array_filter(
+            $rows,
+            static fn(array $row): bool => (string) $row['uuid'] !== (string) $open['uuid']
+        ));
+        self::assertCount(1, $wedged);
+        self::assertSame('failed', $wedged[0]['status'], 'the rejected attempt must not stay initializing');
+        self::assertNotSame(
+            'commerce_order:ord-dup-ref',
+            (string) $wedged[0]['idempotency_key'],
+            'the active port must be freed so a later attempt can claim it'
+        );
+        self::assertSame($first->payload['reference'], (string) $rows[(string) $open['uuid']]['reference']);
+    }
+
+    // ==================================================================
     // PostgreSQL-gated: one-open-attempt serialization under concurrent renewal
     // ==================================================================
 
@@ -569,6 +901,32 @@ final class PayviaPaymentCollectorEnsureLiveTest extends PayviaTestCase
         ]);
     }
 
+    /**
+     * Move an intent's stored liveness confirmation by `$seconds` (negative = further into the
+     * past). A deterministic substitute for sleeping through the cooldown window.
+     */
+    private function shiftLivenessStamp(string $uuid, int $seconds): void
+    {
+        $row = $this->connection->table('payment_intents')
+            ->select(['payload'])
+            ->where(['uuid' => $uuid])
+            ->first();
+        self::assertIsArray($row);
+
+        $payload = json_decode((string) $row['payload'], true);
+        self::assertIsArray($payload);
+        self::assertArrayHasKey(
+            PaymentIntentRepository::LIVENESS_CONFIRMED_AT,
+            $payload,
+            'a confirmed-live probe should have stamped the intent'
+        );
+        $payload[PaymentIntentRepository::LIVENESS_CONFIRMED_AT] += $seconds;
+
+        $this->connection->table('payment_intents')
+            ->where(['uuid' => $uuid])
+            ->update(['payload' => json_encode($payload, JSON_THROW_ON_ERROR)]);
+    }
+
     /** @return list<array<string,mixed>> */
     private function rows(string $payableId): array
     {
@@ -691,5 +1049,101 @@ final class LivenessOnlyGateway implements
         $this->stateCalls++;
 
         return $this->state;
+    }
+}
+
+/**
+ * A driver whose create call is NOT safely repeatable (Paystack-shaped): the collector must ask
+ * it what happened before retrying an interrupted attempt, because blindly re-creating under the
+ * same derived reference would be permanently rejected by the provider.
+ */
+final class ResumableFakeGateway implements
+    PaymentGatewayInterface,
+    InitiationCapableGateway,
+    HostedSessionStateCapableGateway,
+    ResumableHostedSessionGateway
+{
+    public int $initializeCalls = 0;
+    public int $resumeCalls = 0;
+    /** @var list<string> */
+    public array $attemptUuids = [];
+    public bool $throwOnInitialize = false;
+    public bool $throwOnResume = false;
+    public string $resumeOutcome = ResumableHostedSessionGateway::RESUME_ABSENT;
+    public string $state = HostedSessionStateCapableGateway::STATE_LIVE;
+
+    public function verify(string $reference, array $options = []): array
+    {
+        return ['status' => 'success', 'reference' => $reference];
+    }
+
+    public function initialize(PayableReference $payable, array $options = []): array
+    {
+        $this->initializeCalls++;
+        $attempt = (string) ($options['attempt_uuid'] ?? '');
+        if ($attempt === '') {
+            throw new \RuntimeException('fake gateway requires an attempt_uuid');
+        }
+        $this->attemptUuids[] = $attempt;
+
+        if ($this->throwOnInitialize) {
+            throw new \RuntimeException('transport timeout');
+        }
+
+        return [
+            'reference' => 'psref_' . $attempt,
+            'checkout_url' => 'https://checkout.test/' . $attempt,
+        ];
+    }
+
+    public function resumeHostedSession(PayableReference $payable, array $options = []): array
+    {
+        $this->resumeCalls++;
+        if ($this->throwOnResume) {
+            throw new \RuntimeException('provider unreachable');
+        }
+
+        $attempt = (string) ($options['attempt_uuid'] ?? '');
+
+        if ($this->resumeOutcome === ResumableHostedSessionGateway::RESUME_ADOPT) {
+            return [
+                'outcome' => ResumableHostedSessionGateway::RESUME_ADOPT,
+                // Deliberately url-less, exactly like Paystack: its verify response carries no
+                // access_code/authorization_url, so an adopted session can only be a reference.
+                'session' => ['reference' => 'psref_' . $attempt, 'checkout_url' => null],
+            ];
+        }
+
+        return ['outcome' => $this->resumeOutcome];
+    }
+
+    public function hostedSessionState(string $reference): string
+    {
+        return $this->state;
+    }
+}
+
+/**
+ * Mirrors a gateway that hands back the SAME reference no matter how often it is called (a fixed,
+ * time-boxed provider idempotency window). Used to pin what happens when that reference collides
+ * with an already-retired attempt's row.
+ */
+final class FixedReferenceGateway implements PaymentGatewayInterface, InitiationCapableGateway
+{
+    public int $initializeCalls = 0;
+
+    public function verify(string $reference, array $options = []): array
+    {
+        return ['status' => 'success', 'reference' => $reference];
+    }
+
+    public function initialize(PayableReference $payable, array $options = []): array
+    {
+        $this->initializeCalls++;
+
+        return [
+            'reference' => 'cs_fixed_reference',
+            'checkout_url' => 'https://checkout.test/cs_fixed_reference',
+        ];
     }
 }

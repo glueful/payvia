@@ -13,9 +13,11 @@ use Glueful\Extensions\Payvia\Contracts\HostedSessionRenewalCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\HostedSessionStateCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
+use Glueful\Extensions\Payvia\Contracts\ResumableHostedSessionGateway;
 use Glueful\Extensions\Payvia\GatewayManager;
 use Glueful\Extensions\Payvia\Repositories\DuplicateReferenceException;
 use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
+use Glueful\Helpers\Utils;
 
 /**
  * ENSURE-LIVE hosted collection (payment-links spec §2.1 / Ruling 5).
@@ -116,6 +118,17 @@ final class PayviaPaymentCollector implements PaymentCollector
             return $this->fromIntent($existing);
         }
 
+        // Cooldown: a repeat initiate() — a shopper clicking "pay" again, a retried checkout, an
+        // abusive client — must not mean a provider round trip per click. That is a self-inflicted
+        // rate limit, and a provider 429 comes back as UNKNOWN, i.e. fail-closed for every shopper
+        // at once. A recent CONFIRMED-LIVE observation is therefore trusted for
+        // `payvia.session_liveness_cooldown_seconds`. Only a confirmed-live probe ever writes that
+        // stamp, so a dead/unknown answer can never buy itself a quiet period, and a brand-new
+        // attempt has no stamp at all.
+        if ($this->withinLivenessCooldown($context, $existing)) {
+            return $this->fromIntent($existing);
+        }
+
         try {
             $state = $gateway->hostedSessionState($reference);
         } catch (\Throwable $e) {
@@ -129,10 +142,15 @@ final class PayviaPaymentCollector implements PaymentCollector
             );
         }
 
-        if (
-            $state === HostedSessionStateCapableGateway::STATE_LIVE
-            || $state === HostedSessionStateCapableGateway::STATE_COMPLETED
-        ) {
+        if ($state === HostedSessionStateCapableGateway::STATE_LIVE) {
+            $this->intents->recordLivenessConfirmation($context, (string) $existing['uuid'], time());
+
+            return $this->fromIntent($existing);
+        }
+
+        if ($state === HostedSessionStateCapableGateway::STATE_COMPLETED) {
+            // Never replaced, but never cooled down either: a completed session is terminal and
+            // its intent is about to be closed by settlement, so there is nothing to keep warm.
             return $this->fromIntent($existing);
         }
 
@@ -182,16 +200,32 @@ final class PayviaPaymentCollector implements PaymentCollector
      * The claim happens BEFORE any provider I/O and its uuid IS the attempt identity: the driver
      * derives its idempotency key (Stripe) or transaction reference (Paystack) from it. So a
      * transport timeout leaves an `initializing` row holding the port, and the next call recovers
-     * that same row — same attempt uuid, same provider key, same session — instead of creating a
-     * second checkout for the payable.
+     * that same row — same attempt uuid, same provider key.
+     *
+     * What "recovers" MEANS is driver-specific, and getting it wrong wedges the payable forever.
+     * Stripe's Idempotency-Key makes replaying the create the documented recovery (it replays the
+     * original session). Paystack's reference is a permanent uniqueness constraint, not an
+     * idempotency key: replaying returns HTTP 400 "Duplicate Transaction Reference" every time,
+     * for good. So whenever this method RESUMES an attempt some earlier call already claimed, a
+     * {@see ResumableHostedSessionGateway} is asked what actually happened before anything is
+     * created. Fresh attempts never go through that path.
+     *
+     * @param bool $allowReplacement false on the single recursive re-entry, so a driver that
+     *                               keeps answering "replace" can never loop
      */
     private function openAttempt(
         ApplicationContext $context,
         PayableReference $payable,
         string $gatewayKey,
         InitiationCapableGateway $gateway,
+        bool $allowReplacement = true,
     ): PaymentInitiation {
+        // The uuid is minted HERE so the outcome is legible: claimAttempt() returns this exact
+        // row when it inserted, and a DIFFERENT row when it recovered one an earlier call had
+        // already claimed. That distinction is what makes resumption detectable at all.
+        $intendedUuid = Utils::generateNanoID();
         $claim = $this->intents->claimAttempt($context, [
+            'uuid' => $intendedUuid,
             'payable_type' => $payable->type,
             'payable_id' => $payable->id,
             'gateway' => $gatewayKey,
@@ -206,6 +240,7 @@ final class PayviaPaymentCollector implements PaymentCollector
         }
 
         $attemptUuid = (string) $claim['uuid'];
+        $resumed = $attemptUuid !== $intendedUuid;
 
         // The payable-type-agnostic initiation seam: whoever BUILDS a payable supplies the
         // well-known metadata keys (email, callback_url, cancel_url) — orders, subscriptions,
@@ -221,7 +256,70 @@ final class PayviaPaymentCollector implements PaymentCollector
         ], static fn (mixed $value): bool => is_string($value) && $value !== '');
         $options['attempt_uuid'] = $attemptUuid;
 
-        $result = $gateway->initialize($payable, $options);
+        $result = null;
+        if ($resumed && $gateway instanceof ResumableHostedSessionGateway) {
+            try {
+                $resume = $gateway->resumeHostedSession($payable, $options);
+            } catch (\Throwable $e) {
+                // Indeterminate: the attempt row stays exactly as it is (still holding the port,
+                // still resumable) so a later call can ask again.
+                throw ProviderSessionStateUnknownException::for(
+                    $gatewayKey,
+                    $payable->type,
+                    $payable->id,
+                    (string) ($claim['reference'] ?? ''),
+                    $e
+                );
+            }
+
+            // Read as a plain string on purpose: the contract narrows this to three values, but a
+            // third-party driver is not a type checker, and the fall-through here is the
+            // dangerous direction (re-creating under a reference the provider may already hold).
+            // Anything unrecognized is therefore fail-closed below, not silently "absent".
+            /** @var string $outcome */
+            $outcome = $resume['outcome'];
+
+            if (
+                $outcome !== ResumableHostedSessionGateway::RESUME_ABSENT
+                && $outcome !== ResumableHostedSessionGateway::RESUME_ADOPT
+                && $outcome !== ResumableHostedSessionGateway::RESUME_REPLACE
+            ) {
+                throw ProviderSessionStateUnknownException::for(
+                    $gatewayKey,
+                    $payable->type,
+                    $payable->id,
+                    (string) ($claim['reference'] ?? '')
+                );
+            }
+
+            if ($outcome === ResumableHostedSessionGateway::RESUME_REPLACE) {
+                if (!$allowReplacement) {
+                    throw ProviderSessionStateUnknownException::for(
+                        $gatewayKey,
+                        $payable->type,
+                        $payable->id,
+                        (string) ($claim['reference'] ?? '')
+                    );
+                }
+
+                // This attempt can never yield a usable checkout, and the driver has confirmed no
+                // url of its was ever exposed. Free the port and start a genuinely new attempt —
+                // new uuid, therefore a new provider reference.
+                $this->intents->fail($context, $attemptUuid);
+
+                return $this->openAttempt($context, $payable, $gatewayKey, $gateway, false);
+            }
+
+            if ($outcome === ResumableHostedSessionGateway::RESUME_ADOPT) {
+                // A session already exists under this attempt: adopt it rather than create a
+                // second one. It may carry no checkout url (e.g. Paystack, whose verify response
+                // cannot return one) — that is honest, and the caller treats a missing url as an
+                // unavailable checkout rather than being handed a fabricated one.
+                $result = is_array($resume['session'] ?? null) ? $resume['session'] : [];
+            }
+        }
+
+        $result ??= $gateway->initialize($payable, $options);
         $reference = isset($result['reference']) ? (string) $result['reference'] : '';
         if ($reference === '') {
             throw new \RuntimeException(
@@ -268,6 +366,32 @@ final class PayviaPaymentCollector implements PaymentCollector
             'checkout_url' => $result['checkout_url'] ?? null,
             'gateway' => $gatewayKey,
         ]);
+    }
+
+    /**
+     * True when this open attempt's liveness was PROVIDER-CONFIRMED recently enough to trust
+     * without asking again. `payvia.session_liveness_cooldown_seconds` defaults to 30; 0 (or
+     * negative) disables the cooldown entirely and every call probes.
+     *
+     * @param array<string,mixed> $intent
+     */
+    private function withinLivenessCooldown(ApplicationContext $context, array $intent): bool
+    {
+        $cooldown = (int) config($context, 'payvia.session_liveness_cooldown_seconds', 30);
+        if ($cooldown <= 0) {
+            return false;
+        }
+
+        $payload = is_array($intent['payload'] ?? null) ? $intent['payload'] : [];
+        $confirmedAt = $payload[PaymentIntentRepository::LIVENESS_CONFIRMED_AT] ?? null;
+        if (!is_numeric($confirmedAt)) {
+            return false;
+        }
+
+        $age = time() - (int) $confirmedAt;
+
+        // A future-dated stamp (clock skew between app servers) is not evidence of anything.
+        return $age >= 0 && $age < $cooldown;
     }
 
     /**

@@ -196,9 +196,17 @@ final class StripeGateway implements
             throw new \RuntimeException('Stripe checkout session returned no usable session id');
         }
 
+        $url = $this->trustedCheckoutUrl($decoded['url'] ?? null);
+        if ($url === null) {
+            throw new \RuntimeException(
+                'Stripe checkout session returned no usable HTTPS checkout URL on a trusted '
+                . 'Stripe checkout host'
+            );
+        }
+
         return [
             'reference' => $sessionId,
-            'checkout_url' => $this->trustedCheckoutUrl($decoded['url'] ?? null, 'Stripe checkout session'),
+            'checkout_url' => $url,
             'raw' => $decoded,
         ];
     }
@@ -206,23 +214,18 @@ final class StripeGateway implements
     /**
      * The hosted-redirect trust boundary for this driver: an absolute HTTPS url on a host that
      * exactly matches the configured `checkout_hosts` set (default `checkout.stripe.com`).
-     * Anything else throws HERE, so an untrusted url can never reach an intent payload -- and
-     * therefore never reach a browser as a redirect. See {@see HostedCheckoutUrl}.
+     *
+     * Returns null rather than throwing, because the two callers owe their callers DIFFERENT
+     * failure classifications: `initialize()` propagates a plain exception, while
+     * `initializeSubscription()` must raise a DEFINITIVE rejection (see its own handling). See
+     * {@see HostedCheckoutUrl} for what is refused and why.
      */
-    private function trustedCheckoutUrl(mixed $url, string $context): string
+    private function trustedCheckoutUrl(mixed $url): ?string
     {
-        $trusted = HostedCheckoutUrl::trusted(
+        return HostedCheckoutUrl::trusted(
             $url,
             HostedCheckoutUrl::configuredHosts($this->config(), self::CHECKOUT_HOSTS),
         );
-
-        if ($trusted === null) {
-            throw new \RuntimeException(
-                $context . ' returned no usable HTTPS checkout URL on a trusted Stripe checkout host'
-            );
-        }
-
-        return $trusted;
     }
 
     public function verifyWebhookSignature(string $rawBody, array $headers): bool
@@ -412,14 +415,38 @@ final class StripeGateway implements
             throw new \RuntimeException('Stripe subscription checkout session returned no usable session id');
         }
 
+        // Two DIFFERENT failure classifications, deliberately:
+        //
+        // 1. A structurally malformed answer (no url at all, not a string, not absolute HTTPS) is
+        //    an incomplete response body -- the same UNKNOWN outcome as a malformed session id,
+        //    unchanged from before 2.6.0.
+        $url = $decoded['url'] ?? '';
+        $parts = is_string($url) ? parse_url($url) : false;
+        if (
+            !is_string($url)
+            || !is_array($parts)
+            || ($parts['scheme'] ?? '') !== 'https'
+            || ($parts['host'] ?? '') === ''
+        ) {
+            throw new \RuntimeException('Stripe subscription checkout session returned no usable HTTPS checkout URL');
+        }
+
+        // 2. A well-formed HTTPS url that this platform REFUSES to redirect to (untrusted host,
+        //    userinfo, explicit port, lookalike) is the same trust boundary initialize() applies --
+        //    but here it must be classified DEFINITIVE. The outcome is fully known: the session
+        //    exists at Stripe, its url will never be used, and replaying the call under the same
+        //    provider idempotency key returns that identical refused url. Left as an unknown
+        //    outcome, SubscriptionCheckoutService::initializeClaim() would release the lease and
+        //    retry forever; the definitive type instead fails the origination and releases the
+        //    subject guard so a fresh attempt can be made.
+        $trusted = $this->trustedCheckoutUrl($url);
+        if ($trusted === null) {
+            throw DefinitiveSubscriptionCheckoutRejection::forUntrustedCheckoutUrl('stripe', $decoded);
+        }
+
         return [
             'reference' => $sessionId,
-            // Same trust boundary as initialize(): a subscription checkout url is redirected to
-            // by a browser exactly like a one-time one, so it gets the identical host check.
-            'checkout_url' => $this->trustedCheckoutUrl(
-                $decoded['url'] ?? null,
-                'Stripe subscription checkout session'
-            ),
+            'checkout_url' => $trusted,
             'expires_at' => $this->timestamp($decoded['expires_at'] ?? null),
             'raw' => $decoded,
         ];

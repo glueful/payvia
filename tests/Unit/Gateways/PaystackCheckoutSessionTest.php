@@ -9,6 +9,7 @@ use Glueful\Bootstrap\ConfigurationLoader;
 use Glueful\Extensions\Contracts\Payments\PayableReference;
 use Glueful\Extensions\Payvia\Contracts\HostedSessionRenewalCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\HostedSessionStateCapableGateway;
+use Glueful\Extensions\Payvia\Contracts\ResumableHostedSessionGateway;
 use Glueful\Extensions\Payvia\Gateways\PaystackGateway;
 use Glueful\Http\Client;
 use Glueful\Http\Response\Response as HttpResponse;
@@ -251,8 +252,13 @@ final class PaystackCheckoutSessionTest extends TestCase
             'pending is live' => [200, ['status' => true, 'data' => ['status' => 'pending']], 'live'],
             'processing is live' => [200, ['status' => true, 'data' => ['status' => 'processing']], 'live'],
             'queued is live' => [200, ['status' => true, 'data' => ['status' => 'queued']], 'live'],
+            // A decline is NOT terminal for a checkout reference: Paystack's guidance is that the
+            // customer completes the SAME transaction with another payment option on the same
+            // checkout page, and the transaction log counts multiple attempts per reference.
+            // Calling it dead would permanently kill the order, since this driver cannot renew.
+            'failed is still live' => [200, ['status' => true, 'data' => ['status' => 'failed']], 'live'],
             'success is completed' => [200, ['status' => true, 'data' => ['status' => 'success']], 'completed'],
-            'failed is dead' => [200, ['status' => true, 'data' => ['status' => 'failed']], 'dead'],
+            // Unreachable without a prior success, so the checkout url is spent either way.
             'reversed is dead' => [200, ['status' => true, 'data' => ['status' => 'reversed']], 'dead'],
             'unknown reference is unknown' => [
                 404,
@@ -281,5 +287,136 @@ final class PaystackCheckoutSessionTest extends TestCase
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('Missing Paystack secret key');
         $this->gateway($http, ['secret_key' => null])->hostedSessionState('ref1');
+    }
+
+    // ==================================================================
+    // Resuming an interrupted attempt: verify FIRST, never re-POST a used
+    // reference (fix round 1, Critical 1)
+    // ==================================================================
+
+    public function testIsResumeCapableBecauseItsCreateCallIsNotRepeatable(): void
+    {
+        self::assertInstanceOf(
+            ResumableHostedSessionGateway::class,
+            $this->gateway($this->createMock(Client::class)),
+        );
+    }
+
+    /**
+     * @param array<string,mixed> $decoded
+     * @dataProvider resumeOutcomes
+     */
+    public function testResumeVerifiesTheDerivedReferenceAndNeverReInitializes(
+        int $statusCode,
+        array $decoded,
+        string $expected
+    ): void {
+        $http = $this->createMock(Client::class);
+        $http->expects(self::once())->method('get')
+            // The SAME reference initialize() would have derived -- that is the whole point.
+            ->with('https://api.paystack.co/transaction/verify/commerce_order_ord1_atmpt1')
+            ->willReturn($this->responseOf($statusCode, $decoded));
+        // Re-POSTing /transaction/initialize with a used reference is a permanent HTTP 400
+        // "Duplicate Transaction Reference"; resume must never do it.
+        $http->expects(self::never())->method('post');
+
+        $resumed = $this->gateway($http)->resumeHostedSession($this->payable(), ['attempt_uuid' => 'atmpt1']);
+
+        self::assertSame($expected, $resumed['outcome']);
+    }
+
+    /** @return array<string, array{int, array<string,mixed>, string}> */
+    public static function resumeOutcomes(): array
+    {
+        return [
+            // The create never landed: the reference is still free, so the SAME attempt may be
+            // initialized -- true transport-timeout recovery.
+            'reference not found is absent' => [
+                404,
+                ['status' => false, 'message' => 'Transaction reference not found'],
+                'absent',
+            ],
+            // Already paid: never re-create, adopt the reference so settlement can attribute it.
+            'success is adopted' => [200, ['status' => true, 'data' => ['status' => 'success']], 'adopt'],
+            // Exists but unpaid. Its authorization_url is NOT recoverable (verify does not carry
+            // access_code/authorization_url), so this attempt can never produce a checkout: it is
+            // replaced. Safe because the interrupted call never returned a url to anyone.
+            'abandoned is replaced' => [200, ['status' => true, 'data' => ['status' => 'abandoned']], 'replace'],
+            'failed is replaced' => [200, ['status' => true, 'data' => ['status' => 'failed']], 'replace'],
+            'reversed is replaced' => [200, ['status' => true, 'data' => ['status' => 'reversed']], 'replace'],
+        ];
+    }
+
+    /**
+     * @param array<string,mixed> $decoded
+     * @dataProvider indeterminateResumeAnswers
+     */
+    public function testAnIndeterminateResumeAnswerThrowsRatherThanRiskingADuplicate(
+        int $statusCode,
+        array $decoded
+    ): void {
+        $http = $this->createMock(Client::class);
+        $http->method('get')->willReturn($this->responseOf($statusCode, $decoded));
+        $http->expects(self::never())->method('post');
+
+        // Never "absent": guessing here would re-POST a reference that may well exist, which
+        // Paystack refuses permanently. (Transport failures surface as HttpClientException, so
+        // the shared expectation here is the Throwable contract, not one concrete class.)
+        $this->expectException(\Throwable::class);
+        $this->gateway($http)->resumeHostedSession($this->payable(), ['attempt_uuid' => 'atmpt1']);
+    }
+
+    /** @return array<string, array{int, array<string,mixed>}> */
+    public static function indeterminateResumeAnswers(): array
+    {
+        return [
+            'auth failure' => [401, ['status' => false, 'message' => 'Invalid key']],
+            'rate limited' => [429, ['status' => false, 'message' => 'Too many requests']],
+            'a 404 with an unfamiliar message' => [404, ['status' => false, 'message' => 'Something else']],
+            'server error' => [500, []],
+            'unrecognized transaction state' => [200, ['status' => true, 'data' => ['status' => 'quantum']]],
+            'missing transaction data' => [200, ['status' => true]],
+        ];
+    }
+
+    public function testAdoptingAPaidTransactionCarriesItsReferenceAndNoCheckoutUrl(): void
+    {
+        $http = $this->createMock(Client::class);
+        $http->method('get')->willReturn($this->responseOf(200, [
+            'status' => true,
+            'data' => ['status' => 'success', 'reference' => 'commerce_order_ord1_atmpt1', 'amount' => 4999],
+        ]));
+
+        $resumed = $this->gateway($http)->resumeHostedSession($this->payable(), ['attempt_uuid' => 'atmpt1']);
+
+        self::assertSame('adopt', $resumed['outcome']);
+        self::assertSame('commerce_order_ord1_atmpt1', $resumed['session']['reference']);
+        // Honest: Paystack's verify response cannot return the checkout url, and a paid
+        // transaction needs none.
+        self::assertNull($resumed['session']['checkout_url']);
+    }
+
+    public function testResumeWithoutAnAttemptUuidThrowsBeforeAnyRequest(): void
+    {
+        $http = $this->createMock(Client::class);
+        $http->expects(self::never())->method('get');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('attempt_uuid');
+        $this->gateway($http)->resumeHostedSession($this->payable(), []);
+    }
+
+    public function testAnOverLongDerivedReferenceIsRefusedBeforeTheTransactionExists(): void
+    {
+        // security.nanoid_length is host-configurable, and payment_intents.reference is
+        // varchar(100). Failing AFTER the Paystack transaction exists would strand the attempt
+        // permanently, because the reference could never be reused.
+        $http = $this->createMock(Client::class);
+        $http->expects(self::never())->method('post');
+        $http->expects(self::never())->method('get');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('over the 100-character limit');
+        $this->gateway($http)->initialize($this->payable(), ['attempt_uuid' => str_repeat('a', 90)]);
     }
 }
