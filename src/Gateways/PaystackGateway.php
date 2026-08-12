@@ -11,22 +11,32 @@ use Glueful\Extensions\Contracts\Payments\PayoutDestination;
 use Glueful\Extensions\Contracts\Payments\PayoutRequest;
 use Glueful\Extensions\Contracts\Payments\PayoutResult;
 use Glueful\Extensions\Contracts\Payments\PayoutStatusResult;
+use Glueful\Extensions\Payvia\Contracts\HostedSessionStateCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
+use Glueful\Extensions\Payvia\Contracts\ResumableHostedSessionGateway;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCancellationModeProvider;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\TransferCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\WebhookCapableGateway;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\ProviderEvent;
+use Glueful\Extensions\Payvia\Support\HostedCheckoutUrl;
 use Glueful\Extensions\Payvia\Support\PayviaSettings;
-use Glueful\Helpers\Utils;
 use Glueful\Http\Client as HttpClient;
 use Glueful\Http\Exceptions\HttpClientException;
 use Glueful\Http\Response\Response as HttpResponse;
 
 /**
+ * OPERATOR REQUIREMENT -- Paystack integration setting `payment_session_timeout` MUST be left at
+ * its default of 0 (never expire). Paystack exposes it at `GET/PUT /integration/payment_session_
+ * timeout`; when it is set to a non-zero value and elapses, the hosted checkout page dead-ends
+ * with "Session timeout exceeded" while `GET /transaction/verify` still reports the transaction
+ * as `abandoned`. There is no signal that distinguishes the two, so payvia would keep serving a
+ * url that can no longer be paid. This driver deliberately does NOT guess at elapsed time
+ * (Ruling 6 -- no timeout guessing); the platform's contract is that the setting stays at 0.
+ *
  * Deliberately does NOT implement {@see \Glueful\Extensions\Payvia\Contracts\
  * SubscriptionInitiationCapableGateway}. The 2026-08-04 sandbox proof
  * (`tests/Fixtures/paystack-checkout/README.md`) established that Paystack exposes neither
@@ -40,11 +50,68 @@ use Glueful\Http\Response\Response as HttpResponse;
 final class PaystackGateway implements
     PaymentGatewayInterface,
     InitiationCapableGateway,
+    HostedSessionStateCapableGateway,
+    ResumableHostedSessionGateway,
     WebhookCapableGateway,
     SubscriptionCapableGateway,
     SubscriptionCancellationModeProvider,
     TransferCapableGateway
 {
+    /**
+     * The driver's own shipped checkout-host allow-list, used when `gateways.paystack
+     * .checkout_hosts` is absent or malformed. See {@see HostedCheckoutUrl::configuredHosts()}.
+     *
+     * @var list<string>
+     */
+    private const CHECKOUT_HOSTS = ['checkout.paystack.com'];
+
+    /**
+     * Paystack transaction states that mean "this reference has NOT been paid" -- the transaction
+     * exists and its checkout page still accepts payment, so ensure-live reuses its authorization
+     * url verbatim.
+     *
+     * `abandoned` is Paystack's own word for "initialized, never completed" -- exactly where a
+     * payment link sits between being sent and being paid.
+     *
+     * `failed` IS IN THIS BUCKET, deliberately. For CHECKOUT transactions a decline is not
+     * terminal for the reference: Paystack's guidance is that the customer completes the SAME
+     * transaction with another payment option on the same checkout page, the transaction log
+     * records multiple `attempts` under one reference, and `resumeTransaction(access_code)` is
+     * unconditional. ("Start a new charge" is guidance for the server-driven Charge API, not for
+     * checkout.) Treating a declined card -- the most common event in payments -- as a dead
+     * session would permanently kill the order on this gateway, because this driver is
+     * renewal-INcapable by design (Ruling 6) and a dead session it cannot replace is a dead end.
+     *
+     * @var list<string>
+     */
+    private const LIVE_TRANSACTION_STATES = [
+        'abandoned',
+        'failed',
+        'ongoing',
+        'pending',
+        'processing',
+        'queued',
+    ];
+
+    /**
+     * `reversed` is the only state treated as a dead SESSION: a transaction cannot reach it
+     * without having succeeded first, so its checkout url is spent either way.
+     *
+     * This is a judgment about the URL, not about the order. A reversal is a reconciliation
+     * signal (money came back); whether the payable may be paid again belongs to the engine that
+     * owns the order, not to this driver.
+     *
+     * @var list<string>
+     */
+    private const DEAD_TRANSACTION_STATES = ['reversed'];
+
+    /**
+     * `payment_intents.reference` is `varchar(100)`. An over-long reference would only fail AFTER
+     * the Paystack transaction exists -- and because a reference can never be reused, that
+     * failure would be unrecoverable for the attempt. Enforced before any provider I/O instead.
+     */
+    private const MAX_REFERENCE_LENGTH = 100;
+
     private ApplicationContext $context;
     public function __construct(
         private HttpClient $httpClient,
@@ -127,6 +194,24 @@ final class PaystackGateway implements
         ];
     }
 
+    /**
+     * Start a hosted Paystack transaction for a payable.
+     *
+     * `attempt_uuid` is REQUIRED (payment-links Task 2): Paystack's `reference` IS its idempotency
+     * mechanism -- it rejects a duplicate reference rather than charging twice -- so the reference
+     * is DERIVED from the caller's claimed attempt instead of being minted fresh per call. A
+     * transport timeout can then be retried on the same attempt and re-initialize the very same
+     * transaction; a random per-call reference would instead leave a second payable transaction
+     * behind every time. There is deliberately no fallback and no caller-supplied `reference`
+     * option: a caller with no attempt identity has no idempotency story, and is refused before
+     * any provider I/O.
+     *
+     * `authorization_url` -- returned unchecked before 2.6.0 -- must now pass the provider-host
+     * trust boundary before it can leave this method as a `checkout_url`.
+     *
+     * @param array<string,mixed> $options
+     * @return array<string,mixed>
+     */
     public function initialize(PayableReference $payable, array $options = []): array
     {
         $config = $this->gatewayConfig();
@@ -140,9 +225,7 @@ final class PaystackGateway implements
 
         $baseUrl = rtrim((string) ($config['base_url'] ?? 'https://api.paystack.co'), '/');
         $timeout = (int) ($config['timeout'] ?? 15);
-        $reference = isset($options['reference']) && is_string($options['reference']) && $options['reference'] !== ''
-            ? $options['reference']
-            : $this->newReference($payable);
+        $reference = $this->attemptReference($payable, $this->requiredAttemptUuid($options));
 
         $json = [
             'amount' => $payable->amount,
@@ -179,9 +262,185 @@ final class PaystackGateway implements
 
         return [
             'reference' => (string) ($data['reference'] ?? $reference),
-            'checkout_url' => isset($data['authorization_url']) ? (string) $data['authorization_url'] : null,
+            'checkout_url' => $this->trustedCheckoutUrl($data['authorization_url'] ?? null),
             'raw' => $decoded,
         ];
+    }
+
+    /**
+     * Read-only liveness for a hosted transaction (payment-links Task 2). Paystack has no
+     * "session" object: the transaction reference IS the session, and `GET /transaction/verify`
+     * is the only honest read of it.
+     *
+     * Note what this deliberately does NOT do: guess. A reference Paystack cannot find, an API
+     * envelope that says `status: false`, or a transaction state outside the documented set all
+     * come back UNKNOWN rather than DEAD -- and because this driver cannot prove a session dead
+     * at all (no renewal contract, Ruling 6), UNKNOWN and DEAD both end in the collector refusing
+     * to replace anything.
+     *
+     * @return 'live'|'completed'|'dead'|'unknown'
+     */
+    public function hostedSessionState(string $reference): string
+    {
+        if (trim($reference) === '') {
+            return self::STATE_UNKNOWN;
+        }
+
+        [$found, $state] = $this->verifyTransaction($reference);
+
+        // A reference Paystack has never heard of is not a dead session -- it is an answer we
+        // cannot act on (see resumeHostedSession(), which CAN act on it).
+        return $found ? $state : self::STATE_UNKNOWN;
+    }
+
+    /**
+     * Recover an interrupted attempt WITHOUT ever re-POSTing a reference Paystack may already
+     * hold (see {@see ResumableHostedSessionGateway}): `/transaction/initialize` is not
+     * idempotent, and a repeat of a used reference is a permanent HTTP 400 "Duplicate Transaction
+     * Reference". `/transaction/verify` IS idempotent and is therefore the documented recovery
+     * read.
+     *
+     * IMPORTANT limitation, and the reason ADOPT is narrow here: the verify response does NOT
+     * carry `access_code` or `authorization_url` (those exist only on the initialize response).
+     * So when verify finds an unpaid transaction, the original checkout url is simply not
+     * recoverable through any API this driver has.
+     *
+     *  - absent  -> the create never landed; the SAME reference is still free, so the collector
+     *               re-initializes under the same attempt (true timeout recovery).
+     *  - success -> the payable was already PAID under this reference. Never re-create: adopt the
+     *               reference so the intent becomes reference-addressable for settlement. No url
+     *               is returned because none is needed (or available).
+     *  - unpaid  -> the transaction exists but its url is unrecoverable, so this attempt can never
+     *               produce a checkout: REPLACE it. That is safe precisely because the interrupted
+     *               call never returned -- no url for this attempt was ever handed to a payer, so
+     *               the orphaned Paystack transaction is unreachable by anyone and simply ages out
+     *               as `abandoned`. Discarding it cannot double-charge.
+     *  - anything indeterminate throws, leaving the attempt intact for a later retry.
+     *
+     * @param array<string,mixed> $options
+     * @return array{outcome: 'absent'|'adopt'|'replace', session?: array<string,mixed>}
+     */
+    public function resumeHostedSession(PayableReference $payable, array $options = []): array
+    {
+        $reference = $this->attemptReference($payable, $this->requiredAttemptUuid($options));
+
+        [$found, $state, $data] = $this->verifyTransaction($reference);
+
+        if (!$found) {
+            return ['outcome' => self::RESUME_ABSENT];
+        }
+
+        if ($state === self::STATE_UNKNOWN) {
+            throw new \RuntimeException(
+                'Paystack returned an unrecognized state for an in-flight transaction reference; '
+                . 'refusing to guess whether it may be re-created.'
+            );
+        }
+
+        if ($state === self::STATE_COMPLETED) {
+            return [
+                'outcome' => self::RESUME_ADOPT,
+                'session' => [
+                    'reference' => isset($data['reference']) && is_scalar($data['reference'])
+                        ? (string) $data['reference']
+                        : $reference,
+                    'checkout_url' => null,
+                    'raw' => $data,
+                ],
+            ];
+        }
+
+        return ['outcome' => self::RESUME_REPLACE];
+    }
+
+    /**
+     * The one shared `/transaction/verify` read. Returns `[found, state, data]`, where `found` is
+     * false ONLY for Paystack's own "no such reference" answer -- everything else that is not a
+     * clean, parseable success is an exception (transport) or `STATE_UNKNOWN`, never a guess.
+     *
+     * @return array{0: bool, 1: string, 2: array<string,mixed>}
+     */
+    private function verifyTransaction(string $reference): array
+    {
+        $config = $this->gatewayConfig();
+        $secret = (string) ($config['secret_key'] ?? '');
+        if ($secret === '') {
+            throw new \RuntimeException(
+                'Missing Paystack secret key (PAYVIA_PAYSTACK_SECRET_KEY / PAYSTACK_SECRET_KEY)'
+            );
+        }
+
+        $baseUrl = rtrim((string) ($config['base_url'] ?? 'https://api.paystack.co'), '/');
+        // Derived from trusted config only -- never from caller input (see verify()).
+        $response = $this->httpClient->get($baseUrl . '/transaction/verify/' . rawurlencode($reference), [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $secret,
+                'Accept' => 'application/json',
+            ],
+            'timeout' => (int) ($config['timeout'] ?? 15),
+        ]);
+
+        $statusCode = $response->getStatusCode();
+        if ($statusCode >= 500) {
+            throw new HttpClientException(
+                "Paystack transaction status failed with server error {$statusCode}",
+                $statusCode
+            );
+        }
+
+        /** @var array<string,mixed> $decoded */
+        $decoded = $response->getSymfonyResponse()->toArray(false);
+
+        if (($decoded['status'] ?? false) !== true) {
+            $message = isset($decoded['message']) && is_scalar($decoded['message'])
+                ? strtolower((string) $decoded['message'])
+                : '';
+
+            // Paystack answers an unknown reference with 404 + "Transaction reference not found".
+            // Any OTHER falsy envelope (auth failure, rate limit, an unfamiliar message) is an
+            // unknown outcome -- treating it as "absent" would license re-creating a reference
+            // that may well exist.
+            $absent = $statusCode === 404 && str_contains($message, 'not found');
+
+            return [!$absent, self::STATE_UNKNOWN, []];
+        }
+
+        $data = (array) ($decoded['data'] ?? []);
+        $state = isset($data['status']) && is_scalar($data['status']) ? strtolower((string) $data['status']) : '';
+
+        return [
+            true,
+            match (true) {
+                $state === 'success' => self::STATE_COMPLETED,
+                in_array($state, self::LIVE_TRANSACTION_STATES, true) => self::STATE_LIVE,
+                in_array($state, self::DEAD_TRANSACTION_STATES, true) => self::STATE_DEAD,
+                default => self::STATE_UNKNOWN,
+            },
+            $data,
+        ];
+    }
+
+    /**
+     * The hosted-redirect trust boundary for this driver: an absolute HTTPS url whose host
+     * exactly matches the configured `checkout_hosts` set (default `checkout.paystack.com`).
+     * Before 2.6.0 `authorization_url` was passed straight through, so whatever the response
+     * carried became the customer's redirect. See {@see HostedCheckoutUrl}.
+     */
+    private function trustedCheckoutUrl(mixed $url): string
+    {
+        $trusted = HostedCheckoutUrl::trusted(
+            $url,
+            HostedCheckoutUrl::configuredHosts($this->gatewayConfig(), self::CHECKOUT_HOSTS),
+        );
+
+        if ($trusted === null) {
+            throw new \RuntimeException(
+                'Paystack initialization returned no usable HTTPS checkout URL on a trusted '
+                . 'Paystack checkout host'
+            );
+        }
+
+        return $trusted;
     }
 
     public function verifyWebhookSignature(string $rawBody, array $headers): bool
@@ -742,12 +1001,59 @@ final class PaystackGateway implements
         };
     }
 
-    private function newReference(PayableReference $payable): string
+    /**
+     * @param array<string,mixed> $options
+     */
+    private function requiredAttemptUuid(array $options): string
     {
-        $safeType = (string) preg_replace('/[^a-zA-Z0-9]+/', '_', $payable->type);
-        $safeId = (string) preg_replace('/[^a-zA-Z0-9]+/', '_', $payable->id);
+        $attemptUuid = isset($options['attempt_uuid']) && is_string($options['attempt_uuid'])
+            ? trim($options['attempt_uuid'])
+            : '';
 
-        return trim($safeType . '_' . $safeId, '_') . '_' . Utils::generateNanoID(10);
+        if ($attemptUuid === '') {
+            throw new \RuntimeException(
+                'Paystack initialization requires an attempt_uuid in the initiation options; the '
+                . 'transaction reference is derived from it.'
+            );
+        }
+
+        return $attemptUuid;
+    }
+
+    /**
+     * The per-attempt transaction reference: `{payable type}_{payable id}_{attempt uuid}`, kept
+     * human-legible for the merchant's Paystack dashboard while being deterministic per attempt --
+     * {@see resumeHostedSession()} re-derives exactly this value to ask what happened to an
+     * interrupted attempt.
+     *
+     * The payable segments are truncated because `payable_id` is `varchar(255)` while
+     * `payment_intents.reference` is `varchar(100)`. The attempt uuid is globally unique on its
+     * own, so truncation can never make two payables collide.
+     *
+     * The uuid length is host-configurable (`security.nanoid_length`), so the budget is asserted
+     * rather than assumed: an over-long reference must fail HERE, before the transaction exists
+     * at Paystack, because a reference can never be reused and a post-creation failure would
+     * strand the attempt permanently.
+     */
+    private function attemptReference(PayableReference $payable, string $attemptUuid): string
+    {
+        $safeType = substr((string) preg_replace('/[^a-zA-Z0-9]+/', '_', $payable->type), 0, 40);
+        $safeId = substr((string) preg_replace('/[^a-zA-Z0-9]+/', '_', $payable->id), 0, 40);
+
+        $reference = trim($safeType . '_' . $safeId, '_') . '_' . $attemptUuid;
+
+        if (strlen($reference) > self::MAX_REFERENCE_LENGTH) {
+            throw new \RuntimeException(sprintf(
+                'Derived Paystack reference is %d characters, over the %d-character limit of '
+                . 'payment_intents.reference (attempt uuid length %d). Reduce security.nanoid_length '
+                . 'or widen the column before initiating.',
+                strlen($reference),
+                self::MAX_REFERENCE_LENGTH,
+                strlen($attemptUuid),
+            ));
+        }
+
+        return $reference;
     }
 
     /** @param array<string,mixed> $data */

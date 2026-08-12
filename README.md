@@ -96,6 +96,10 @@ Key environment variables:
 # Default gateway (must exist in payvia.gateways)
 PAYVIA_DEFAULT_GATEWAY=paystack
 
+# How long a provider-CONFIRMED "session still live" answer is trusted before ensure-live
+# asks the provider again. 0 always probes.
+PAYVIA_SESSION_LIVENESS_COOLDOWN_SECONDS=30
+
 # Paystack
 PAYVIA_PAYSTACK_ENABLED=true
 PAYVIA_PAYSTACK_SECRET_KEY=sk_test_xxx
@@ -125,6 +129,12 @@ Config structure (simplified):
 return [
     'default_gateway' => env('PAYVIA_DEFAULT_GATEWAY', 'paystack'),
 
+    // How long a PROVIDER-CONFIRMED "this hosted session is still live" answer is trusted
+    // before ensure-live asks the provider again. Only a confirmed-live probe refreshes the
+    // stamp; dead/unknown answers never do, and a brand-new attempt is never suppressed.
+    // Set to 0 to always probe.
+    'session_liveness_cooldown_seconds' => (int) env('PAYVIA_SESSION_LIVENESS_COOLDOWN_SECONDS', 30),
+
     'gateways' => [
         'paystack' => [
             'enabled' => (bool) env('PAYVIA_PAYSTACK_ENABLED', true),
@@ -133,6 +143,9 @@ return [
             'webhook_secret' => env('PAYVIA_PAYSTACK_WEBHOOK_SECRET', env('PAYVIA_PAYSTACK_SECRET_KEY', env('PAYSTACK_SECRET_KEY', null))),
             'base_url' => env('PAYVIA_PAYSTACK_BASE_URL', 'https://api.paystack.co'),
             'timeout' => (int) env('PAYVIA_PAYSTACK_TIMEOUT', 15),
+            // Hosted-redirect trust boundary: the ONLY hosts a returned `authorization_url`
+            // may live on. File-config only -- not overridable via PayviaSettings.
+            'checkout_hosts' => ['checkout.paystack.com'],
         ],
         'stripe' => [
             'enabled' => (bool) env('PAYVIA_STRIPE_ENABLED', false),
@@ -142,6 +155,9 @@ return [
             'webhook_tolerance' => (int) env('PAYVIA_STRIPE_WEBHOOK_TOLERANCE', 300),
             'base_url' => env('PAYVIA_STRIPE_BASE_URL', 'https://api.stripe.com'),
             'timeout' => (int) env('PAYVIA_STRIPE_TIMEOUT', 15),
+            // Same trust boundary as paystack above, applied to the Checkout Session `url`
+            // for both one-time and subscription sessions.
+            'checkout_hosts' => ['checkout.stripe.com'],
         ],
     ],
 
@@ -188,8 +204,76 @@ constructing their payable — nothing here is order-specific. Two invariants:
 - **Initiation exceptions propagate.** The collector has no catch — mapping failures (e.g. to an
   `init_failed` result) is the calling application's job.
 
-Stripe session creation sends a deterministic `Idempotency-Key` per payable and validates the
+Stripe session creation sends a deterministic per-**attempt** `Idempotency-Key` and validates the
 response (a `cs_…` session id and an absolute HTTPS checkout URL) before any intent is persisted.
+
+### Ensure-live: `initiate()` is fallible on every call
+
+A call against a payable with no open intent claims a fresh attempt and creates a session, as
+above. A call against a payable that already has an open intent no longer unconditionally hands
+back the cached checkout URL — it asks the provider to prove the session is still live first:
+
+| Provider answer | Behavior |
+|---|---|
+| confirmed live, or completed | the SAME checkout URL is returned; no new session is created. |
+| confirmed dead + renewal proof | the retired attempt is superseded (its reference stays webhook-addressable) and a NEW attempt/session is claimed. |
+| unknown (unreadable answer, probe exception, ambiguous abandon result) | throws `ProviderSessionStateUnknownException`; the existing intent is left untouched. |
+| dead, but the gateway cannot prove/renew | throws `SessionRenewalUnavailableException` (Paystack — see below). |
+| gateway not state-capable / different gateway / no reference yet | nothing is provable, so the open intent is returned unchanged. |
+
+**This is a behavior change from 2.5.0**, where a repeat `initiate()` against an open intent
+always returned `ok` with the cached URL and never touched the provider. Callers must now treat
+*every* `initiate()` call as fallible — not just the first one for a payable — and handle the two
+typed exceptions above alongside the pre-existing "initiation exceptions propagate" contract.
+
+A repeated attempt (e.g. the same visitor's browser retrying the request) reuses the SAME
+provider idempotency key/reference as the original attempt, so a genuine transport timeout
+resolves to one session, not two; only a NEW attempt (a fresh claim after supersession) gets a
+new one.
+
+### Provider liveness details
+
+- **Stripe** reads the Checkout Session's `status`/`payment_status`: `open` is live;
+  `complete` is only `completed` once `payment_status` confirms it (`paid` or
+  `no_payment_required`) — an unsettled async payment method keeps a `complete` session **live**;
+  `expired`/`canceled` is dead. Renewal expires the session and re-fetches, trusting only the
+  re-fetch's result as proof of death.
+- **Paystack** treats its own non-terminal transaction states
+  (`abandoned`/`ongoing`/`pending`/`processing`/`queued`), *including* `failed`, as **live** — a
+  shopper revisiting the same checkout page or trying another payment option should not be
+  treated as dead. Only `reversed` is dead. Paystack does **not** implement session renewal: it
+  has no provider-side proof of death to renew against, so a genuinely dead Paystack session
+  surfaces `SessionRenewalUnavailableException` rather than being silently replaced.
+- **Paystack verify-first recovery.** `/transaction/initialize` is not idempotent — a repeated
+  reference is a permanent error — while `/transaction/verify` is. When the collector resumes an
+  existing (not brand-new) attempt, it verifies before ever calling initialize again: an absent
+  transaction re-initializes under the same attempt; a paid one is adopted (recorded, never
+  re-created); an unpaid or reversed one fails the retired attempt and claims a new one.
+- **Operational requirement:** the Paystack integration setting `payment_session_timeout` must
+  stay at `0` (infinite). A non-zero value silently dead-ends a resumed checkout page while
+  `/transaction/verify` still reports it `abandoned` — Payvia cannot tell that apart from live.
+
+### Checkout URL trust boundary
+
+Every hosted checkout URL a gateway driver returns (Stripe Checkout, Stripe subscription
+Checkout, and Paystack's `authorization_url`) is validated against a per-gateway host allowlist,
+`gateways.{stripe,paystack}.checkout_hosts` (see [Configuration](#configuration)), before it can
+reach an intent payload: absolute HTTPS, case-normalized *exact* host match (no subdomains, no
+ports, no userinfo/credentials, no trailing dot, no whitespace/control characters). A rejected
+URL throws inside the gateway — nothing untrusted is ever persisted.
+
+**This key is file-config only.** Unlike most `payvia.*` settings, `checkout_hosts` is
+deliberately **not** overridable via `PayviaSettings` — it is a platform-owned trust boundary,
+not a runtime-editable one. A merchant serving Stripe Checkout on their own custom domain must
+extend `gateways.stripe.checkout_hosts` directly in `config/payvia.php`.
+
+### Liveness cooldown
+
+`payvia.session_liveness_cooldown_seconds` (default `30`; `0` disables) suppresses a repeat
+provider liveness probe for that long after the last confirmed-live answer for a given intent,
+so a shopper clicking "pay" repeatedly can't turn one checkout into a stream of provider round
+trips. Only a confirmed-live probe extends the window; a dead/unknown answer or a brand-new
+attempt is never suppressed.
 
 ## Webhooks and Provider Events
 
@@ -212,6 +296,19 @@ POST /payvia/webhooks/stripe
 The webhook route intentionally has no `auth` middleware. Payvia verifies the provider signature inside the webhook pipeline before accepting the event.
 
 `payvia:relay-events` replays processed provider events that were not dispatched yet, including crash recovery for rows stuck in `dispatching`.
+
+### Reference-addressable confirmation
+
+A payable can carry a retired (`superseded`/`closed`/`failed`) session attempt alongside its
+current open one — each with its own provider reference, once a session has been renewed (see
+[Ensure-live](#ensure-live-initiate-is-fallible-on-every-call) above). `ConfirmationDispatcher::dispatch()`
+resolves the row to close by the confirmation's own `(gateway, reference)` via
+`PaymentIntentRepository::findByReference()` — an exact lookup on the composite
+`UNIQUE(tenant_uuid, gateway, reference)` index — rather than "whichever attempt is open for this
+payable." A webhook confirming a superseded attempt's reference settles exactly that retired row
+(`::settle()`, a CAS to `closed` from `open`/`superseded`/`failed`) and never touches a newer open
+attempt for the same payable; an unmatched reference remains a no-op. `dispatch()` takes the
+gateway key as a required parameter for this lookup.
 
 ### Strict Delivery and Listener Contracts
 

@@ -38,6 +38,30 @@ final class DefinitiveSubscriptionCheckoutRejection extends \RuntimeException
     }
 
     /**
+     * The provider created a session but handed back a checkout url this platform refuses to
+     * redirect to (wrong host, non-HTTPS, malformed — see {@see \Glueful\Extensions\Payvia
+     * \Support\HostedCheckoutUrl}). Definitive rather than unknown BY CONSTRUCTION: the outcome
+     * is fully known (the url is unusable and always will be), and replaying the call under the
+     * same provider idempotency key returns that identical url, so retrying could only loop.
+     *
+     * @param array<string,mixed> $raw
+     */
+    public static function forUntrustedCheckoutUrl(string $gateway, array $raw): self
+    {
+        return new self(
+            sprintf(
+                '%s: %s subscription checkout session returned no usable HTTPS checkout URL on a '
+                . 'trusted checkout host',
+                self::MARKER,
+                $gateway,
+            ),
+            gateway: $gateway,
+            providerCode: 'untrusted_checkout_url',
+            raw: $raw,
+        );
+    }
+
+    /**
      * @param array<string,mixed> $error
      * @param array<string,mixed> $raw
      */

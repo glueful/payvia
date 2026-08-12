@@ -259,6 +259,54 @@ final class StripeSubscriptionCheckoutTest extends TestCase
         }
     }
 
+    /**
+     * The 2.6.0 hosted-redirect trust boundary, on the subscription path (payment-links Task 2).
+     *
+     * Classified DEFINITIVE rather than unknown, unlike the malformed cases above: Stripe DID
+     * create the session and its url is one this platform will never redirect to, so replaying
+     * the call under the same idempotency key returns the identical refused url. As an unknown
+     * outcome it would release the lease and retry forever.
+     *
+     * @dataProvider untrustedSubscriptionCheckoutUrls
+     */
+    public function testAnUntrustedCheckoutUrlIsADefinitiveRejection(string $url): void
+    {
+        [$http] = $this->capturingClient($this->responseOf(200, [
+            'id' => 'cs_test_sub_1',
+            'url' => $url,
+        ]));
+
+        try {
+            $this->gateway($http)->initializeSubscription($this->request());
+            self::fail('Expected an exception to be thrown');
+        } catch (DefinitiveSubscriptionCheckoutRejection $e) {
+            self::assertSame('stripe', $e->gateway);
+            self::assertSame('untrusted_checkout_url', $e->providerCode);
+            self::assertStringContainsString(DefinitiveSubscriptionCheckoutRejection::MARKER, $e->getMessage());
+        }
+    }
+
+    /** @return array<string, array{string}> */
+    public static function untrustedSubscriptionCheckoutUrls(): array
+    {
+        return [
+            'untrusted host' => ['https://evil.test/c/pay/cs_test_sub_1'],
+            'subdomain lookalike' => ['https://checkout.stripe.com.evil.test/c/x'],
+            'userinfo' => ['https://checkout.stripe.com@evil.test/c/x'],
+            'explicit port' => ['https://checkout.stripe.com:8443/c/x'],
+            'trailing dot' => ['https://checkout.stripe.com./c/x'],
+        ];
+    }
+
+    public function testATrustedSubscriptionCheckoutUrlStillPassesThrough(): void
+    {
+        [$http] = $this->capturingClient($this->responseOf(200, $this->goodSession()));
+
+        $result = $this->gateway($http)->initializeSubscription($this->request());
+
+        self::assertSame('https://checkout.stripe.com/c/pay/cs_test_sub_abc123', $result['checkout_url']);
+    }
+
     /** @return array<string, array{array<string,mixed>, string}> */
     public static function malformedSessions(): array
     {

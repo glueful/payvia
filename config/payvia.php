@@ -9,6 +9,15 @@ declare(strict_types=1);
 return [
     'default_gateway' => env('PAYVIA_DEFAULT_GATEWAY', 'paystack'),
 
+    // How long a PROVIDER-CONFIRMED "this hosted session is still live" answer is trusted before
+    // ensure-live asks the provider again. Repeat initiations inside the window reuse the stored
+    // checkout URL with no provider I/O, so a shopper clicking "pay" repeatedly (or an abusive
+    // client) cannot turn one checkout into a stream of provider round trips -- which would invite
+    // provider rate limiting, and a rate-limited answer is an UNKNOWN state that fails closed for
+    // every shopper at once. Only a confirmed-live probe refreshes the stamp; dead/unknown answers
+    // never do, and a brand-new attempt is never suppressed. Set to 0 to always probe.
+    'session_liveness_cooldown_seconds' => (int) env('PAYVIA_SESSION_LIVENESS_COOLDOWN_SECONDS', 30),
+
     'gateways' => [
         'paystack' => [
             'enabled' => (bool) env('PAYVIA_PAYSTACK_ENABLED', true),
@@ -23,6 +32,18 @@ return [
             'webhook_url' => env('PAYVIA_PAYSTACK_WEBHOOK_URL', null),
             'base_url' => env('PAYVIA_PAYSTACK_BASE_URL', 'https://api.paystack.co'),
             'timeout' => (int) env('PAYVIA_PAYSTACK_TIMEOUT', 15),
+            // OPERATOR REQUIREMENT: the Paystack integration setting `payment_session_timeout`
+            // (GET/PUT /integration/payment_session_timeout) MUST stay at its default of 0 (never
+            // expire). A non-zero value that elapses dead-ends the hosted checkout page while
+            // /transaction/verify still reports the transaction as `abandoned` -- indistinguishable
+            // from a live one, so payvia would keep serving a URL nobody can pay. See the
+            // PaystackGateway class docblock; payvia deliberately does not guess at elapsed time.
+            // Hosted-redirect trust boundary: the ONLY hosts a returned `authorization_url` may
+            // live on. Matching is case-normalized but otherwise exact -- no subdomains, no
+            // ports, no userinfo, HTTPS only (see Support\HostedCheckoutUrl). Narrow this (or
+            // point it at a sandbox host) only if you know why; an empty array trusts nothing
+            // and refuses every checkout URL.
+            'checkout_hosts' => ['checkout.paystack.com'],
         ],
 
         'stripe' => [
@@ -33,6 +54,9 @@ return [
             'webhook_tolerance' => (int) env('PAYVIA_STRIPE_WEBHOOK_TOLERANCE', 300),
             'base_url' => env('PAYVIA_STRIPE_BASE_URL', 'https://api.stripe.com'),
             'timeout' => (int) env('PAYVIA_STRIPE_TIMEOUT', 15),
+            // See the paystack note above -- same trust boundary, applied to the Checkout
+            // Session `url` for both one-time and subscription sessions.
+            'checkout_hosts' => ['checkout.stripe.com'],
         ],
     ],
 
