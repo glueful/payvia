@@ -27,8 +27,12 @@ use Glueful\Helpers\Utils;
  *
  *   no intent           -> claim an attempt, THEN create a session, then open the intent
  *   confirmed live      -> hand back the SAME url; the provider is never asked to make a second
- *   live, but repriced  -> supersede that attempt and claim a new one at the CURRENT amount: a
- *                          session created for one total must never be served for another
+ *   live, but repriced  -> a live session created for one total must never be served for another,
+ *                          and replacing a LIVE session is the same act as replacing a dead one:
+ *                          it needs the same proof. On a renewal-capable driver, supersede that
+ *                          attempt and claim a new one at the CURRENT amount; on a driver that
+ *                          cannot prove a session dead, typed fail-CLOSED refusal (Ruling 6) --
+ *                          neither the stale-priced url NOR a second live url is ever served
  *   confirmed completed -> likewise; settlement is the webhook's business, not initiation's
  *   confirmed dead      -> supersede that attempt (its reference stays webhook-addressable) and
  *                          claim a NEW one, with a new provider idempotency key/reference
@@ -127,14 +131,16 @@ final class PayviaPaymentCollector implements PaymentCollector
         // `payvia.session_liveness_cooldown_seconds`. Only a confirmed-live probe ever writes that
         // stamp, so a dead/unknown answer can never buy itself a quiet period, and a brand-new
         // attempt has no stamp at all.
-        if ($this->withinLivenessCooldown($context, $existing)) {
-            // The cooldown suppresses the PROVIDER round trip, never the price check: comparing
-            // the payable's current amount/currency to the row's stored ones is a pure read of
-            // data already in hand, so riding the cooldown can never launder a stale price.
-            if (!$this->stillPricedFor($payable, $existing)) {
-                return $this->renewRepriced($context, $payable, $gatewayKey, $gateway, $existing);
-            }
-
+        //
+        // A REPRICE INVALIDATES THE COOLDOWN. The stamp says "this session was live 12 seconds
+        // ago"; it says nothing about a payable whose price has changed since, and the answer to
+        // drift is never "reuse". Acting on drift from a stale stamp alone would supersede a
+        // session that may have COMPLETED inside the window -- minting a second checkout for an
+        // order the payer already paid. So drift falls through to the ordinary probe below, which
+        // routes the three real answers correctly (completed ⇒ keep, live ⇒ renew per Ruling 6,
+        // dead ⇒ the normal renewal). That is one provider round trip per reprice, on a path that
+        // is by definition not a repeat click, and no new code path.
+        if ($this->withinLivenessCooldown($context, $existing) && $this->stillPricedFor($payable, $existing)) {
             return $this->fromIntent($existing);
         }
 
@@ -193,7 +199,14 @@ final class PayviaPaymentCollector implements PaymentCollector
 
         if ($proof === HostedSessionRenewalCapableGateway::RENEWAL_STILL_LIVE) {
             // The expire/re-fetch round trip is the authority and it contradicted the probe:
-            // the session survived (or had already completed). Keep it.
+            // the session survived (or had already completed). Keep it -- but this is a
+            // CONFIRMED-LIVE reuse like any other, so it revalidates the price like any other.
+            // (Unreachable for the shipped drivers, whose abandon call cannot answer STILL_LIVE
+            // after a successful expire; a registered third-party driver can.)
+            if (!$this->stillPricedFor($payable, $existing)) {
+                return $this->renewRepriced($context, $payable, $gatewayKey, $gateway, $existing);
+            }
+
             return $this->fromIntent($existing);
         }
 
@@ -439,15 +452,30 @@ final class PayviaPaymentCollector implements PaymentCollector
     }
 
     /**
-     * The repriced-payable renewal: byte-for-byte the confirmed-dead flow — supersede the attempt
-     * (preserved, so its provider reference stays webhook-addressable for anyone who somehow paid
-     * the old session) and claim a fresh one, which creates a new provider session at the CURRENT
-     * amount.
+     * The repriced-payable renewal — and it obeys Ruling 6 exactly like the confirmed-dead flow
+     * does, because it is the same act: retiring a session the provider still considers payable.
      *
-     * Note what this does NOT do: it never expires the old session at the provider. That would be
-     * a second, failure-prone provider round trip on a path whose whole point is that the session
-     * we hold is LIVE and simply mispriced; the old session's fate is the provider's own timeout
-     * and, if it is somehow paid, the superseded row settles it exactly as it does today.
+     * A repriced payable has TWO unacceptable outcomes, not one. Serving the stored url charges
+     * the old total; minting a replacement without first making the old session unpayable leaves
+     * two simultaneously-payable checkouts for one payable. Only a
+     * {@see HostedSessionRenewalCapableGateway} can rule the second one out, because implementing
+     * that contract is precisely the claim that the provider offers a way to make a session
+     * definitively unpayable. Stripe does (expire + re-fetch). Paystack does not — an authorization
+     * url stays payable until Paystack's own `payment_session_timeout` retires it, which is
+     * DISABLED (never expires) by default, so "the provider's own timeout will clean it up" is not
+     * a fact one may rely on.
+     *
+     * So: renewal-capable ⇒ supersede the attempt (preserved, so its reference stays
+     * webhook-addressable for anyone who somehow paid the old session) and claim a fresh one at
+     * the CURRENT amount. Otherwise ⇒ typed {@see SessionRenewalUnavailableException}, fail
+     * CLOSED: the intent is left completely untouched, no second session is created, and the
+     * recovery is the documented operator path (offline completion / an explicit,
+     * risk-acknowledged cancellation and recreation), never a silent re-initiation.
+     *
+     * Note what the renewal-capable branch still does NOT do: it does not expire the old session
+     * at the provider before superseding. That is Ruling 5's existing shape for renewal-capable
+     * drivers and is unchanged here — the driver has proven it CAN kill a session, and the
+     * superseded row keeps settling a late payment exactly as it does today.
      *
      * @param array<string,mixed> $existing
      */
@@ -458,6 +486,15 @@ final class PayviaPaymentCollector implements PaymentCollector
         InitiationCapableGateway $gateway,
         array $existing,
     ): PaymentInitiation {
+        if (!$gateway instanceof HostedSessionRenewalCapableGateway) {
+            throw SessionRenewalUnavailableException::for(
+                $gatewayKey,
+                $payable->type,
+                $payable->id,
+                isset($existing['reference']) ? (string) $existing['reference'] : ''
+            );
+        }
+
         $this->intents->supersede($context, (string) $existing['uuid']);
 
         return $this->openAttempt($context, $payable, $gatewayKey, $gateway);

@@ -15,6 +15,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Stale-intent sweeper** — `payvia:intents:sweep-stale` retires `initializing`/`open`
+  `payment_intents` rows untouched (`COALESCE(updated_at, created_at)`) for longer than
+  `payvia.intents.stale_after_days` (default 30, clamped 1–365), freeing each payable's active
+  idempotency port. Batched (`--limit`, default 200), per-row compare-and-swap, non-destructive:
+  a swept row keeps its `reference`, so a late webhook still settles it. `--tenant` names the
+  partition on tenancy-enabled hosts, where an unqualified CLI run is correctly refused (a command
+  has no request to resolve a tenant from).
+
+### Changed
+
+- **Reuse revalidates the price, and repricing obeys Ruling 6.** A confirmed-live session is
+  reused only if the payable still costs what the session was created for — checked on the probe
+  branch, the liveness-cooldown branch (a reprice *invalidates* the cooldown and forces one probe,
+  so a session that completed inside the window is never blindly superseded), and the
+  abandon-contradicts-the-probe branch. On drift, a renewal-capable gateway (Stripe) supersedes and
+  opens a fresh attempt at the current amount; a gateway that cannot prove a session dead
+  (Paystack) throws `SessionRenewalUnavailableException` and leaves the intent untouched, rather
+  than leaving two simultaneously-payable checkout URLs alive.
+
+### Release-note obligation (carry into 2.7.0)
+
+- **Hosts must schedule the sweeper.** Nothing in Payvia runs `payvia:intents:sweep-stale` on its
+  own; without a cron/scheduler entry (daily is ample at the 30-day window) the orphan-intent
+  defect keeps recurring. Tenancy-enabled hosts must either loop `--tenant` over their tenants or
+  schedule `StaleIntentSweeper::sweep()` through their own per-tenant scheduler.
+
 ## [2.6.0] - 2026-08-11 — Ensure-Live Hosted Sessions
 
 Payvia's hosted-session lifecycle becomes reference-addressable end to end: every session

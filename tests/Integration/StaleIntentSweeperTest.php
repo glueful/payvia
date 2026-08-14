@@ -8,6 +8,7 @@ use Glueful\Extensions\Payvia\Database\Migrations\AddPaymentIntentAttemptLifecyc
 use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentIntentsTable;
 use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
 use Glueful\Extensions\Payvia\Services\StaleIntentSweeper;
+use Glueful\Extensions\Payvia\Tests\Support\FixedTenantResolver;
 use Glueful\Extensions\Payvia\Tests\Support\PayviaTestCase;
 
 /**
@@ -182,6 +183,67 @@ final class StaleIntentSweeperTest extends PayviaTestCase
         self::assertSame('commerce_order:ord-returning', (string) $fresh['idempotency_key']);
     }
 
+    public function testASweptRowStillSettlesWhenItsLateWebhookArrives(): void
+    {
+        // THE load-bearing safety argument for sweeping on age alone. Retiring an `open` row is
+        // only defensible because it is not destructive: the row keeps its provider reference, so
+        // a settlement webhook that arrives after the sweep -- the payer who wandered off for six
+        // weeks and then paid -- still resolves to that exact row and closes it. If this ever
+        // stopped holding, age-alone sweeping would be losing money, not freeing ports.
+        $uuid = $this->seed('ord-late-webhook', PaymentIntentRepository::STATUS_OPEN);
+        $this->backdate($uuid, 40, 40);
+
+        self::assertSame(1, $this->sweeper->sweep($this->context));
+        self::assertSame('failed', $this->row($uuid)['status']);
+
+        // A webhook knows the provider reference and nothing else -- exactly the lookup
+        // WebhookService performs.
+        $found = $this->intents->findByReference($this->context, 'fake', 'sess_' . $uuid);
+        self::assertIsArray($found, 'the swept row is still reference-addressable');
+        self::assertSame($uuid, (string) $found['uuid']);
+
+        self::assertTrue(
+            $this->intents->settle($this->context, (string) $found['uuid']),
+            'settle() is legal from `failed`, which is precisely why sweeping may use it'
+        );
+        self::assertSame('closed', $this->row($uuid)['status']);
+    }
+
+    // ==================================================================
+    // Tenant scope
+    // ==================================================================
+
+    public function testASweepNeverCrossesTenantBoundaries(): void
+    {
+        // findStale() is tenant-scoped like every other read here, and expireStale()'s CAS reads
+        // through the same scope -- so a per-tenant scheduled sweep can never retire another
+        // tenant's checkouts, and the '' sentinel partition is just another tenant to it.
+        $tenantA = new PaymentIntentRepository($this->connection, resolver: new FixedTenantResolver('tenantAAAA01'));
+        $tenantB = new PaymentIntentRepository($this->connection, resolver: new FixedTenantResolver('tenantBBBB02'));
+
+        $a = $this->seedFor($tenantA, 'ord-shared-id');
+        $b = $this->seedFor($tenantB, 'ord-shared-id');
+        $sentinel = $this->seed('ord-sentinel', PaymentIntentRepository::STATUS_OPEN);
+        foreach ([$a, $b, $sentinel] as $uuid) {
+            $this->backdate($uuid, 40, 40);
+        }
+
+        $cutoff = new \DateTimeImmutable('-30 days');
+        self::assertSame([$a], array_column($tenantA->findStale($this->context, $cutoff, 100), 'uuid'));
+        self::assertSame([$b], array_column($tenantB->findStale($this->context, $cutoff, 100), 'uuid'));
+        self::assertSame([$sentinel], array_column($this->intents->findStale($this->context, $cutoff, 100), 'uuid'));
+
+        self::assertSame(1, (new StaleIntentSweeper($tenantA))->sweep($this->context));
+        self::assertSame('failed', $this->row($a)['status']);
+        self::assertSame('open', $this->row($b)['status'], "another tenant's checkout is untouched");
+        self::assertSame('open', $this->row($sentinel)['status']);
+
+        self::assertFalse(
+            $tenantA->expireStale($this->context, $b),
+            'even a uuid handed to it directly is refused across the tenant boundary'
+        );
+    }
+
     // ==================================================================
     // The configured window
     // ==================================================================
@@ -265,6 +327,22 @@ final class StaleIntentSweeperTest extends PayviaTestCase
         if ($status === PaymentIntentRepository::STATUS_CLOSED) {
             $this->intents->close($this->context, $uuid);
         }
+
+        return $uuid;
+    }
+
+    /** Claim + open an attempt through a repository bound to some OTHER tenant. */
+    private function seedFor(PaymentIntentRepository $intents, string $payableId): string
+    {
+        $claim = $intents->claimAttempt($this->context, [
+            'payable_type' => 'commerce_order',
+            'payable_id' => $payableId,
+            'gateway' => 'fake',
+            'amount' => 4999,
+            'currency' => 'GHS',
+        ]);
+        $uuid = (string) $claim['uuid'];
+        self::assertTrue($intents->markOpen($this->context, $uuid, 'sess_' . $uuid));
 
         return $uuid;
     }

@@ -216,7 +216,8 @@ back the cached checkout URL — it asks the provider to prove the session is st
 | Provider answer | Behavior |
 |---|---|
 | confirmed live, or completed | the SAME checkout URL is returned; no new session is created. |
-| confirmed live, but the payable has been REPRICED | the attempt is superseded and a NEW attempt/session is claimed at the current amount — a session created for one total is never served for another. |
+| confirmed live, but the payable has been REPRICED — gateway *can* prove a session dead (Stripe) | the attempt is superseded and a NEW attempt/session is claimed at the current amount — a session created for one total is never served for another. |
+| confirmed live, but the payable has been REPRICED — gateway *cannot* prove a session dead (Paystack) | throws `SessionRenewalUnavailableException`; the intent is left untouched and **no** second session is minted (Ruling 6 — see below). |
 | confirmed dead + renewal proof | the retired attempt is superseded (its reference stays webhook-addressable) and a NEW attempt/session is claimed. |
 | unknown (unreadable answer, probe exception, ambiguous abandon result) | throws `ProviderSessionStateUnknownException`; the existing intent is left untouched. |
 | dead, but the gateway cannot prove/renew | throws `SessionRenewalUnavailableException` (Paystack — see below). |
@@ -233,10 +234,26 @@ resolves to one session, not two; only a NEW attempt (a fresh claim after supers
 new one.
 
 Reuse compares the payable's **current** amount/currency against the ones the intent row stored
-when its session was created — on the probe-confirmed branch *and* on the liveness-cooldown
-branch, which skips the provider round trip but never the price check. A mismatch (an order
-edited between two initiations), or an intent row with no stored price at all, takes the renewal
-path above rather than serving a checkout URL for the old total.
+when its session was created, on *every* confirmed-live path: the probe-confirmed branch, the
+liveness-cooldown branch, and the rarer "the abandon round trip contradicted the probe" branch. A
+mismatch (an order edited between two initiations), or an intent row with no stored price at all,
+takes the renewal path above rather than serving a checkout URL for the old total.
+
+A reprice **invalidates the liveness cooldown**. The cooldown suppresses the provider round trip
+for repeat clicks; it cannot speak for a payable whose price changed since the stamp was written,
+and a session that *completed* inside that ≤30s window still carries a live-looking stamp. So
+drift falls through to the ordinary probe — one extra round trip per reprice — which then routes
+the real answer: completed keeps the session (settlement is the webhook's business), live takes
+the two repriced rows in the table above, dead takes the normal renewal.
+
+Repricing obeys **Ruling 6 exactly as death does**, because it is the same act: retiring a session
+the provider still considers payable. Only a driver that can make a session definitively unpayable
+(Stripe: expire + re-fetch) may replace it. A Paystack authorization URL stays payable until
+Paystack's own `payment_session_timeout` retires it — and that is *disabled* by default — so
+minting a replacement there would leave two simultaneously-payable checkouts for one payable, with
+the second settlement surfacing only after a double charge. Payvia serves neither URL: the
+recovery is the documented operator path (offline completion / mark paid, or an explicit,
+risk-acknowledged cancellation and recreation).
 
 ### Stale-intent sweeper
 
@@ -247,15 +264,37 @@ retires rows untouched (`COALESCE(updated_at, created_at)`) for longer than
 1–365) to `failed`, through the same re-keying compare-and-swap every terminal transition uses:
 
 ```bash
-php glueful payvia:intents:sweep-stale [--limit=200] [--stale-after-days=30]
+php glueful payvia:intents:sweep-stale [--limit=200] [--stale-after-days=30] [--tenant=UUID]
 ```
 
+**Nothing schedules this for you.** Payvia auto-discovers the command; running it is the host's
+obligation, and until a cron/scheduler entry exists the defect it fixes keeps recurring. Daily is
+ample at the default 30-day window. Both numeric options are validated, not cast: a non-integer
+`--limit` or `--stale-after-days` exits `FAILURE` rather than silently becoming `0` (which would
+mean a 1-day sweep, or a batch cap of nothing).
+
 Age is the only criterion — nothing in the table can honestly answer whether a payer is still
-coming back — and that is safe because sweeping is not destructive: the row is kept (its provider
-reference stays webhook-addressable, so a late settlement still resolves to it) and its port is
-freed, so a payer who returns later simply gets a brand-new attempt from the create path above.
-One run retires at most `--limit` rows, oldest first; concurrent runs are safe (per-row CAS), and
-a sweep is scoped to the tenant resolved for the run.
+coming back — and that is safe because sweeping is not destructive: the row is kept and its port
+is freed, so a payer who returns later simply gets a brand-new attempt from the create path above.
+One run retires at most `--limit` rows, oldest first; concurrent runs are safe (per-row CAS).
+
+**What a swept row does and does not mean.** Sweeping is a *local* transition — it never touches
+the provider. On Paystack in particular, the swept row's authorization URL may well remain payable
+(Paystack's `payment_session_timeout` is disabled by default), so a payer holding an old link can
+still complete a checkout weeks after the sweep. That is survivable, not silent: the swept row
+keeps its own `reference`, so the late settlement webhook resolves to that exact row via
+`findByReference()` and closes it through `settle()` (legal from `failed`) with the amount it was
+created for. What the payable does with a settlement it no longer expects is the consuming app's
+business — Commerce's own settle-aware confirm ordering handles it.
+
+**Tenancy.** A sweep is tenant-scoped like every other Payvia repository operation, and a command
+has no request for a host tenancy package to resolve a tenant from — so on a tenancy-enabled host
+an unqualified run is *refused* by `FailClosedTenantResolver` rather than silently sweeping the
+`''` sentinel partition. Name the partition with `--tenant` (mirroring `payvia:tenancy:adopt`) and
+loop it over your tenants, or skip the command entirely and schedule
+`StaleIntentSweeper::sweep($context)` through your own per-tenant scheduler (e.g. tenancy's
+`ForEachTenant`), which resolves each tenant the same way a request would. Single-store installs
+need neither: the sentinel resolver already answers and `--tenant` stays absent.
 
 ### Provider liveness details
 
