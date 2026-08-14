@@ -27,6 +27,8 @@ use Glueful\Helpers\Utils;
  *
  *   no intent           -> claim an attempt, THEN create a session, then open the intent
  *   confirmed live      -> hand back the SAME url; the provider is never asked to make a second
+ *   live, but repriced  -> supersede that attempt and claim a new one at the CURRENT amount: a
+ *                          session created for one total must never be served for another
  *   confirmed completed -> likewise; settlement is the webhook's business, not initiation's
  *   confirmed dead      -> supersede that attempt (its reference stays webhook-addressable) and
  *                          claim a NEW one, with a new provider idempotency key/reference
@@ -126,6 +128,13 @@ final class PayviaPaymentCollector implements PaymentCollector
         // stamp, so a dead/unknown answer can never buy itself a quiet period, and a brand-new
         // attempt has no stamp at all.
         if ($this->withinLivenessCooldown($context, $existing)) {
+            // The cooldown suppresses the PROVIDER round trip, never the price check: comparing
+            // the payable's current amount/currency to the row's stored ones is a pure read of
+            // data already in hand, so riding the cooldown can never launder a stale price.
+            if (!$this->stillPricedFor($payable, $existing)) {
+                return $this->renewRepriced($context, $payable, $gatewayKey, $gateway, $existing);
+            }
+
             return $this->fromIntent($existing);
         }
 
@@ -143,6 +152,12 @@ final class PayviaPaymentCollector implements PaymentCollector
         }
 
         if ($state === HostedSessionStateCapableGateway::STATE_LIVE) {
+            // Live, but live FOR WHAT? A hosted session is created for one price; if the payable
+            // has been repriced since, handing back its url would charge the OLD total.
+            if (!$this->stillPricedFor($payable, $existing)) {
+                return $this->renewRepriced($context, $payable, $gatewayKey, $gateway, $existing);
+            }
+
             $this->intents->recordLivenessConfirmation($context, (string) $existing['uuid'], time());
 
             return $this->fromIntent($existing);
@@ -392,6 +407,60 @@ final class PayviaPaymentCollector implements PaymentCollector
 
         // A future-dated stamp (clock skew between app servers) is not evidence of anything.
         return $age >= 0 && $age < $cooldown;
+    }
+
+    /**
+     * Is this open attempt's session still the one this payable needs — i.e. was it created for
+     * the amount/currency the payable costs RIGHT NOW?
+     *
+     * `false` means the stored url must never be served (see {@see renewRepriced()}). Deliberately
+     * fail-CLOSED on a row that cannot answer: `amount`/`currency` are nullable at the actual
+     * constraint level on `payment_intents` (see migration 012's notes on this schema builder's
+     * nullability), and 007-era rows predate the collector always writing them, so a row with no
+     * stored price exists in the wild. "Nothing to compare against" is not "matches" — an
+     * unverifiable price is renewed rather than served unverified.
+     *
+     * Currency comparison is case-insensitive: 'ghs' and 'GHS' are the same currency, and a
+     * caller's casing must never be mistaken for a repriced payable (which would supersede a
+     * perfectly good session on every single initiation).
+     *
+     * @param array<string,mixed> $intent
+     */
+    private function stillPricedFor(PayableReference $payable, array $intent): bool
+    {
+        $amount = $intent['amount'] ?? null;
+        $currency = $intent['currency'] ?? null;
+        if (!is_numeric($amount) || !is_string($currency) || trim($currency) === '') {
+            return false;
+        }
+
+        return (int) $amount === $payable->amount
+            && strcasecmp(trim($currency), trim($payable->currency)) === 0;
+    }
+
+    /**
+     * The repriced-payable renewal: byte-for-byte the confirmed-dead flow — supersede the attempt
+     * (preserved, so its provider reference stays webhook-addressable for anyone who somehow paid
+     * the old session) and claim a fresh one, which creates a new provider session at the CURRENT
+     * amount.
+     *
+     * Note what this does NOT do: it never expires the old session at the provider. That would be
+     * a second, failure-prone provider round trip on a path whose whole point is that the session
+     * we hold is LIVE and simply mispriced; the old session's fate is the provider's own timeout
+     * and, if it is somehow paid, the superseded row settles it exactly as it does today.
+     *
+     * @param array<string,mixed> $existing
+     */
+    private function renewRepriced(
+        ApplicationContext $context,
+        PayableReference $payable,
+        string $gatewayKey,
+        InitiationCapableGateway $gateway,
+        array $existing,
+    ): PaymentInitiation {
+        $this->intents->supersede($context, (string) $existing['uuid']);
+
+        return $this->openAttempt($context, $payable, $gatewayKey, $gateway);
     }
 
     /**

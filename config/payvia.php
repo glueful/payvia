@@ -18,6 +18,18 @@ return [
     // never do, and a brand-new attempt is never suppressed. Set to 0 to always probe.
     'session_liveness_cooldown_seconds' => (int) env('PAYVIA_SESSION_LIVENESS_COOLDOWN_SECONDS', 30),
 
+    'intents' => [
+        // How long an `initializing`/`open` payment_intents row may sit UNTOUCHED
+        // (`COALESCE(updated_at, created_at)`) before `payvia:intents:sweep-stale` retires it to
+        // `failed`. Such a row holds its payable's active idempotency port, so without a sweeper
+        // an abandoned checkout wedges that payable's port forever and the table grows without
+        // bound. Age is the ONLY criterion -- nothing in this table can honestly answer whether a
+        // payer is still coming back -- and retiring is safe precisely because it FREES that port:
+        // a payer who does return converges through ensure-live's create path onto a brand-new
+        // attempt. Clamped to 1..365 days at read time; the default is deliberately generous.
+        'stale_after_days' => (int) env('PAYVIA_INTENTS_STALE_AFTER_DAYS', 30),
+    ],
+
     'gateways' => [
         'paystack' => [
             'enabled' => (bool) env('PAYVIA_PAYSTACK_ENABLED', true),

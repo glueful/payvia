@@ -68,7 +68,7 @@ return [
 php glueful extensions:cache   # required in production
 ```
 
-Payvia also auto-discovers the `payvia:relay-events` command. If your app caches command metadata during deploy, rebuild that cache after enabling or upgrading the extension.
+Payvia also auto-discovers the `payvia:relay-events` and `payvia:intents:sweep-stale` commands. If your app caches command metadata during deploy, rebuild that cache after enabling or upgrading the extension.
 
 ## Verify Installation
 
@@ -216,6 +216,7 @@ back the cached checkout URL — it asks the provider to prove the session is st
 | Provider answer | Behavior |
 |---|---|
 | confirmed live, or completed | the SAME checkout URL is returned; no new session is created. |
+| confirmed live, but the payable has been REPRICED | the attempt is superseded and a NEW attempt/session is claimed at the current amount — a session created for one total is never served for another. |
 | confirmed dead + renewal proof | the retired attempt is superseded (its reference stays webhook-addressable) and a NEW attempt/session is claimed. |
 | unknown (unreadable answer, probe exception, ambiguous abandon result) | throws `ProviderSessionStateUnknownException`; the existing intent is left untouched. |
 | dead, but the gateway cannot prove/renew | throws `SessionRenewalUnavailableException` (Paystack — see below). |
@@ -230,6 +231,31 @@ A repeated attempt (e.g. the same visitor's browser retrying the request) reuses
 provider idempotency key/reference as the original attempt, so a genuine transport timeout
 resolves to one session, not two; only a NEW attempt (a fresh claim after supersession) gets a
 new one.
+
+Reuse compares the payable's **current** amount/currency against the ones the intent row stored
+when its session was created — on the probe-confirmed branch *and* on the liveness-cooldown
+branch, which skips the provider round trip but never the price check. A mismatch (an order
+edited between two initiations), or an intent row with no stored price at all, takes the renewal
+path above rather than serving a checkout URL for the old total.
+
+### Stale-intent sweeper
+
+An `initializing`/`open` intent whose payable is never resolved holds that payable's active
+idempotency port indefinitely, and the table grows without bound. `payvia:intents:sweep-stale`
+retires rows untouched (`COALESCE(updated_at, created_at)`) for longer than
+`payvia.intents.stale_after_days` (`PAYVIA_INTENTS_STALE_AFTER_DAYS`, default 30, clamped to
+1–365) to `failed`, through the same re-keying compare-and-swap every terminal transition uses:
+
+```bash
+php glueful payvia:intents:sweep-stale [--limit=200] [--stale-after-days=30]
+```
+
+Age is the only criterion — nothing in the table can honestly answer whether a payer is still
+coming back — and that is safe because sweeping is not destructive: the row is kept (its provider
+reference stays webhook-addressable, so a late settlement still resolves to it) and its port is
+freed, so a payer who returns later simply gets a brand-new attempt from the create path above.
+One run retires at most `--limit` rows, oldest first; concurrent runs are safe (per-row CAS), and
+a sweep is scoped to the tenant resolved for the run.
 
 ### Provider liveness details
 
