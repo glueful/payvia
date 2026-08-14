@@ -68,7 +68,7 @@ return [
 php glueful extensions:cache   # required in production
 ```
 
-Payvia also auto-discovers the `payvia:relay-events` command. If your app caches command metadata during deploy, rebuild that cache after enabling or upgrading the extension.
+Payvia also auto-discovers the `payvia:relay-events` and `payvia:intents:sweep-stale` commands. If your app caches command metadata during deploy, rebuild that cache after enabling or upgrading the extension.
 
 ## Verify Installation
 
@@ -99,6 +99,10 @@ PAYVIA_DEFAULT_GATEWAY=paystack
 # How long a provider-CONFIRMED "session still live" answer is trusted before ensure-live
 # asks the provider again. 0 always probes.
 PAYVIA_SESSION_LIVENESS_COOLDOWN_SECONDS=30
+
+# How long an initializing/open payment_intents row may sit UNTOUCHED before
+# `payvia:intents:sweep-stale` retires it to `failed`. Clamped to 1-365.
+PAYVIA_INTENTS_STALE_AFTER_DAYS=30
 
 # Paystack
 PAYVIA_PAYSTACK_ENABLED=true
@@ -134,6 +138,13 @@ return [
     // stamp; dead/unknown answers never do, and a brand-new attempt is never suppressed.
     // Set to 0 to always probe.
     'session_liveness_cooldown_seconds' => (int) env('PAYVIA_SESSION_LIVENESS_COOLDOWN_SECONDS', 30),
+
+    'intents' => [
+        // How long an `initializing`/`open` payment_intents row may sit UNTOUCHED before
+        // `payvia:intents:sweep-stale` retires it to `failed`, freeing its payable's active
+        // idempotency port. Age is the only criterion. Clamped to 1..365 days at read time.
+        'stale_after_days' => (int) env('PAYVIA_INTENTS_STALE_AFTER_DAYS', 30),
+    ],
 
     'gateways' => [
         'paystack' => [
@@ -216,6 +227,8 @@ back the cached checkout URL — it asks the provider to prove the session is st
 | Provider answer | Behavior |
 |---|---|
 | confirmed live, or completed | the SAME checkout URL is returned; no new session is created. |
+| confirmed live, but the payable has been REPRICED — gateway *can* prove a session dead (Stripe) | the attempt is superseded and a NEW attempt/session is claimed at the current amount — a session created for one total is never served for another. |
+| confirmed live, but the payable has been REPRICED — gateway *cannot* prove a session dead (Paystack) | throws `SessionRenewalUnavailableException`; the intent is left untouched and **no** second session is minted (Ruling 6 — see below). |
 | confirmed dead + renewal proof | the retired attempt is superseded (its reference stays webhook-addressable) and a NEW attempt/session is claimed. |
 | unknown (unreadable answer, probe exception, ambiguous abandon result) | throws `ProviderSessionStateUnknownException`; the existing intent is left untouched. |
 | dead, but the gateway cannot prove/renew | throws `SessionRenewalUnavailableException` (Paystack — see below). |
@@ -230,6 +243,69 @@ A repeated attempt (e.g. the same visitor's browser retrying the request) reuses
 provider idempotency key/reference as the original attempt, so a genuine transport timeout
 resolves to one session, not two; only a NEW attempt (a fresh claim after supersession) gets a
 new one.
+
+Reuse compares the payable's **current** amount/currency against the ones the intent row stored
+when its session was created, on *every* confirmed-live path: the probe-confirmed branch, the
+liveness-cooldown branch, and the rarer "the abandon round trip contradicted the probe" branch. A
+mismatch (an order edited between two initiations), or an intent row with no stored price at all,
+takes the renewal path above rather than serving a checkout URL for the old total.
+
+A reprice **invalidates the liveness cooldown**. The cooldown suppresses the provider round trip
+for repeat clicks; it cannot speak for a payable whose price changed since the stamp was written,
+and a session that *completed* inside that ≤30s window still carries a live-looking stamp. So
+drift falls through to the ordinary probe — one extra round trip per reprice — which then routes
+the real answer: completed keeps the session (settlement is the webhook's business), live takes
+the two repriced rows in the table above, dead takes the normal renewal.
+
+Repricing obeys **Ruling 6 exactly as death does**, because it is the same act: retiring a session
+the provider still considers payable. Only a driver that can make a session definitively unpayable
+(Stripe: expire + re-fetch) may replace it. A Paystack authorization URL stays payable until
+Paystack's own `payment_session_timeout` retires it — and that is *disabled* by default — so
+minting a replacement there would leave two simultaneously-payable checkouts for one payable, with
+the second settlement surfacing only after a double charge. Payvia serves neither URL: the
+recovery is the documented operator path (offline completion / mark paid, or an explicit,
+risk-acknowledged cancellation and recreation).
+
+### Stale-intent sweeper
+
+An `initializing`/`open` intent whose payable is never resolved holds that payable's active
+idempotency port indefinitely, and the table grows without bound. `payvia:intents:sweep-stale`
+retires rows untouched (`COALESCE(updated_at, created_at)`) for longer than
+`payvia.intents.stale_after_days` (`PAYVIA_INTENTS_STALE_AFTER_DAYS`, default 30, clamped to
+1–365) to `failed`, through the same re-keying compare-and-swap every terminal transition uses:
+
+```bash
+php glueful payvia:intents:sweep-stale [--limit=200] [--stale-after-days=30] [--tenant=UUID]
+```
+
+**Nothing schedules this for you.** Payvia auto-discovers the command; running it is the host's
+obligation, and until a cron/scheduler entry exists the defect it fixes keeps recurring. Daily is
+ample at the default 30-day window. Both numeric options are validated, not cast: a non-integer
+`--limit` or `--stale-after-days` exits `FAILURE` rather than silently becoming `0` (which would
+mean a 1-day sweep, or a batch cap of nothing).
+
+Age is the only criterion — nothing in the table can honestly answer whether a payer is still
+coming back — and that is safe because sweeping is not destructive: the row is kept and its port
+is freed, so a payer who returns later simply gets a brand-new attempt from the create path above.
+One run retires at most `--limit` rows, oldest first; concurrent runs are safe (per-row CAS).
+
+**What a swept row does and does not mean.** Sweeping is a *local* transition — it never touches
+the provider. On Paystack in particular, the swept row's authorization URL may well remain payable
+(Paystack's `payment_session_timeout` is disabled by default), so a payer holding an old link can
+still complete a checkout weeks after the sweep. That is survivable, not silent: the swept row
+keeps its own `reference`, so the late settlement webhook resolves to that exact row via
+`findByReference()` and closes it through `settle()` (legal from `failed`) with the amount it was
+created for. What the payable does with a settlement it no longer expects is the consuming app's
+business — Commerce's own settle-aware confirm ordering handles it.
+
+**Tenancy.** A sweep is tenant-scoped like every other Payvia repository operation, and a command
+has no request for a host tenancy package to resolve a tenant from — so on a tenancy-enabled host
+an unqualified run is *refused* by `FailClosedTenantResolver` rather than silently sweeping the
+`''` sentinel partition. Name the partition with `--tenant` (mirroring `payvia:tenancy:adopt`) and
+loop it over your tenants, or skip the command entirely and schedule
+`StaleIntentSweeper::sweep($context)` through your own per-tenant scheduler (e.g. tenancy's
+`ForEachTenant`), which resolves each tenant the same way a request would. Single-store installs
+need neither: the sentinel resolver already answers and `--tenant` stays absent.
 
 ### Provider liveness details
 
@@ -309,6 +385,37 @@ payable." A webhook confirming a superseded attempt's reference settles exactly 
 (`::settle()`, a CAS to `closed` from `open`/`superseded`/`failed`) and never touches a newer open
 attempt for the same payable; an unmatched reference remains a no-op. `dispatch()` takes the
 gateway key as a required parameter for this lookup.
+
+### Confirm-route guards (`PaymentService::confirmAndRecord()`)
+
+The manual confirm route (`POST /payvia/payments/confirm`) carries three guards, all keyed off
+the reference's own `payment_intents` row and all documented in full on
+`PaymentService::confirmAndRecord()`'s docblock:
+
+1. **Payable binding** — refuses (typed `PayableAttributionException`, `409`,
+   `payable_mismatch`) a caller-supplied payable that disagrees with the one the reference's
+   intent row is bound to. See the note under
+   [Confirm and record a payment](#confirm-and-record-a-payment) above.
+2. **Settle-aware ordering** — if a nested strict-lane listener (invoked from within
+   `recordVerifyEvent()`) settles THIS call's own reference before control returns, the route
+   reports success without dispatching a second, spurious `payment_late_rejected`.
+3. **Redelivery-aware ordering** — the more common production ordering: a webhook settles and
+   closes the intent *before* this call even starts (e.g. an operator replaying the same
+   reference through this route after the fact). The route recognizes the reference's intent as
+   already `closed` and bound to the same payable, and again reports success instead of a late
+   rejection.
+
+A genuinely late confirmation — a different reference/attempt against a payable something else
+already paid — is unaffected by guards 2 and 3 and is still dispatched and recorded late.
+
+**Upgrade obligation.** `PaymentService` gained an optional sixth constructor argument
+(`?PaymentIntentRepository $intents`) to power these guards; autowiring resolves it
+automatically on a fresh container build. A container **compiled before this release** still
+constructs the service with the old five-argument shape, which would otherwise let all three
+guards silently no-op. Instead, `confirmAndRecord()` now fails LOUD — `\LogicException` — the
+instant it is entered with no intent repository, so a stale compiled container blocks the confirm
+route outright rather than quietly running it unguarded. **Clear/rebuild the container cache as
+part of upgrading to this release.**
 
 ### Strict Delivery and Listener Contracts
 
@@ -552,6 +659,19 @@ keys) while single-store installs remain byte-identical.
 > from the request body. It is **not** caller‑settable. If a `user_uuid` is supplied and it
 > differs from the authenticated user's UUID, the request is rejected with `422`. This
 > prevents an authenticated caller from attributing a payment to another user.
+
+> **Note:** When the `reference` has its own `payment_intents` row (i.e. it originated through
+> [Hosted Payment Initiation](#hosted-payment-initiation-the-payable-metadata-convention)), a
+> supplied `payable_type`/`payable_id` must agree with the payable that row is bound to. A
+> mismatch is rejected with `409` and `error.details.reason = "payable_mismatch"` **before** any
+> provider verification, upsert, or dispatch — the same equal-amount, equal-currency payable is
+> otherwise indistinguishable to downstream handlers, so this is the only guard that can tell
+> them apart. The error message never names the payable the reference IS bound to. A reference
+> with no intent row (legacy rows, manual/operator references) is unaffected. A redelivery of the
+> *same* reference for an already-settled payment — whether settled moments earlier in this same
+> call or already closed by an out-of-band webhook before this call started — returns the normal
+> success response instead of a late-rejection error; only a genuinely late confirmation (a
+> different reference/attempt against a payable something else already paid) is recorded as late.
 
 **Response (200):**
 

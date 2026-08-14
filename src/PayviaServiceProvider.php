@@ -50,6 +50,7 @@ use Glueful\Extensions\Payvia\Services\InvoiceService;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Extensions\Payvia\Services\PayviaPaymentCollector;
 use Glueful\Extensions\Payvia\Services\PayviaPayoutCollector;
+use Glueful\Extensions\Payvia\Services\StaleIntentSweeper;
 use Glueful\Extensions\Payvia\Services\WebhookService;
 use Glueful\Extensions\Payvia\Support\DiagnosticsReport;
 use Glueful\Extensions\Payvia\Tenancy\FailClosedTenantResolver;
@@ -176,6 +177,14 @@ final class PayviaServiceProvider extends ServiceProvider
             ],
             PaymentCollector::class => [
                 'class' => PayviaPaymentCollector::class,
+                'shared' => true,
+                'autowire' => true,
+            ],
+            // The orphan-intent reaper behind `payvia:intents:sweep-stale`. Autowired off the
+            // shared, tenant-resolving PaymentIntentRepository bound above, so a sweep is scoped
+            // exactly like every other Payvia repository operation.
+            StaleIntentSweeper::class => [
+                'class' => StaleIntentSweeper::class,
                 'shared' => true,
                 'autowire' => true,
             ],

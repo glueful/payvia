@@ -7,7 +7,9 @@ namespace Glueful\Extensions\Payvia\Tests\Integration;
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
+use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentIntentsTable;
 use Glueful\Extensions\Payvia\GatewayManager;
+use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Extensions\Payvia\Tests\Support\PayviaTestCase;
 
@@ -18,6 +20,16 @@ use Glueful\Extensions\Payvia\Tests\Support\PayviaTestCase;
  */
 final class PaymentConfirmUniqueRaceTest extends PayviaTestCase
 {
+    private PaymentIntentRepository $intents;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->runMigration(new CreatePaymentIntentsTable());
+        $this->intents = new PaymentIntentRepository($this->connection);
+    }
+
     private function gateway(): PaymentGatewayInterface
     {
         return new class implements PaymentGatewayInterface {
@@ -45,7 +57,7 @@ final class PaymentConfirmUniqueRaceTest extends PayviaTestCase
         $manager = new GatewayManager($this->context->getContainer(), $this->context);
         $manager->registerDriver('paystack', $gateway::class);
 
-        return new PaymentService($this->context, $repo, $manager);
+        return new PaymentService($this->context, $repo, $manager, null, null, $this->intents);
     }
 
     public function testRecoversFromUniqueViolationByUpdating(): void

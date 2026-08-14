@@ -462,6 +462,67 @@ final class PaymentIntentRepository extends BaseRepository
     }
 
     /**
+     * The stale-orphan batch (OUTSTANDING: orphan-intent expiry/sweeper): rows still holding a
+     * payable's ACTIVE idempotency port ({@see activePortKey()}) whose last touch --
+     * `COALESCE(updated_at, created_at)`, because a claimed-but-never-opened attempt has no
+     * `updated_at` at all -- predates `$cutoff`. Ordered by `id` ASC (the table's stable,
+     * monotonic insertion order) and capped at `$limit`, so a sweep is a bounded batch and
+     * repeated runs make forward progress: every row this returns is about to leave the active
+     * statuses, so the NEXT call's own WHERE clause excludes it -- no cursor or offset is needed,
+     * and a row a concurrent sweeper retired first simply stops matching.
+     *
+     * Read-only and tenant-scoped like every other method here. The decision to retire is the
+     * caller's, made one row at a time through {@see expireStale()}'s CAS.
+     *
+     * @return list<array<string,mixed>>
+     */
+    public function findStale(ApplicationContext $context, \DateTimeInterface $cutoff, int $limit): array
+    {
+        if ($limit < 1) {
+            return [];
+        }
+
+        /** @var list<array<string,mixed>> $rows */
+        $rows = $this->db->table($this->getTableName())
+            ->select(['*'])
+            ->where(['tenant_uuid' => $this->resolver->tenantUuid($context)])
+            ->whereIn('status', self::ACTIVE_STATUSES)
+            ->whereRaw(
+                'COALESCE(updated_at, created_at) < ?',
+                [$this->db->getDriver()->formatDateTime($cutoff->format('Y-m-d H:i:s'))]
+            )
+            ->orderBy(['id' => 'ASC'])
+            ->limit($limit)
+            ->get();
+
+        return array_map($this->normalizeRow(...), $rows);
+    }
+
+    /**
+     * Retire an orphaned attempt the sweeper found (OUTSTANDING: orphan-intent expiry/sweeper):
+     * `initializing`/`open` -> `failed`, through the SAME {@see retire()} CAS every other terminal
+     * transition uses, which re-keys `idempotency_key` and therefore FREES the payable's active
+     * port. Unlike {@see fail()} this is legal from `open` too: an abandoned hosted session is
+     * exactly an `open` row nobody ever came back to.
+     *
+     * The CAS is what makes an overlapping sweep safe: two sweepers that both selected the same
+     * row race on `status`, exactly one UPDATE matches, and the loser returns `false` without
+     * re-keying the row a second time or stamping a misleading `updated_at`.
+     *
+     * AGE IS THE ONLY CRITERION the caller applies, and that is deliberate: nothing in this table
+     * can honestly answer whether a payer is still coming back. Retiring is safe anyway BECAUSE it
+     * frees the port -- a swept payer who returns later converges through
+     * {@see \Glueful\Extensions\Payvia\Services\PayviaPaymentCollector::initiate()}'s create path
+     * (no active row is found, so a fresh attempt is claimed and a new provider session created).
+     * The swept row keeps its own `reference`, so a late webhook for the abandoned session still
+     * resolves to it via {@see findByReference()} and settles through {@see settle()}.
+     */
+    public function expireStale(ApplicationContext $context, string $uuid): bool
+    {
+        return $this->retire($context, $uuid, self::ACTIVE_STATUSES, self::STATUS_FAILED);
+    }
+
+    /**
      * Shared terminal/superseded transition: reads the row (tenant-scoped), refuses if it is
      * missing or not currently in one of `$fromStatuses`, otherwise CASes to `$toStatus` and
      * re-keys `idempotency_key` to {@see retiredKey()} -- freeing the active port the instant the

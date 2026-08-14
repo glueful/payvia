@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace Glueful\Extensions\Payvia\Tests\Integration;
 
+use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentIntentsTable;
 use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentsTable;
 use Glueful\Extensions\Payvia\Database\Migrations\CreateProviderEventsTable;
 use Glueful\Extensions\Payvia\Events\EventType;
 use Glueful\Extensions\Payvia\Events\PaymentProviderEvent;
 use Glueful\Extensions\Payvia\GatewayManager;
+use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
 use Glueful\Extensions\Payvia\Repositories\PaymentRepository;
 use Glueful\Extensions\Payvia\Repositories\ProviderEventRepository;
 use Glueful\Extensions\Payvia\Services\PaymentService;
@@ -22,6 +24,8 @@ final class PaymentServiceOutboxTest extends PayviaTestCase
     {
         $this->runMigration(new CreatePaymentsTable());
         $this->runMigration(new CreateProviderEventsTable());
+        $this->runMigration(new CreatePaymentIntentsTable());
+        $intents = new PaymentIntentRepository($this->connection);
 
         $fake = new FakeWebhookGateway();
         $this->bind(FakeWebhookGateway::class, $fake);
@@ -38,7 +42,14 @@ final class PaymentServiceOutboxTest extends PayviaTestCase
                 $dispatched[] = $event->event->logicalEventKey();
             }
         );
-        $payments = new PaymentService($this->context, new PaymentRepository($this->connection), $manager, $webhooks);
+        $payments = new PaymentService(
+            $this->context,
+            new PaymentRepository($this->connection),
+            $manager,
+            $webhooks,
+            null,
+            $intents
+        );
 
         $payments->confirmAndRecord('REF_9', 'fake');
 

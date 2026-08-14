@@ -15,6 +15,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-08-14 — Attribution-Bound Confirmations
+
+Payvia closes two gaps adjacent to the reference-addressable session lifecycle 2.6.0 built.
+`POST /payvia/payments/confirm` now enforces that a caller-supplied payable agrees with the
+reference's own `payment_intents` binding, and stops mistaking an already-settled redelivery for
+a late payment. A new sweeper reclaims `payment_intents` rows abandoned before a session was ever
+confirmed, so an abandoned checkout no longer wedges its payable's idempotency port forever. And
+confirmed-live session reuse now revalidates the payable's price before handing back a cached
+checkout URL, closing the gap where a mid-checkout reprice could serve — or, on Paystack, leave
+alive — a stale-priced session. **Upgrading requires clearing any compiled service container** —
+see Notes.
+
+### Security
+
+- **Confirm refuses a payable-attribution mismatch.** `POST /payvia/payments/confirm` now reads
+  the reference's own `payment_intents` binding before any provider I/O or `payments` write and,
+  when a caller-supplied `payable_type`/`payable_id` disagrees with it, refuses with a typed
+  `PayableAttributionException` mapped to `409` (`error.details.reason = "payable_mismatch"`).
+  Previously two equal-amount, equal-currency payables were indistinguishable to the downstream
+  handlers, so an authenticated caller could attribute a reference they legitimately paid to a
+  DIFFERENT pending payable and have it marked paid. The refusal message deliberately never names
+  the payable the reference IS bound to, and the lookup stays tenant-scoped, so another tenant's
+  reference is invisible rather than a cross-tenant existence oracle. A reference with no intent
+  row (legacy rows, manual/operator references) is unaffected — there is nothing to compare it
+  against.
+
+### Fixed
+
+- **Same-reference redelivery of an already-settled confirmation now returns success instead of
+  recording a spurious `payment_late_rejected`.** Two orderings are covered: a nested strict-lane
+  listener settling THIS call's own reference during `recordVerifyEvent()`, and the more common
+  out-of-band ordering — a provider webhook settles and closes the intent first, and only later
+  does an operator replay the identical reference through the manual confirm route. Both are now
+  recognized as redelivery, not lateness, by re-reading the reference's own intent status. A
+  genuinely late confirmation — a different reference/attempt against a payable something else
+  already paid — is unaffected: it still dispatches and is still recorded late.
+
+### Added
+
+- **Loud guard against a stale compiled container.** `PaymentService::confirmAndRecord()` now
+  throws `\LogicException` immediately if it was constructed without a `PaymentIntentRepository`
+  — the shape a container compiled before this release still produces (the pre-2.7.0,
+  five-argument constructor). Previously that shape would have silently disabled every confirm
+  guard above with no error and no log. See Notes for the upgrade step this requires.
+- **Stale-intent sweeper** — `payvia:intents:sweep-stale` retires `initializing`/`open`
+  `payment_intents` rows untouched (`COALESCE(updated_at, created_at)`) for longer than
+  `payvia.intents.stale_after_days` (`PAYVIA_INTENTS_STALE_AFTER_DAYS`, default 30, clamped
+  1–365), freeing each payable's active idempotency port. Batched (`--limit`, default 200),
+  per-row compare-and-swap, non-destructive: a swept row keeps its `reference`, so a late webhook
+  still settles it via `findByReference()`/`settle()`. `--tenant` (backed by a new, narrowly
+  scoped `ExplicitTenantResolver`) names the partition on tenancy-enabled hosts, where an
+  unqualified CLI run is correctly refused — a command has no request to resolve a tenant from.
+- **`RENEWAL_STILL_LIVE` now revalidates price too**, behind the same renewal-capable guard as
+  the other confirmed-live paths, so a reprice is caught on every route to "this session is still
+  live," not just the two most common ones.
+
+### Changed
+
+- **Reuse revalidates the price, and repricing obeys Ruling 6.** A confirmed-live session is
+  reused only if the payable still costs what the session was created for — checked on the probe
+  branch, the liveness-cooldown branch (a reprice *invalidates* the cooldown and forces one probe,
+  so a session that completed inside the window is never blindly superseded), and the
+  abandon-contradicts-the-probe branch. On drift, a renewal-capable gateway (Stripe) supersedes and
+  opens a fresh attempt at the current amount; a gateway that cannot prove a session dead
+  (Paystack) throws `SessionRenewalUnavailableException` and leaves the intent untouched, rather
+  than leaving two simultaneously-payable checkout URLs alive. `STATE_COMPLETED` sessions are
+  never superseded by a price change — settlement is the webhook's business.
+
+### Notes
+
+- **Upgrade obligation: clear any compiled container.** Autowiring resolves `PaymentService`'s
+  new sixth constructor argument automatically on a fresh build, but a container compiled before
+  this release still constructs the pre-2.7.0, five-argument shape — which now fails LOUD
+  (`\LogicException`) on every confirm instead of silently running the route unguarded. Clear or
+  rebuild the container cache as part of upgrading.
+- **Operational obligation: schedule the sweeper.** Nothing runs `payvia:intents:sweep-stale` on
+  its own. Single-store hosts should add a cron entry (daily is ample at the 30-day default
+  window: `php glueful payvia:intents:sweep-stale`); tenancy-enabled hosts must either loop
+  `--tenant` over their tenants or schedule `StaleIntentSweeper::sweep()` through their own
+  per-tenant scheduler (e.g. tenancy's `ForEachTenant`).
+- **Paystack repricing is now a hard stop, not a silent replacement.** A payable repriced while
+  its Paystack checkout is open cannot be renewed — Paystack has no provider-side proof of death
+  to renew against — so `initiate()` throws `SessionRenewalUnavailableException` and the payable
+  is stuck until an operator marks it paid out-of-band or performs an explicit,
+  risk-acknowledged cancel/recreate. Hosts should map this exception to an honest operator-facing
+  message rather than a generic failure.
+
 ## [2.6.0] - 2026-08-11 — Ensure-Live Hosted Sessions
 
 Payvia's hosted-session lifecycle becomes reference-addressable end to end: every session

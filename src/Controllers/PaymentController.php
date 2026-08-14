@@ -6,6 +6,7 @@ namespace Glueful\Extensions\Payvia\Controllers;
 
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Controllers\BaseController;
+use Glueful\Extensions\Payvia\Services\PayableAttributionException;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Http\Response;
 use Glueful\Routing\Attributes\ApiOperation;
@@ -36,10 +37,14 @@ final class PaymentController extends BaseController
             . '`metadata` (optional free-form JSON metadata to persist), `options` (optional gateway-specific '
             . 'options passed to the gateway driver). Requires authentication. The stored `user_uuid` is '
             . 'always derived from the authenticated session and is NOT caller-settable; supplying a '
-            . '`user_uuid` that differs from the session returns 422.',
+            . '`user_uuid` that differs from the session returns 422. When the reference has a payment '
+            . 'intent of its own, the supplied `payable_type`/`payable_id` must be the pair that intent is '
+            . 'bound to; attributing the reference to any other payable returns 409 and confirms nothing.',
         tags: ['Payments'],
     )]
     #[ApiResponse(200, description: 'Payment verified and recorded')]
+    #[ApiResponse(409, description: 'The reference is bound to a different payable than the one supplied '
+        . '(`payable_mismatch`); nothing is recorded, dispatched, or settled')]
     #[ApiResponse(422, description: 'Validation failed (also returned if a user_uuid that differs from the '
         . 'authenticated session is supplied)')]
     public function confirm(Request $request): Response
@@ -94,6 +99,16 @@ final class PaymentController extends BaseController
             return $this->success($result, 'Payment verified');
         } catch (ValidationException $e) {
             return $this->validationError(['reference' => $e->getMessage()]);
+        } catch (PayableAttributionException $e) {
+            // A refusal, not a fault -- so NOT the 500 the generic catch below would produce.
+            // The reference belongs to a different payable than the one supplied; the answer
+            // carries the stable marker only, never the payable it IS bound to.
+            $this->logError('payment.confirm', $e);
+            return Response::error(
+                'This reference is not bound to the supplied payable',
+                409,
+                ['reason' => PayableAttributionException::MARKER]
+            );
         } catch (\Throwable $e) {
             $this->logError('payment.confirm', $e);
             return $this->serverError('Failed to verify payment');

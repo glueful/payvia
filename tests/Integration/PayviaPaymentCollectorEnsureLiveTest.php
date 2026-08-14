@@ -721,6 +721,266 @@ final class PayviaPaymentCollectorEnsureLiveTest extends PayviaTestCase
     }
 
     // ==================================================================
+    // Amount-revalidated reuse (OUTSTANDING: ensure-live amount revalidation on reuse)
+    //
+    // A confirmed-live session was created for ONE price. If the payable's current amount or
+    // currency no longer matches the amount the session was created for -- an order edited
+    // between two initiations -- handing back the stored checkout url would charge the payer the
+    // OLD total. Reuse therefore revalidates first, on EVERY confirmed-live path (probe, cooldown,
+    // and the abandon-contradicts-the-probe answer), and a mismatch takes exactly the
+    // confirmed-dead flow -- INCLUDING Ruling 6: supersede + fresh attempt on a driver that can
+    // prove a session dead, typed fail-closed refusal on one that cannot. Replacing a session the
+    // provider still considers payable is the same act whether the trigger was death or a
+    // reprice, so it needs the same proof.
+    // ==================================================================
+
+    public function testAMatchedAmountAndCurrencyStillReusesTheConfirmedLiveSession(): void
+    {
+        $gateway = new EnsureLiveGateway();
+        [$collector] = $this->collector($gateway);
+
+        $first = $collector->initiate($this->context, $this->payable('ord-priced-same'));
+        $gateway->state = HostedSessionStateCapableGateway::STATE_LIVE;
+        // Currency comparison is case-insensitive: 'ghs' and 'GHS' are the same currency, and a
+        // caller's casing must never be mistaken for a repriced payable.
+        $second = $collector->initiate($this->context, $this->payable('ord-priced-same', 4999, 'ghs'));
+
+        self::assertSame($first->payload['reference'], $second->payload['reference']);
+        self::assertSame($first->payload['checkout_url'], $second->payload['checkout_url']);
+        self::assertSame(1, $gateway->initializeCalls);
+        self::assertCount(1, $this->rows('ord-priced-same'));
+    }
+
+    public function testAnAmountDriftSupersedesTheLiveSessionAndOpensANewOneAtTheNewAmount(): void
+    {
+        $gateway = new EnsureLiveGateway();
+        [$collector, $intents] = $this->collector($gateway);
+
+        $first = $collector->initiate($this->context, $this->payable('ord-repriced'));
+        $gateway->state = HostedSessionStateCapableGateway::STATE_LIVE;
+        $second = $collector->initiate($this->context, $this->payable('ord-repriced', 7999));
+
+        self::assertSame(2, $gateway->initializeCalls, 'the stale-priced url is never served again');
+        self::assertNotSame($first->payload['reference'], $second->payload['reference']);
+        self::assertNotSame($first->payload['checkout_url'], $second->payload['checkout_url']);
+
+        [$firstAttempt, $secondAttempt] = $gateway->attemptUuids;
+        $rows = array_column($this->rows('ord-repriced'), null, 'uuid');
+        self::assertCount(2, $rows, 'the old attempt is preserved, never deleted');
+        self::assertSame('superseded', $rows[$firstAttempt]['status']);
+        self::assertSame($first->payload['reference'], $rows[$firstAttempt]['reference']);
+        self::assertSame('open', $rows[$secondAttempt]['status']);
+        self::assertSame(7999, (int) $rows[$secondAttempt]['amount'], 'the new session carries the NEW amount');
+
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-repriced');
+        self::assertIsArray($open);
+        self::assertSame($secondAttempt, $open['uuid']);
+    }
+
+    public function testACurrencyDriftIsTreatedExactlyLikeAnAmountDrift(): void
+    {
+        $gateway = new EnsureLiveGateway();
+        [$collector, $intents] = $this->collector($gateway);
+
+        $first = $collector->initiate($this->context, $this->payable('ord-recurrencied'));
+        $gateway->state = HostedSessionStateCapableGateway::STATE_LIVE;
+        $second = $collector->initiate($this->context, $this->payable('ord-recurrencied', 4999, 'USD'));
+
+        self::assertSame(2, $gateway->initializeCalls);
+        self::assertNotSame($first->payload['reference'], $second->payload['reference']);
+
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-recurrencied');
+        self::assertIsArray($open);
+        self::assertSame('USD', (string) $open['currency']);
+    }
+
+    public function testARepriceInvalidatesTheCooldownAndProbesBeforeRenewing(): void
+    {
+        // The cooldown stamp says "this session was live N seconds ago". It says NOTHING about a
+        // payable whose price changed since, and the answer to drift is never "reuse" -- so a
+        // reprice invalidates the cooldown and falls through to the ordinary probe, which is what
+        // makes the renewal decision. One extra round trip per reprice, on a path that is by
+        // definition not a repeat click.
+        $gateway = new EnsureLiveGateway();
+        [$collector] = $this->collector($gateway);
+
+        $first = $collector->initiate($this->context, $this->payable('ord-cooldown-repriced'));
+        $collector->initiate($this->context, $this->payable('ord-cooldown-repriced'));
+        self::assertSame(1, $gateway->stateCalls, 'the second call probed and earned a cooldown');
+
+        $third = $collector->initiate($this->context, $this->payable('ord-cooldown-repriced', 8999));
+
+        self::assertSame(2, $gateway->stateCalls, 'the reprice invalidated the cooldown and re-probed');
+        self::assertSame(2, $gateway->initializeCalls);
+        self::assertNotSame($first->payload['reference'], $third->payload['reference']);
+
+        $rows = array_column($this->rows('ord-cooldown-repriced'), null, 'uuid');
+        self::assertSame('superseded', $rows[$gateway->attemptUuids[0]]['status']);
+        self::assertSame(8999, (int) $rows[$gateway->attemptUuids[1]]['amount']);
+    }
+
+    public function testAMatchedPriceInsideTheCooldownStillSkipsTheProviderEntirely(): void
+    {
+        // The other half of the rule: with no drift the cooldown is untouched, so the repeat-click
+        // rate limit it exists to be is still a rate limit.
+        $gateway = new EnsureLiveGateway();
+        [$collector] = $this->collector($gateway);
+
+        $collector->initiate($this->context, $this->payable('ord-cooldown-same'));
+        $collector->initiate($this->context, $this->payable('ord-cooldown-same'));
+        $collector->initiate($this->context, $this->payable('ord-cooldown-same'));
+        $collector->initiate($this->context, $this->payable('ord-cooldown-same'));
+
+        self::assertSame(1, $gateway->stateCalls);
+        self::assertSame(1, $gateway->initializeCalls);
+    }
+
+    public function testARepricedButCompletedSessionInsideTheCooldownIsProbedAndKept(): void
+    {
+        // The reason drift must PROBE rather than supersede outright. A session that completed
+        // inside the <=30s cooldown window still carries a live-looking stamp; superseding on that
+        // stamp alone would mint a second checkout for an order the payer has already paid.
+        $gateway = new EnsureLiveGateway();
+        [$collector, $intents] = $this->collector($gateway);
+
+        $first = $collector->initiate($this->context, $this->payable('ord-cooldown-completed'));
+        $collector->initiate($this->context, $this->payable('ord-cooldown-completed'));
+        self::assertSame(1, $gateway->stateCalls, 'a cooldown is now in force');
+
+        $gateway->state = HostedSessionStateCapableGateway::STATE_COMPLETED;
+        $third = $collector->initiate($this->context, $this->payable('ord-cooldown-completed', 8999));
+
+        self::assertSame(2, $gateway->stateCalls, 'the drift forced a probe instead of a blind supersede');
+        self::assertSame(1, $gateway->initializeCalls, 'a paid session is never given a second checkout');
+        self::assertSame($first->payload['reference'], $third->payload['reference']);
+
+        $rows = $this->rows('ord-cooldown-completed');
+        self::assertCount(1, $rows);
+        self::assertSame('open', (string) $rows[0]['status'], 'the completed session was NOT superseded');
+
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-cooldown-completed');
+        self::assertIsArray($open);
+        self::assertSame(4999, (int) $open['amount'], 'and it still carries the price it was created for');
+    }
+
+    public function testARepricedLiveSessionOnARenewalIncapableGatewayIsRefusedNotSuperseded(): void
+    {
+        // Ruling 6, applied to repricing. Superseding a LIVE Paystack session does not make it
+        // unpayable -- an authorization url stays payable until Paystack's own
+        // `payment_session_timeout`, which is disabled (never expires) by default -- so minting a
+        // replacement would leave TWO simultaneously-payable checkouts for one order, and the
+        // second settlement would only surface after a double charge. Neither url may be served:
+        // the stale-priced one charges the wrong total, the fresh one is a second live checkout.
+        // Fail closed and leave the intent completely untouched; recovery is the documented
+        // operator path (mark paid, or an explicit risk-acknowledged cancel and recreate).
+        $gateway = new LivenessOnlyGateway();
+        [$collector, $intents] = $this->collector($gateway, LivenessOnlyGateway::class);
+
+        $first = $collector->initiate($this->context, $this->payable('ord-paystack-repriced'));
+
+        try {
+            $collector->initiate($this->context, $this->payable('ord-paystack-repriced', 8999));
+            self::fail('a repriced live session cannot be renewed on a renewal-incapable gateway');
+        } catch (SessionRenewalUnavailableException $e) {
+            self::assertSame('fake', $e->gateway);
+            self::assertSame('ord-paystack-repriced', $e->payableId);
+            self::assertSame($first->payload['reference'], $e->reference);
+        }
+
+        self::assertSame(1, $gateway->initializeCalls, 'no second live authorization url is ever minted');
+
+        $rows = $this->rows('ord-paystack-repriced');
+        self::assertCount(1, $rows, 'the old attempt is left exactly as it was');
+        self::assertSame('open', (string) $rows[0]['status']);
+
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-paystack-repriced');
+        self::assertIsArray($open);
+        self::assertSame($first->payload['reference'], $open['reference']);
+        self::assertSame(4999, (int) $open['amount']);
+    }
+
+    public function testARenewalIncapableGatewayIsRefusedFromTheCooldownBranchToo(): void
+    {
+        // The same ruling, reached through the cooldown: the reprice invalidates the cooldown, the
+        // probe says LIVE, and the refusal is identical. The cooldown is not a loophole.
+        $gateway = new LivenessOnlyGateway();
+        [$collector] = $this->collector($gateway, LivenessOnlyGateway::class);
+
+        $collector->initiate($this->context, $this->payable('ord-paystack-cooldown'));
+        $collector->initiate($this->context, $this->payable('ord-paystack-cooldown'));
+        self::assertSame(1, $gateway->stateCalls);
+
+        $this->expectException(SessionRenewalUnavailableException::class);
+        $collector->initiate($this->context, $this->payable('ord-paystack-cooldown', 8999));
+    }
+
+    public function testAContradictedProbeRevalidatesThePriceBeforeReusingTheSession(): void
+    {
+        // The abandon-contradicts-the-probe answer (RENEWAL_STILL_LIVE) is a third confirmed-live
+        // reuse, and confirmed-live reuse always revalidates the price. Only reachable for a
+        // registered third-party driver -- neither shipped driver can answer STILL_LIVE after a
+        // successful expire -- so a fake driver is the honest way to pin it. This branch already
+        // sits behind the renewal-capable guard, so drift here takes the renewal-capable
+        // semantics: supersede and open a fresh attempt at the new price.
+        $gateway = new EnsureLiveGateway();
+        [$collector, $intents] = $this->collector($gateway);
+
+        $first = $collector->initiate($this->context, $this->payable('ord-contradicted-repriced'));
+        $gateway->state = HostedSessionStateCapableGateway::STATE_DEAD;
+        $gateway->abandon = HostedSessionRenewalCapableGateway::RENEWAL_STILL_LIVE;
+
+        $second = $collector->initiate($this->context, $this->payable('ord-contradicted-repriced', 7999));
+
+        self::assertSame(1, $gateway->abandonCalls);
+        self::assertSame(2, $gateway->initializeCalls, 'the stale-priced url is never served again');
+        self::assertNotSame($first->payload['reference'], $second->payload['reference']);
+
+        $rows = array_column($this->rows('ord-contradicted-repriced'), null, 'uuid');
+        self::assertCount(2, $rows);
+        self::assertSame('superseded', $rows[$gateway->attemptUuids[0]]['status']);
+        self::assertSame($first->payload['reference'], $rows[$gateway->attemptUuids[0]]['reference']);
+
+        $open = $intents->findOpen($this->context, 'commerce_order', 'ord-contradicted-repriced');
+        self::assertIsArray($open);
+        self::assertSame(7999, (int) $open['amount']);
+    }
+
+    public function testAnIntentRowWithNoStoredAmountFailsClosedToRenewal(): void
+    {
+        // Nothing to revalidate AGAINST is not the same as "matches". A legacy/hand-repaired row
+        // with no stored price is renewed rather than served unverified.
+        $gateway = new EnsureLiveGateway();
+        [$collector] = $this->collector($gateway);
+
+        $first = $collector->initiate($this->context, $this->payable('ord-priceless'));
+        $this->connection->table('payment_intents')
+            ->where(['payable_id' => 'ord-priceless'])
+            ->update(['amount' => null, 'currency' => null]);
+        $gateway->state = HostedSessionStateCapableGateway::STATE_LIVE;
+
+        $second = $collector->initiate($this->context, $this->payable('ord-priceless'));
+
+        self::assertSame(2, $gateway->initializeCalls);
+        self::assertNotSame($first->payload['reference'], $second->payload['reference']);
+    }
+
+    public function testACompletedSessionIsNeverSupersededByAPriceChange(): void
+    {
+        // The payer already finished checkout; settlement is the webhook's business. Minting a
+        // second checkout for a session the provider says is COMPLETED would be far worse than
+        // the stale price this feature exists to prevent.
+        $gateway = new EnsureLiveGateway();
+        [$collector] = $this->collector($gateway);
+
+        $first = $collector->initiate($this->context, $this->payable('ord-completed-repriced'));
+        $gateway->state = HostedSessionStateCapableGateway::STATE_COMPLETED;
+        $second = $collector->initiate($this->context, $this->payable('ord-completed-repriced', 9999));
+
+        self::assertSame(1, $gateway->initializeCalls);
+        self::assertSame($first->payload['reference'], $second->payload['reference']);
+    }
+
+    // ==================================================================
     // PostgreSQL-gated: one-open-attempt serialization under concurrent renewal
     // ==================================================================
 
@@ -894,9 +1154,9 @@ final class PayviaPaymentCollectorEnsureLiveTest extends PayviaTestCase
         return [new PayviaPaymentCollector($manager, $intents), $intents];
     }
 
-    private function payable(string $id): PayableReference
+    private function payable(string $id, int $amount = 4999, string $currency = 'GHS'): PayableReference
     {
-        return new PayableReference('commerce_order', $id, 4999, 'GHS', 'Order ' . $id, [
+        return new PayableReference('commerce_order', $id, $amount, $currency, 'Order ' . $id, [
             'callback_url' => 'https://shop.test/return',
         ]);
     }

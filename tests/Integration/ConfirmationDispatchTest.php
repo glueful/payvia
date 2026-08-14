@@ -239,6 +239,30 @@ final class ConfirmationDispatchTest extends PayviaTestCase
         return [$openA, $openB];
     }
 
+    /**
+     * Guard-side regression: a stale compiled container that resolves this service via the
+     * pre-2.7.0, five-argument constructor must fail LOUD rather than silently run every
+     * pre-existing scenario above with the payable-binding/settle-aware guards disabled.
+     */
+    public function testFiveArgumentConstructionFailsLoudInsteadOfSilentlyDisablingTheGuards(): void
+    {
+        $manager = new GatewayManager($this->context->getContainer(), $this->context);
+        $manager->registerDriver('paystack', FakeConfirmGateway::class);
+        $this->bind(FakeConfirmGateway::class, new FakeConfirmGateway('success', 4999, 'USD'));
+
+        // Exactly the pre-2.7.0 signature: five positional arguments, no PaymentIntentRepository.
+        $service = new PaymentService(
+            $this->context,
+            new RecordingPaymentRepository(),
+            $manager,
+            null,
+            new ConfirmationDispatcher($this->intents, [])
+        );
+
+        $this->expectException(\LogicException::class);
+        $service->confirmAndRecord('ref_stale_container', 'paystack');
+    }
+
     private function service(PaymentConfirmationHandler ...$handlers): PaymentService
     {
         $manager = new GatewayManager($this->context->getContainer(), $this->context);
@@ -249,7 +273,8 @@ final class ConfirmationDispatchTest extends PayviaTestCase
             new RecordingPaymentRepository(),
             $manager,
             null,
-            new ConfirmationDispatcher($this->intents, $handlers)
+            new ConfirmationDispatcher($this->intents, $handlers),
+            $this->intents
         );
     }
 }
