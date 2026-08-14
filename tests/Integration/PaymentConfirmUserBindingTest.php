@@ -10,7 +10,9 @@ use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentRepositoryInterface;
 use Glueful\Extensions\Payvia\Controllers\PaymentController;
+use Glueful\Extensions\Payvia\Database\Migrations\CreatePaymentIntentsTable;
 use Glueful\Extensions\Payvia\GatewayManager;
+use Glueful\Extensions\Payvia\Repositories\PaymentIntentRepository;
 use Glueful\Extensions\Payvia\Services\PaymentService;
 use Glueful\Extensions\Payvia\Tests\Support\PayviaTestCase;
 use Symfony\Component\HttpFoundation\Request;
@@ -29,6 +31,9 @@ final class PaymentConfirmUserBindingTest extends PayviaTestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        $this->runMigration(new CreatePaymentIntentsTable());
+        $intents = new PaymentIntentRepository($this->connection);
 
         $written = &$this->written;
 
@@ -89,7 +94,7 @@ final class PaymentConfirmUserBindingTest extends PayviaTestCase
         $manager = new GatewayManager($container, $this->context);
         $manager->registerDriver('paystack', $gateway::class);
 
-        $service = new PaymentService($this->context, $repo, $manager);
+        $service = new PaymentService($this->context, $repo, $manager, null, null, $intents);
 
         $this->bind(AuthenticationManager::class, $this->createMock(AuthenticationManager::class));
         $this->bind(Request::class, new Request());

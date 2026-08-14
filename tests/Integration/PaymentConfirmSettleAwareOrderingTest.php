@@ -80,6 +80,50 @@ final class PaymentConfirmSettleAwareOrderingTest extends PayviaTestCase
     }
 
     /**
+     * The MOST LIKELY production ordering: a provider webhook lands out-of-band and the strict
+     * lane settles + closes the intent BEFORE an operator ever touches this route -- so, unlike
+     * the nested-settlement case above, the intent is already `closed` when this call starts and
+     * guard 2's live-to-closed transition never fires. Guard 3 catches this from the other side:
+     * THIS reference's intent is already `closed` and still bound to the SAME payable the caller
+     * supplied, so this is a redelivery of a payment already confirmed, not a late one.
+     */
+    public function testAlreadyClosedSameReferenceRedeliveryIsNotRecordedAsALatePayment(): void
+    {
+        $this->openIntent('ord_redelivered', 'ref_redelivered');
+
+        // Simulate the out-of-band webhook: the strict lane already settled the order and
+        // closed the intent before the operator's manual confirm call below even starts.
+        $row = $this->intents->findByReference($this->context, 'paystack', 'ref_redelivered');
+        self::assertIsArray($row);
+        $this->book->settle('ord_redelivered', 'ref_redelivered');
+        $this->intents->settle($this->context, (string) $row['uuid']);
+
+        // The operator now replays the SAME reference through the manual confirm route. The
+        // event this call records is a fresh delivery of an already-processed payment, so the
+        // nested webhook path is a no-op here (an idempotent host listener would not re-settle
+        // an intent it already observes as closed).
+        $webhooks = $this->webhooks(static function (PaymentProviderEvent $event): void {
+            unset($event);
+        });
+
+        $result = $this->service($webhooks)->confirmAndRecord('ref_redelivered', 'paystack', [
+            'payable_type' => 'commerce_order',
+            'payable_id' => 'ord_redelivered',
+        ]);
+
+        self::assertSame('success', $result['payment_status']);
+        // Exactly one settle -- the out-of-band one above. The redelivery must not settle again.
+        self::assertSame(['ref_redelivered'], $this->book->settled);
+        // The whole point: no spurious late rejection for a redelivery of the very payment
+        // this reference already confirmed.
+        self::assertSame([], $this->book->lateRejected);
+
+        $row2 = $this->intents->findByReference($this->context, 'paystack', 'ref_redelivered');
+        self::assertIsArray($row2);
+        self::assertSame(PaymentIntentRepository::STATUS_CLOSED, (string) $row2['status']);
+    }
+
+    /**
      * The counter-case that keeps the fix honest: a GENUINELY late confirmation -- a second
      * attempt's own reference against an order some earlier attempt already paid -- is not
      * settled by the nested path (nothing closes THIS reference's intent there), so the route

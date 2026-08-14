@@ -75,6 +75,9 @@ final class PaymentConfirmPayableBindingTest extends PayviaTestCase
         self::assertSame('ord_victim', (string) $row['payable_id']);
         // ...and nothing written to `payments` under the attacker's attribution.
         self::assertSame([], $this->payments->written);
+        // ...and the refusal is decided entirely from the intent row already in hand -- not a
+        // single provider round trip is spent on a bogus attribution.
+        self::assertSame(0, $this->gateway->verifyCalls);
     }
 
     /**
@@ -188,6 +191,14 @@ final class PaymentConfirmPayableBindingTest extends PayviaTestCase
         self::assertSame(409, $response->getStatusCode());
         self::assertSame([], $this->handler->calls);
         self::assertSame([], $this->payments->written);
+
+        $body = json_decode((string) $response->getContent(), true);
+        self::assertIsArray($body);
+        self::assertSame(PayableAttributionException::MARKER, $body['error']['details']['reason'] ?? null);
+        // Non-revealing end to end: the wire body never names the payable the reference IS
+        // bound to, only that the supplied one does not match.
+        $raw = (string) $response->getContent();
+        self::assertStringNotContainsString('ord_victim', $raw);
     }
 
     /**
@@ -236,6 +247,9 @@ final class PaymentConfirmPayableBindingTest extends PayviaTestCase
 
 final class BindingConfirmGateway implements PaymentGatewayInterface
 {
+    /** Counts provider round trips so a refusal path can assert it spent zero of them. */
+    public int $verifyCalls = 0;
+
     public function __construct(
         public string $status,
         private int $amount,
@@ -249,6 +263,8 @@ final class BindingConfirmGateway implements PaymentGatewayInterface
      */
     public function verify(string $reference, array $options = []): array
     {
+        $this->verifyCalls++;
+
         return [
             'status' => $this->status,
             'id' => 'gw_' . $reference,

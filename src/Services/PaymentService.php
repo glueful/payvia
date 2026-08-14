@@ -69,22 +69,57 @@ final class PaymentService
      *     already paid -- does not close THIS reference's intent in the nested path, so it still
      *     dispatches and is still recorded as late.
      *
+     *  3. SAME-REFERENCE REDELIVERY. Guard 2 only catches a reference that settles DURING this
+     *     call. The more likely production ordering is out-of-band: a provider webhook lands
+     *     first, the strict lane settles and closes the intent, and only THEN does an operator
+     *     replay the SAME reference through this manual route -- so the intent is ALREADY
+     *     `closed` before this call even starts, and guard 2's live-to-closed transition never
+     *     fires. Guard 1 has, by this point, already proven that a caller-supplied payable
+     *     agrees with the one this reference's intent is bound to (or this call never reached
+     *     here). So a THIS-reference intent that is already `closed` AND still bound to that
+     *     same payable can only be a redelivery of a payment already confirmed -- dispatching
+     *     again would again produce a spurious late rejection. A GENUINELY late confirmation is
+     *     structurally different: a DIFFERENT reference/attempt against a payable something else
+     *     already paid, whose OWN intent row was never closed by that fact -- it still dispatches
+     *     and is still recorded late.
+     *
+     * A stale compiled container that still constructs this service with the pre-2.7.0,
+     * five-argument signature would otherwise make `$intents` null and let all three guards
+     * silently no-op -- a money guard that can silently disable itself is worse than a route
+     * that refuses until the container is rebuilt, so that case throws instead (see below).
+     *
      * @param array<string,mixed> $context user_uuid, payable_type, payable_id, metadata, options
      * @return array<string,mixed>
      * @throws PayableAttributionException when the supplied payable is not the one the
      *         reference's intent row is bound to.
+     * @throws \LogicException when this service was constructed without a
+     *         {@see PaymentIntentRepository} -- see the note above.
      */
     public function confirmAndRecord(
         string $reference,
         ?string $gatewayName = null,
         array $context = []
     ): array {
+        if ($this->intents === null) {
+            // Fail LOUD, not open. Autowiring resolves the optional 6th constructor argument
+            // from the container; a compiled container built before this release still
+            // constructs this service with five arguments, which would otherwise leave every
+            // guard above silently disabled -- no error, no log, exactly as vulnerable as
+            // before this hardening. Token/PII-free: safe to surface in any log sink.
+            throw new \LogicException(
+                'PaymentService was constructed without a PaymentIntentRepository -- this is a '
+                    . 'stale compiled container (deployment/config error). The payable-binding '
+                    . 'and settle-aware confirm guards cannot run without it. Clear the container '
+                    . 'cache and retry.'
+            );
+        }
+
         $gatewayKey = $gatewayName ?: PayviaSettings::defaultGateway($this->context);
 
         // Tenant-scoped, reference-addressable: another tenant's row is invisible here and takes
         // the unbound path below, so a confirmation can never become a cross-tenant existence
         // oracle.
-        $intent = $this->intents?->findByReference($this->context, $gatewayKey, $reference);
+        $intent = $this->intents->findByReference($this->context, $gatewayKey, $reference);
         $this->assertPayableBinding($intent, $context, $gatewayKey, $reference);
 
         $options = (array) ($context['options'] ?? []);
@@ -199,12 +234,17 @@ final class PaymentService
 
         if (
             $status === 'success'
-            && $this->settledWhileRecording($intent, $gatewayKey, $reference)
+            && (
+                $this->settledWhileRecording($intent, $gatewayKey, $reference)
+                || $this->isSameReferenceRedelivery($intent, $context)
+            )
         ) {
-            // Guard 2 (see the method docblock): the nested webhook path already delivered this
-            // reference's confirmation and closed its intent. Dispatching again would only
-            // produce a spurious late-payment rejection, and the intent settle would be a no-op
-            // (`settle()` never transitions out of `closed`).
+            // Guard 2 or guard 3 (see the class docblock): this reference's confirmation has
+            // already been delivered -- either settled just now by the nested webhook path
+            // (guard 2), or settled and closed out-of-band before this call even started (guard
+            // 3, redelivery). Dispatching again would only produce a spurious late-payment
+            // rejection, and the intent settle would be a no-op (`settle()` never transitions
+            // out of `closed`).
             return $this->result($status, $gatewayKey, $reference, $amount, $currency, $message, $verification);
         }
 
@@ -265,8 +305,11 @@ final class PaymentService
             return;
         }
 
-        $boundType = is_string($intent['payable_type'] ?? null) ? $intent['payable_type'] : '';
-        $boundId = is_string($intent['payable_id'] ?? null) ? $intent['payable_id'] : '';
+        // Cast rather than fail-open on an unexpected type: the repository always returns
+        // strings for these columns (unreachable today), but for a money guard the safer
+        // default is to compare what is actually there rather than silently treat it as absent.
+        $boundType = (string) ($intent['payable_type'] ?? '');
+        $boundId = (string) ($intent['payable_id'] ?? '');
         if ($boundType === '' || $boundId === '') {
             return;
         }
@@ -305,6 +348,46 @@ final class PaymentService
 
         return $current !== null
             && (string) ($current['status'] ?? '') === PaymentIntentRepository::STATUS_CLOSED;
+    }
+
+    /**
+     * Guard 3 (see {@see confirmAndRecord()}): is this call a redelivery of a payment ALREADY
+     * confirmed before this call started -- rather than a genuinely late one?
+     *
+     * Fires only when THIS reference's own intent was already `closed` before this call (guard
+     * 2 handles the in-call transition case) AND the caller-supplied payable agrees with the one
+     * that intent is bound to -- the same equality guard 1 already enforces, checked again here
+     * because guard 1 only refuses a MISMATCH; it does not, by itself, tell this method that a
+     * match was actually found. A caller that supplied no payable at all has nothing to compare,
+     * so this never fires for that path (it already dispatches nothing regardless).
+     *
+     * A GENUINELY late confirmation -- a different attempt's reference against a payable
+     * something else already paid -- does not satisfy this: it is a DIFFERENT reference, and
+     * that reference's own intent was never closed by another payable being settled, so this
+     * returns false and the caller falls through to the ordinary dispatch (and late rejection).
+     *
+     * @param array<string,mixed>|null $intent the row as it was BEFORE the verify event was
+     *        recorded (equivalently, its current status: this guard never re-reads, because a
+     *        row observed `closed` here was already closed before this call touched anything).
+     * @param array<string,mixed> $context
+     */
+    private function isSameReferenceRedelivery(?array $intent, array $context): bool
+    {
+        if ($intent === null || (string) ($intent['status'] ?? '') !== PaymentIntentRepository::STATUS_CLOSED) {
+            return false;
+        }
+
+        $suppliedType = is_string($context['payable_type'] ?? null) ? $context['payable_type'] : '';
+        $suppliedId = is_string($context['payable_id'] ?? null) ? $context['payable_id'] : '';
+        if ($suppliedType === '' || $suppliedId === '') {
+            return false;
+        }
+
+        // Cast rather than fail-open on an unexpected type -- same reasoning as guard 1.
+        $boundType = (string) ($intent['payable_type'] ?? '');
+        $boundId = (string) ($intent['payable_id'] ?? '');
+
+        return $boundType === $suppliedType && $boundId === $suppliedId;
     }
 
     /**
