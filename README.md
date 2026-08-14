@@ -100,6 +100,10 @@ PAYVIA_DEFAULT_GATEWAY=paystack
 # asks the provider again. 0 always probes.
 PAYVIA_SESSION_LIVENESS_COOLDOWN_SECONDS=30
 
+# How long an initializing/open payment_intents row may sit UNTOUCHED before
+# `payvia:intents:sweep-stale` retires it to `failed`. Clamped to 1-365.
+PAYVIA_INTENTS_STALE_AFTER_DAYS=30
+
 # Paystack
 PAYVIA_PAYSTACK_ENABLED=true
 PAYVIA_PAYSTACK_SECRET_KEY=sk_test_xxx
@@ -134,6 +138,13 @@ return [
     // stamp; dead/unknown answers never do, and a brand-new attempt is never suppressed.
     // Set to 0 to always probe.
     'session_liveness_cooldown_seconds' => (int) env('PAYVIA_SESSION_LIVENESS_COOLDOWN_SECONDS', 30),
+
+    'intents' => [
+        // How long an `initializing`/`open` payment_intents row may sit UNTOUCHED before
+        // `payvia:intents:sweep-stale` retires it to `failed`, freeing its payable's active
+        // idempotency port. Age is the only criterion. Clamped to 1..365 days at read time.
+        'stale_after_days' => (int) env('PAYVIA_INTENTS_STALE_AFTER_DAYS', 30),
+    ],
 
     'gateways' => [
         'paystack' => [
@@ -374,6 +385,37 @@ payable." A webhook confirming a superseded attempt's reference settles exactly 
 (`::settle()`, a CAS to `closed` from `open`/`superseded`/`failed`) and never touches a newer open
 attempt for the same payable; an unmatched reference remains a no-op. `dispatch()` takes the
 gateway key as a required parameter for this lookup.
+
+### Confirm-route guards (`PaymentService::confirmAndRecord()`)
+
+The manual confirm route (`POST /payvia/payments/confirm`) carries three guards, all keyed off
+the reference's own `payment_intents` row and all documented in full on
+`PaymentService::confirmAndRecord()`'s docblock:
+
+1. **Payable binding** — refuses (typed `PayableAttributionException`, `409`,
+   `payable_mismatch`) a caller-supplied payable that disagrees with the one the reference's
+   intent row is bound to. See the note under
+   [Confirm and record a payment](#confirm-and-record-a-payment) above.
+2. **Settle-aware ordering** — if a nested strict-lane listener (invoked from within
+   `recordVerifyEvent()`) settles THIS call's own reference before control returns, the route
+   reports success without dispatching a second, spurious `payment_late_rejected`.
+3. **Redelivery-aware ordering** — the more common production ordering: a webhook settles and
+   closes the intent *before* this call even starts (e.g. an operator replaying the same
+   reference through this route after the fact). The route recognizes the reference's intent as
+   already `closed` and bound to the same payable, and again reports success instead of a late
+   rejection.
+
+A genuinely late confirmation — a different reference/attempt against a payable something else
+already paid — is unaffected by guards 2 and 3 and is still dispatched and recorded late.
+
+**Upgrade obligation.** `PaymentService` gained an optional sixth constructor argument
+(`?PaymentIntentRepository $intents`) to power these guards; autowiring resolves it
+automatically on a fresh container build. A container **compiled before this release** still
+constructs the service with the old five-argument shape, which would otherwise let all three
+guards silently no-op. Instead, `confirmAndRecord()` now fails LOUD — `\LogicException` — the
+instant it is entered with no intent repository, so a stale compiled container blocks the confirm
+route outright rather than quietly running it unguarded. **Clear/rebuild the container cache as
+part of upgrading to this release.**
 
 ### Strict Delivery and Listener Contracts
 
@@ -617,6 +659,19 @@ keys) while single-store installs remain byte-identical.
 > from the request body. It is **not** caller‑settable. If a `user_uuid` is supplied and it
 > differs from the authenticated user's UUID, the request is rejected with `422`. This
 > prevents an authenticated caller from attributing a payment to another user.
+
+> **Note:** When the `reference` has its own `payment_intents` row (i.e. it originated through
+> [Hosted Payment Initiation](#hosted-payment-initiation-the-payable-metadata-convention)), a
+> supplied `payable_type`/`payable_id` must agree with the payable that row is bound to. A
+> mismatch is rejected with `409` and `error.details.reason = "payable_mismatch"` **before** any
+> provider verification, upsert, or dispatch — the same equal-amount, equal-currency payable is
+> otherwise indistinguishable to downstream handlers, so this is the only guard that can tell
+> them apart. The error message never names the payable the reference IS bound to. A reference
+> with no intent row (legacy rows, manual/operator references) is unaffected. A redelivery of the
+> *same* reference for an already-settled payment — whether settled moments earlier in this same
+> call or already closed by an out-of-band webhook before this call started — returns the normal
+> success response instead of a late-rejection error; only a genuinely late confirmation (a
+> different reference/attempt against a payable something else already paid) is recorded as late.
 
 **Response (200):**
 
