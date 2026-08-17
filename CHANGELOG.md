@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-08-17
+
 ### Added
 - Declares the Glueful schema manifest (migration descriptors, requires.extensions, structural
   verifier); requires framework >=1.79.0 for schema-on-enable participation. Migrations are now
