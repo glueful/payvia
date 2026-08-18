@@ -40,6 +40,20 @@ final class NoDirectPdoBypassTest extends TestCase
                 continue;
             }
 
+            // src/Schema holds the structural adoption verifier (schema policy spec B7): it
+            // reads CATALOG metadata (PRAGMA index_list/info, pg_indexes,
+            // information_schema.statistics) and never touches tenant ROWS — enforced by the
+            // DML assertion below instead of the file-level table-name ban.
+            if (str_contains($file->getPathname(), '/src/Schema/')) {
+                $contents = (string) file_get_contents($file->getPathname());
+                self::assertDoesNotMatchRegularExpression(
+                    '/\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|SELECT\s+[^;]*\bFROM)\s+"?(payments|billing_plans|invoices|gateway_subscriptions|payment_intents)\b/i',
+                    $contents,
+                    'the schema verifier must never read or write tenant-table rows'
+                );
+                continue;
+            }
+
             $contents = (string) file_get_contents($file->getPathname());
             if (preg_match('/getPDO\(\)|executeModification|->query\(|->prepare\(|->exec\(/', $contents) !== 1) {
                 continue;

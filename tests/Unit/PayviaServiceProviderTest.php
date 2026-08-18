@@ -24,6 +24,10 @@ final class PayviaServiceProviderTest extends TestCase
     {
         $provider = new PayviaServiceProvider($this->createStub(ContainerInterface::class));
 
-        self::assertSame('2.7.0', $provider->getVersion());
+        $expected = json_decode(
+            (string) file_get_contents(dirname(__DIR__, 2) . '/composer.json'),
+            true
+        )['extra']['glueful']['version'];
+        self::assertSame($expected, $provider->getVersion());
     }
 }
