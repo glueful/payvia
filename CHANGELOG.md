@@ -15,12 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.8.1] - 2026-08-18
-
-Packaging re-release of 2.8.0: the stale root-level composer.json `version` field (2.7.0) made
-Packagist ignore the v2.8.0 tag. The field is removed — Composer derives the version from the
-VCS tag. No code changes.
-
 ## [2.8.0] - 2026-08-17
 
 ### Added
