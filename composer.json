@@ -1,6 +1,5 @@
 {
     "name": "glueful/payvia",
-    "version": "2.7.0",
     "description": "Payvia: Unified payment gateway bridge for the Glueful PHP Framework (Stripe, Paystack, Flutterwave, and more).",
     "type": "glueful-extension",
     "license": "MIT",
@@ -54,7 +53,7 @@
             "name": "Payvia",
             "displayName": "Payvia Payments",
             "description": "Unified payment gateway bridge for Glueful (Stripe, Paystack, and more).",
-            "version": "2.8.0",
+            "version": "2.8.1",
             "icon": "assets/icon.png",
             "categories": [
                 "payments",
