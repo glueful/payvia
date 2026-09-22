@@ -19,6 +19,7 @@ use Glueful\Extensions\Payvia\Contracts\InitiationCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\PaymentGatewayInterface;
 use Glueful\Extensions\Payvia\Contracts\PaymentProviderEventInterface;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCancellationModeProvider;
+use Glueful\Extensions\Payvia\Contracts\SubscriptionPlanChangeCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionCheckoutLifecycleCapableGateway;
 use Glueful\Extensions\Payvia\Contracts\SubscriptionInitiationCapableGateway;
@@ -42,6 +43,7 @@ final class StripeGateway implements
     SubscriptionInitiationCapableGateway,
     SubscriptionCheckoutLifecycleCapableGateway,
     SubscriptionCancellationModeProvider,
+    SubscriptionPlanChangeCapableGateway,
     TransferCapableGateway
 {
     /**
@@ -592,6 +594,44 @@ final class StripeGateway implements
      *
      * @return list<'stop_renewal'|'immediate'>
      */
+    /**
+     * Swap the subscription's one item to the new price, prorated, and clear any pending
+     * cancellation: a customer changing plan means to stay. Stripe's answer is reported, never
+     * thrown; the local plan follows the `customer.subscription.updated` event.
+     */
+    public function changeSubscriptionPlan(string $gatewaySubscriptionId, string $providerPlanIdentifier): array
+    {
+        if ($this->secretKey() === '') {
+            return ['status' => 'failed', 'message' => 'Missing Stripe secret key'];
+        }
+        $current = $this->fetchSubscription($gatewaySubscriptionId);
+        $itemId = $current['items']['data'][0]['id'] ?? null;
+        if (!is_string($itemId) || $itemId === '') {
+            $message = $current['error']['message'] ?? 'The subscription has no item to change.';
+            return ['status' => 'failed', 'message' => (string) $message];
+        }
+
+        $response = $this->httpClient->post(
+            $this->baseUrl() . '/v1/subscriptions/' . rawurlencode($gatewaySubscriptionId),
+            array_replace($this->requestOptions(), [
+                'form_params' => [
+                    'items' => [['id' => $itemId, 'price' => $providerPlanIdentifier]],
+                    'proration_behavior' => 'create_prorations',
+                    'cancel_at_period_end' => 'false',
+                ],
+            ])
+        );
+        $decoded = $response->toArray();
+        if (isset($decoded['error']) || !isset($decoded['id'])) {
+            return [
+                'status' => 'failed',
+                'message' => (string) ($decoded['error']['message'] ?? 'Stripe refused the plan change.'),
+            ];
+        }
+
+        return ['status' => 'changed'];
+    }
+
     public function cancellationModes(): array
     {
         return ['stop_renewal', 'immediate'];
