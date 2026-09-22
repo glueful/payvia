@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-09-22
+
 ### Added
 - **A live subscription can move to another plan.** New additive capability
   `SubscriptionPlanChangeCapableGateway::changeSubscriptionPlan($subscriptionId, $providerPlanId)`.
