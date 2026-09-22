@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A live subscription can move to another plan.** New additive capability
+  `SubscriptionPlanChangeCapableGateway::changeSubscriptionPlan($subscriptionId, $providerPlanId)`.
+  Stripe implements it: it swaps the subscription item's price, prorated, and clears a pending
+  cancellation. The answer is reported (`changed`, or `failed` with the provider's message), never
+  thrown. Paystack does not implement it: it cannot switch a live subscription's plan.
+
 ## [2.8.0] - 2026-08-17
 
 ### Added
